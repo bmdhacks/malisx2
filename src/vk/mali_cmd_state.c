@@ -172,10 +172,24 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
 #if PAN_ARCH < 9
    /* v7 runs the vertex shader over the index range of an indexed draw,
     * which the v7 draw finds by reading the indices on the CPU
-    * (mali_jm_cmd_draw_v7.c): the buffer's CPU view, NULL for an imported
-    * dma-buf, which has none. */
+    * (mali_jm_cmd_draw_v7.c): the buffer's CPU view, NULL when there is
+    * none, and then the draw is skipped and logged.
+    *
+    * A non-NULL CPU view is not enough to read it: the job manager places
+    * every allocation in SAME_VA and maps it with the memory type's
+    * protection, so a GPU-only type has a PROT_NONE view and a lazily
+    * allocated one may not be mapped at all; reading either faults. Only a
+    * host-visible, non-lazy, unprotected type is read. It may still be
+    * host-cached and not host-coherent, and the driver does no
+    * invalidation for a write the CPU did not make, so indices the GPU
+    * wrote can come back stale; mali_jm_cmd_draw_v7.c says what that costs. */
    const struct mali_buffer *mb = buf ? container_of(buf, struct mali_buffer, vk) : NULL;
-   cmd->jm.draw.ib_cpu = (mb && mb->mem && mb->mem->bo.cpu)
+   const VkMemoryPropertyFlags mem_props = (mb && mb->mem) ? mb->mem->props : 0;
+   const bool ib_cpu_readable =
+      (mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+      !(mem_props & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+                     VK_MEMORY_PROPERTY_PROTECTED_BIT));
+   cmd->jm.draw.ib_cpu = (ib_cpu_readable && mb->mem->bo.cpu)
                             ? (const uint8_t *)mb->mem->bo.cpu + mb->mem_offset + offset
                             : NULL;
 #endif

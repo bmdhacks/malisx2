@@ -311,6 +311,18 @@ jit_init(struct mali_kbase *kb)
       .phys_pages = KB_JIT_VA_PAGES,
    };
    long ret = kb_ioctl(kb, KB_IOCTL_MEM_JIT_INIT, &ji);
+   if (ret == -ENOMEM && kb->frontend == MALI_KBASE_FRONTEND_JM) {
+      /* The kernel cuts the JIT zone from the end of the SAME_VA zone (at
+       * most 2^(GPU VA bits) bytes, less the 4 GiB executable zone) and
+       * answers ENOMEM when KB_JIT_VA_PAGES does not fit
+       * (kbase_region_tracker_init_jit_64), as on the RK3568's Mali-G52.
+       * The job-manager path issues no JIT soft jobs and allocates only
+       * from the SAME_VA and executable zones (mem.c), so it goes on
+       * without the zone (mali_device.c logs it). A CSF context still
+       * fails here: its tiler heap chunks come from that zone. */
+      kb->jm_no_jit = true;
+      return MALI_KBASE_SUCCESS;
+   }
    if (ret < 0) {
       KB_LOG(kb, "MEM_JIT_INIT failed: %s", strerror((int)-ret));
       return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);

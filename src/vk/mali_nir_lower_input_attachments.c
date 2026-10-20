@@ -4,9 +4,11 @@
  */
 
 /*
- * subpassLoad() on v11, following panvk (Mesa src/panfrost/vulkan/
+ * subpassLoad(), following panvk (Mesa src/panfrost/vulkan/
  * panvk_vX_nir_lower_input_attachment_loads.c, MIT). ARMSX2 reads its
  * colour and depth attachments this way on Mali ("feedback" descriptors).
+ * On v7 the depth and stencil tile reads also take a conversion word: the
+ * map's for depth, a constant the v7 compile adds for stencil.
  *
  * An input attachment that is also a colour or depth/stencil attachment of
  * the current render pass is read from the tile buffer (LD_TILE); anything
@@ -26,6 +28,7 @@
 #include "util/u_dynarray.h"
 
 struct ia_ctx {
+   unsigned arch;
    uint32_t ro_color_mask;
    uint32_t input_attachment_read;
 };
@@ -169,13 +172,20 @@ lower_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       }
       nir_push_else(b, NULL);
       {
-         /* Depth or stencil: the conversion is zero on v9+. */
+         /* Depth or stencil: the conversion is zero on v9+. v7 needs the
+          * format, as a zero conversion faults with INVALID_INSTR_ENC
+          * (panvk_v7): depth's comes with the attachment map. Stencil's is
+          * a constant, which the v7 compile puts in place of the zero
+          * (mali_shader.c v7_stencil_tile_conv). */
          iosem.location = dest_type == nir_type_float32 ? FRAG_RESULT_DEPTH
                                                         : FRAG_RESULT_STENCIL;
+         nir_def *v7_conv = NULL;
+         if (ctx->arch < 9 && iosem.location == FRAG_RESULT_DEPTH)
+            v7_conv = nir_load_input_attachment_conv_pan(b, index_ssa);
          load_zs = nir_load_tile_pan(
             b, intr->def.num_components, intr->def.bit_size,
             pan_nir_tile_location_sample(b, iosem.location, intr->src[2].ssa),
-            pan_nir_tile_default_coverage(b), nir_imm_int(b, 0),
+            pan_nir_tile_default_coverage(b), v7_conv ? v7_conv : nir_imm_int(b, 0),
             .dest_type = dest_type, .access = nir_intrinsic_access(intr),
             .io_semantics = iosem);
 
@@ -322,6 +332,7 @@ mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
    /* The read-only tile load (LD_TILE with the resource wait) exists from
     * v10 on; v9 reads every colour attachment with the plain tile load. */
    struct ia_ctx ctx = {
+      .arch = arch,
       .ro_color_mask = arch >= 10 ? readonly_color_mask(nir, state) : 0,
    };
 

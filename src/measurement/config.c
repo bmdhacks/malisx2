@@ -387,7 +387,7 @@ static const char *const sq_names[MALI_SUBQUEUE_COUNT] = {
  * (0) or MALI_JM_SLOT_VTC (1) (mali_jm.h), not an enum mali_subqueue
  * value, and these rows use "vtc"/"frag" labels on JM rather than the
  * CSF names above. This file builds once, at this build's fixed v11
- * MALI_PAN_ARCH, so it cannot include the v9-only mali_jm.h; the two
+ * MALI_PAN_ARCH, so it cannot include the job-manager mali_jm.h; the two
  * slot values 0 and 1 are repeated here as plain indices instead of
  * the symbolic ones mali_jm.h defines.
  */

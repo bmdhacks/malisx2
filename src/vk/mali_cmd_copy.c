@@ -6,7 +6,7 @@
 /*
  * vkCmdCopyBuffer, vkCmdFillBuffer and vkCmdUpdateBuffer, as compute
  * dispatches of small internal shaders: on the compute subqueue (CSF, v11)
- * or as Compute jobs in the open batch's vtc chain (job manager, v9).
+ * or as Compute jobs in the open batch's vtc chain (job manager, v7 and v9).
  * Built once per arch.
  *
  * Why compute and not the command stream itself: CS LOAD_MULTIPLE /
@@ -190,6 +190,11 @@ dispatch_elems(struct mali_cmd_buffer *cmd, enum mali_meta_shader m,
    if (!s)
       return;
    const unsigned elem = meta_elem_size(m);
+#if PAN_ARCH < 9
+   /* The buffer memory written, for the v7 indexed draws
+    * (mali_v7_note_buffer_write). */
+   mali_v7_note_buffer_write(cmd, *dst, elems * elem);
+#endif
 
    while (elems) {
       uint32_t n = (uint32_t)MIN2(elems, META_MAX_ELEMS);

@@ -22,10 +22,13 @@
  *    are packed for the device's arch (mali_pipeline_state.c is built per
  *    arch); on v9 TILER_FLAGS is word 0 of the Malloc Vertex job's
  *    Primitive section and DCD2 is 0 (v9's Draw descriptor has no Flags 2).
- *    mali_gfx_pack_state() packs them from state; pipeline creation runs
- *    it with the pipeline's static state, and the draw encoder runs it
- *    again with the command buffer's state when baked.uses_dynamic_state
- *    says a dynamic state feeds them.
+ *    On v7 TILER_FLAGS is word 0 of the Tiler job's Primitive section,
+ *    DCD0 the low half of its Draw word 0, DCD1 and DCD2 are 0, and the
+ *    Depth/stencil words are words 4 to 11 of the fragment Renderer State
+ *    Descriptor. mali_gfx_pack_state() packs them from state; pipeline
+ *    creation runs it with the pipeline's static state, and the draw
+ *    encoder runs it again with the command buffer's state when
+ *    baked.uses_dynamic_state says a dynamic state feeds them.
  *
  * Nothing here encodes a draw.
  */
@@ -91,12 +94,16 @@ struct mali_gfx_baked {
    bool uses_dynamic_state;
 
    enum mesa_prim prim;           /* static topology, MESA_PRIM_COUNT if dynamic */
-   uint32_t tiler_flags;          /* v11 Primitive Flags, v9 Primitive word 0;
-                                   * index type is per draw */
-   uint32_t dcd0[2];              /* [0] occlusion query off, [1] counting */
-   uint32_t dcd1;
-   uint32_t dcd2;                 /* v11 only; 0 on v9 */
-   uint32_t zsd[8];               /* Depth/stencil descriptor */
+   uint32_t tiler_flags;          /* v11 Primitive Flags, v9 and v7 Primitive
+                                   * word 0; index type is per draw */
+   uint32_t dcd0[2];              /* [0] occlusion query off, [1] counting;
+                                   * v7: the low half of the Tiler job's Draw
+                                   * word 0, both alike */
+   uint32_t dcd1;                 /* 0 on v7 */
+   uint32_t dcd2;                 /* v11 only; 0 on v7 and v9 */
+   uint32_t zsd[8];               /* Depth/stencil descriptor; v7: words 4 to
+                                   * 11 of the fragment Renderer State
+                                   * Descriptor (pack_rsd_state) */
 
    uint8_t rt_count;
    uint8_t rt_written;            /* colour attachments the fragment shader writes */
@@ -110,7 +117,8 @@ struct mali_gfx_baked {
    struct mali_blend_rt_baked blend[MALI_MAX_RTS];
 
    /* SPDs the draw uses: position (the points variant for point lists),
-    * varying (0 when the vertex shader has none), fragment (0 without one). */
+    * varying (0 when the vertex shader has none), fragment (0 without one).
+    * v7: the vertex shader's RSD, 0, the fragment shader's code address. */
    uint64_t vs_pos_spd;
    uint64_t vs_var_spd;
    uint64_t fs_spd;
@@ -144,7 +152,8 @@ enum mali_gfx_static {
  */
 struct mali_gfx_bind {
    uint64_t spd[3];               /* SPD_0, SPD_1, SPD_2 */
-   uint64_t zsd;                  /* GPU copy of baked.zsd, 0 if dynamic */
+   uint64_t zsd;                  /* GPU copy of baked.zsd, 0 if dynamic or
+                                   * on v7 */
    uint32_t tiler_flags;
    uint32_t dcd0, dcd1, dcd2;
    uint32_t vary_size;            /* VARY_SIZE */

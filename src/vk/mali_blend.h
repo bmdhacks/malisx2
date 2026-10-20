@@ -11,7 +11,8 @@
  * the way Mesa's pan_blend_create_shader does, compiled through kraid,
  * placed in the device's executable pool and cached per device by key.
  * Built per arch (v9 and v11 blend the same way; the shader is compiled
- * for the device's GPU).
+ * for the device's GPU). v7 compiles it with Mesa's Bifrost backend, and
+ * its Blend descriptor carries the address the shader returns to.
  */
 
 #ifndef MALI_BLEND_H

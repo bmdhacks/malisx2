@@ -83,8 +83,10 @@ mali_measure_harvest(struct mali_measure *m, struct mali_measure_cmd *mc)
 static bool
 completed(struct mali_measure *m, const struct mali_measure_cmd *mc)
 {
-   if (m->dev->jm)
-      return mali_jm_measure_reached(m->dev->jm, mc->submit);
+   if (m->dev->jm) {
+      const uint32_t arch = mali_device_physical(m->dev)->arch;
+      return mali_jm_arch_dispatch(arch, jm_measure_reached, m->dev->jm, mc->submit);
+   }
    struct mali_csf_queue *q = m->dev->csf ? m->dev->csf->queue : NULL;
    if (!q)
       return true;
@@ -171,10 +173,10 @@ emit_timestamp(struct mali_cmd_buffer *cmd, enum mali_subqueue sq, uint64_t va, 
  * job-manager back half has its own copy of this logic in timing_jm.c
  * against its own struct mali_cmd_buffer (mali_jm.h), because a function
  * compiled once here would read cmd->measure, and call mali_cmd_alloc(),
- * at this file's (v11) offsets and definition even when handed a v9 cmd
- * pointer. Only mali_measure_harvest and completed() are shared (above):
- * they never touch cmd, only the frontend-neutral struct mali_measure_cmd
- * a cmd->measure already points at.
+ * at this file's (v11) offsets and definition even when handed a
+ * job-manager cmd pointer. Only mali_measure_harvest and completed() are
+ * shared (above): they never touch cmd, only the frontend-neutral struct
+ * mali_measure_cmd a cmd->measure already points at.
  */
 uint32_t
 mali_measure_begin(struct mali_cmd_buffer *cmd, enum mali_measure_kind kind,

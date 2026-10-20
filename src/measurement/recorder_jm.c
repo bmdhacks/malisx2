@@ -5,8 +5,8 @@
 
 /*
  * Job-manager command-stream capture: MALISX2_MEASURE's "csf" mode keeps
- * that name on a v9 device too -- job-manager capture is a mode of the
- * same knob, not a second one. One file per captured vkQueueSubmit,
+ * that name on a job-manager device too -- job-manager capture is a mode
+ * of the same knob, not a second one. One file per captured vkQueueSubmit,
  * jm-SSSSSSSS.bin (S = submit number):
  *
  *   header   "MALIJM01", u32 version (1), u32 GPU product ID,
@@ -26,12 +26,15 @@
  *
  * tools/mali_jc_decode.py walks each atom's chain through its job
  * headers' Next pointers and decodes every job with v9.xml, the way
- * tools/mali_cs_decode.py walks a CSF capture's rings with v11.xml.
+ * tools/mali_cs_decode.py walks a CSF capture's rings with v11.xml. A G52
+ * capture holds v7 jobs and descriptors, which only v7.xml describes; the
+ * header's GPU product ID says which arch a capture is.
  *
  * Command memory is captured before the kernel sees the submission
  * (mali_jm_measure_capture_begin runs before mali_jm_build_begin in
- * mali_v9_queue_submit), so it is as recorded, not as the job manager
- * leaves it; the atoms are plain CPU data (struct kb_jm_atom) either way.
+ * MALI_PER_ARCH(queue_submit)), so it is as recorded, not as the job
+ * manager leaves it; the atoms are plain CPU data (struct kb_jm_atom)
+ * either way.
  */
 
 #include "mali_measure.h"

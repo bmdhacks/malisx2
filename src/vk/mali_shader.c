@@ -5,21 +5,35 @@
 
 /*
  * One pipeline stage from NIR to an uploaded shader (mali_shader.h), built
- * per arch (v9 and v11).
+ * per arch (v7, v9 and v11).
  *
  * The lowering follows panvk's v9+ path (Mesa src/panfrost/vulkan/
  * panvk_vX_shader.c, MIT) step for step, because the shaders come from the
  * same compiler and the draw code follows panvk's FAU and descriptor
- * model. Left out: Bifrost paths, cooperative matrices, YCbCr, tile
- * images, pipeline executables. Where the code goes differs from panvk:
- * shader code in the device's executable pool (kbase GPU_EX memory in the
- * 4 GiB executable zone, 128-byte aligned), SPDs in the pipeline
- * descriptor pool.
+ * model; v7 follows its PAN_ARCH < 9 path. Left out: cooperative matrices,
+ * YCbCr, tile images, pipeline executables. Where the code goes differs
+ * from panvk: shader code in the device's executable pool (kbase GPU_EX
+ * memory in the 4 GiB executable zone, 128-byte aligned), SPDs (RSDs on
+ * v7) in the pipeline descriptor pool.
  *
  * v9 and v11 differ here only in the uniform-buffer words pushed into FAU
  * (v11 only, "Dynamic uniform buffers in FAU"); the SPD and Shader
  * Environment layouts are the same, and kraid takes the arch from the GPU
  * ID.
+ *
+ * v7 (Bifrost) compiles with Mesa's Bifrost backend (pan_use_kraid()
+ * answers false below arch 9), and differs more:
+ *  - descriptors go through per-type tables instead of resource tables
+ *    (mali_shader.h enum mali_v7_desc_table, mali_nir_lower_descriptors_v7.c);
+ *  - constant data is a buffer of its own, read through a system value,
+ *    as Bifrost has no PC-relative constant pool;
+ *  - the BLEND instructions read the Blend descriptors from the hardware's
+ *    blend FAU slots, not from system values;
+ *  - jobs point at Renderer State Descriptors (RSDs) instead of SPDs
+ *    (shader_upload);
+ *  - vertex and fragment shaders push uniform-buffer words into FAU too
+ *    (lower_ubo_push), and clip distances are a discard in the fragment
+ *    shader ("Clip distances").
  */
 
 #ifndef PAN_ARCH
@@ -30,6 +44,10 @@
 #include "mali_shader.h"
 #if PAN_ARCH >= 10
 #include "mali_cs.h"
+#endif
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#include "pan_format.h"
 #endif
 #include "mali_vk.h"
 
@@ -56,7 +74,7 @@
 
 /* A magic push-constant base marking system values until the FAU packing
  * below gives everything its final offset. */
-#define SYSVALS_PUSH_CONST_BASE MALI_MAX_PUSH_CONSTANTS_SIZE
+#define SYSVALS_PUSH_CONST_BASE MALI_SYSVALS_PUSH_CONST_BASE
 /* And one marking the shader's constant FAU words (fau.consts), above any
  * sysval offset. */
 #define CONSTS_PUSH_CONST_BASE (SYSVALS_PUSH_CONST_BASE + 4096)
@@ -162,6 +180,20 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_noperspective_varyings_pan:
       val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
       break;
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_raw_vertex_offset:
+      /* gl_VertexIndex = raw vertex id + this (pan_nir_lower_vertex_id). */
+      val = load_sysval(b, graphics, bit_size, vs.raw_vertex_offset);
+      break;
+   case nir_intrinsic_load_view_index:
+   case nir_intrinsic_load_layer_id:
+      /* v7 has no frame argument; panvk draws once per layer and passes the
+       * layer as a sysval. Multiview is refused at compile time and a
+       * layered pass is drawn into layer 0 only (mali_jm_cmd_draw_v7.c),
+       * so both are 0. */
+      val = nir_imm_zero(b, 1, 32);
+      break;
+#else
    case nir_intrinsic_load_view_index:
       if (!ctx->state || !ctx->state->mv || ctx->state->mv->view_mask == 0) {
          val = nir_imm_zero(b, 1, 32);
@@ -175,12 +207,20 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_layer_id:
       val = nir_extract_u8_imm(b, nir_u2u32(b, nir_load_frame_arg_pan(b)), 0);
       break;
+#endif /* PAN_ARCH >= 9 */
    case nir_intrinsic_load_printf_buffer_address:
       val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_blend_descriptor_pan:
+      /* Bifrost reads the Blend descriptors from its blend FAU slots
+       * (BIR_FAU_BLEND_0 + rt): the backend handles the intrinsic. */
+      return false;
+#else
    case nir_intrinsic_load_blend_descriptor_pan:
       val = load_sysval(b, graphics, bit_size, fs.blend_descs[nir_intrinsic_base(intr)]);
       break;
+#endif
    case nir_intrinsic_load_input_attachment_target_pan: {
       const struct vk_input_attachment_location_state *ial =
          ctx->state ? ctx->state->ial : NULL;
@@ -431,6 +471,37 @@ lower_load_push_consts(nir_shader *nir, struct mali_shader *s)
 /* ---------------------------------------------------------------------- */
 /* Dynamic uniform buffers in FAU                                          */
 
+#if PAN_ARCH >= 10 || PAN_ARCH < 9
+/* Replaces a uniform buffer load with a read of its words in FAU, the
+ * first of which is FAU word fau_word; offset is the load's byte offset
+ * in the buffer. */
+static void
+ubo_push_replace(nir_builder *b, nir_intrinsic_instr *intr, unsigned fau_word,
+                 uint32_t offset)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *val = nir_load_push_constant(
+      b, intr->def.num_components, intr->def.bit_size,
+      nir_imm_int(b, fau_word * MALI_FAU_WORD_SIZE + offset % 8));
+   nir_def_replace(&intr->def, val);
+}
+
+/* Lists the words set in `used` (size bits, words_per_buf for each
+ * dynamic buffer in turn) in s->fau.ubo_push, in that order. */
+static void
+ubo_push_list(struct mali_shader *s, const BITSET_WORD *used, unsigned size,
+              unsigned words_per_buf)
+{
+   unsigned w;
+   BITSET_FOREACH_SET(w, used, size) {
+      s->fau.ubo_push[s->fau.ubo_push_count++] = (struct mali_ubo_push_word){
+         .dyn = w / words_per_buf,
+         .offset = (w % words_per_buf) * 8,
+      };
+   }
+}
+#endif
+
 #if PAN_ARCH >= 10
 
 /* The FAU block may hold this many words once the uniform-buffer words are
@@ -491,11 +562,7 @@ ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    /* The pushed words are in (buffer, offset) order, so the words of one
     * load are adjacent in FAU. */
    unsigned fau_word = ctx->s->fau.ubo_push_start + BITSET_PREFIX_SUM(ctx->used, first);
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *val = nir_load_push_constant(
-      b, intr->def.num_components, intr->def.bit_size,
-      nir_imm_int(b, fau_word * MALI_FAU_WORD_SIZE + offset % 8));
-   nir_def_replace(&intr->def, val);
+   ubo_push_replace(b, intr, fau_word, offset);
    return true;
 }
 
@@ -528,23 +595,178 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
       return;
 
    const unsigned words_per_buf = UBO_PUSH_MAX_BYTES / 8;
-   unsigned w;
-   BITSET_FOREACH_SET(w, ctx.used, MALI_MAX_DYNAMIC_BUFFERS * words_per_buf) {
-      s->fau.ubo_push[s->fau.ubo_push_count++] = (struct mali_ubo_push_word){
-         .dyn = w / words_per_buf,
-         .offset = (w % words_per_buf) * 8,
-      };
-   }
+   ubo_push_list(s, ctx.used, MALI_MAX_DYNAMIC_BUFFERS * words_per_buf, words_per_buf);
 
    ctx.lower = true;
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, ubo_push_intr,
             nir_metadata_control_flow, &ctx);
    s->fau.total_count += n;
 }
+#elif PAN_ARCH < 9
+
+/*
+ * v7: as on v11, constant-offset reads of dynamic uniform buffers become
+ * FAU reads, here in vertex and fragment shaders. The job manager has no
+ * command-stream loads and stores, so a small Compute job in the vtc chain
+ * copies the words into the draw's FAU block before the jobs that read it
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy). Each such read is otherwise a
+ * uniform buffer LOAD, a load/store-unit message per warp, and azahar's
+ * shaders in both stages are bound by them.
+ *
+ * Partial: when not every load's words fit, the ranges read by the most
+ * load instructions go first, each one whose words still fit; the other
+ * loads stay loads.
+ */
+
+/* The pushed words may fill the FAU block, as Mesa's Bifrost UBO push
+ * (bi_opt_push_ubo) fills it: the Bifrost backend promotes no constants
+ * into FAU (bifrost_compile.c does that from v9 on), so there is nothing
+ * to leave room for, unlike v11's UBO_PUSH_FAU_LIMIT. */
+#define V7_UBO_PUSH_FAU_LIMIT MALI_FAU_WORD_COUNT
+
+/* Words are pushed from the first 4 KiB of a buffer. The window only says
+ * where pushed words may come from; how many are pushed is the FAU budget
+ * above, and the window costs only the `used` bitset below. 4 KiB covers a
+ * 3DS emulator's whole vertex uniform block with room for larger ones:
+ * azahar's PICA vertex uniforms (vs_pica_data, 96 vec4 from byte 80) end
+ * at byte 1616. */
+#define V7_UBO_PUSH_MAX_BYTES 4096
+#define V7_UBO_PUSH_WORDS_PER_BUF (V7_UBO_PUSH_MAX_BYTES / 8)
+
+/* A word range loads read, and how many load instructions read it. */
+struct v7_ubo_push_range {
+   uint16_t first, last;
+   uint32_t uses;
+};
+
+struct v7_ubo_push_ctx {
+   struct mali_shader *s;
+   uint32_t first_index;   /* UBO table index of dynamic uniform buffer 0 */
+   BITSET_DECLARE(used, MALI_MAX_DYNAMIC_UNIFORM_BUFFERS * V7_UBO_PUSH_WORDS_PER_BUF);
+   struct util_dynarray ranges;   /* struct v7_ubo_push_range */
+   bool lower;
+};
+
+/* The first and last 64-bit word a load reads, numbered as in `used`
+ * (buffer, then offset), or false when it cannot be pushed: a non-constant
+ * index or offset, components narrower than 32 bits, not a dynamic uniform
+ * buffer, or an offset that is not 4-byte aligned or reads past
+ * V7_UBO_PUSH_MAX_BYTES. */
+static bool
+v7_ubo_push_load(const struct v7_ubo_push_ctx *ctx, nir_intrinsic_instr *intr,
+                 unsigned *first, unsigned *last, uint32_t *offset)
+{
+   if (intr->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(intr->src[0]) ||
+       !nir_src_is_const(intr->src[1]) || intr->def.bit_size < 32)
+      return false;
+   const uint32_t index = nir_src_as_uint(intr->src[0]);
+   if (index < ctx->first_index || index - ctx->first_index >= ctx->s->v7.dyn_ubo_count ||
+       index - ctx->first_index >= MALI_MAX_DYNAMIC_UNIFORM_BUFFERS)
+      return false;
+   const uint32_t dyn = index - ctx->first_index;
+   *offset = nir_src_as_uint(intr->src[1]);
+   const uint32_t bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   if (*offset % 4 || *offset + bytes > V7_UBO_PUSH_MAX_BYTES)
+      return false;
+   *first = dyn * V7_UBO_PUSH_WORDS_PER_BUF + *offset / 8;
+   *last = dyn * V7_UBO_PUSH_WORDS_PER_BUF + (*offset + bytes - 1) / 8;
+   return true;
+}
+
+static bool
+v7_ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct v7_ubo_push_ctx *ctx = data;
+   unsigned first, last;
+   uint32_t offset;
+   if (!v7_ubo_push_load(ctx, intr, &first, &last, &offset))
+      return false;
+
+   if (!ctx->lower) {
+      util_dynarray_foreach(&ctx->ranges, struct v7_ubo_push_range, r) {
+         if (r->first == first && r->last == last) {
+            r->uses++;
+            return false;
+         }
+      }
+      util_dynarray_append_typed(&ctx->ranges, struct v7_ubo_push_range,
+                                 ((struct v7_ubo_push_range){first, last, 1}));
+      return false;
+   }
+
+   for (unsigned w = first; w <= last; w++) {
+      if (!BITSET_TEST(ctx->used, w))
+         return false;
+   }
+   /* The pushed words are in (buffer, offset) order, so the words of one
+    * load are adjacent in FAU. */
+   const unsigned fau_word = ctx->s->fau.ubo_push_start + BITSET_PREFIX_SUM(ctx->used, first);
+   ubo_push_replace(b, intr, fau_word, offset);
+   return true;
+}
+
+/* More uses first, then the lower first word. */
+static int
+v7_ubo_push_range_cmp(const void *a, const void *b)
+{
+   const struct v7_ubo_push_range *x = a, *y = b;
+   if (x->uses != y->uses)
+      return x->uses > y->uses ? -1 : 1;
+   return (int)x->first - (int)y->first;
+}
+
+static void
+lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+{
+   s->fau.ubo_push_start = s->fau.total_count;
+   s->fau.ubo_push_count = 0;
+
+   if ((nir->info.stage != MESA_SHADER_FRAGMENT && nir->info.stage != MESA_SHADER_VERTEX) ||
+       !s->v7.dyn_ubo_count || s->fau.total_count >= V7_UBO_PUSH_FAU_LIMIT)
+      return;
+
+   struct v7_ubo_push_ctx ctx = {
+      .s = s,
+      .first_index = s->v7.count[MALI_V7_DESC_TABLE_UBO],
+   };
+   util_dynarray_init(&ctx.ranges, NULL);
+   nir_shader_intrinsics_pass(nir, v7_ubo_push_intr, nir_metadata_all, &ctx);
+
+   /* The most used ranges first, each one whose words still fit. */
+   unsigned budget = MIN2(MALI_MAX_UBO_PUSH_FAUS, V7_UBO_PUSH_FAU_LIMIT - s->fau.total_count);
+   const unsigned nr = util_dynarray_num_elements(&ctx.ranges, struct v7_ubo_push_range);
+   if (nr)
+      qsort(util_dynarray_begin(&ctx.ranges), nr, sizeof(struct v7_ubo_push_range),
+            v7_ubo_push_range_cmp);
+   util_dynarray_foreach(&ctx.ranges, struct v7_ubo_push_range, r) {
+      unsigned need = 0;
+      for (unsigned w = r->first; w <= r->last; w++)
+         need += !BITSET_TEST(ctx.used, w);
+      if (need <= budget) {
+         BITSET_SET_RANGE(ctx.used, r->first, r->last);
+         budget -= need;
+      }
+   }
+   util_dynarray_fini(&ctx.ranges);
+
+   const unsigned n = BITSET_COUNT(ctx.used);
+   if (!n)
+      return;
+   assert(n <= MALI_MAX_UBO_PUSH_FAUS);
+   ubo_push_list(s, ctx.used, MALI_MAX_DYNAMIC_UNIFORM_BUFFERS * V7_UBO_PUSH_WORDS_PER_BUF,
+                 V7_UBO_PUSH_WORDS_PER_BUF);
+
+   ctx.lower = true;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_ubo_push_intr,
+            nir_metadata_control_flow, &ctx);
+   s->fau.total_count += n;
+}
 #else
-/* v9: nothing is pushed. The words are copied per draw with command-stream
- * loads and stores on v11, and the job manager has no such instructions;
- * shaders load from the buffer. */
+/* v9: nothing is pushed; shaders load from the buffer. The v9 draw
+ * (mali_jm_cmd_draw.c) has no step that copies the words into the FAU
+ * block: v11 copies them with command-stream loads and stores, which the
+ * job manager does not have, and v7 with a Compute job of its own
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy). */
 static void
 lower_ubo_push(nir_shader *nir, struct mali_shader *s)
 {
@@ -562,13 +784,40 @@ MALI_PER_ARCH(shader_nir_options)(struct mali_device *dev, mesa_shader_stage sta
    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
 }
 
+/* The buffer address formats (panvk_buffer_ubo_addr_format,
+ * panvk_buffer_ssbo_addr_format): resource handles on v9+; on v7 a
+ * Uniform Buffer table index, and a global address and size read from the
+ * set, bounds-checked by nir_lower_explicit_io when storage buffers are
+ * robust. */
+static nir_address_format
+ubo_addr_format(void)
+{
+#if PAN_ARCH < 9
+   return nir_address_format_32bit_index_offset;
+#else
+   return nir_address_format_vec2_index_32bit_offset;
+#endif
+}
+
+static nir_address_format
+ssbo_addr_format(const struct vk_pipeline_robustness_state *rs)
+{
+#if PAN_ARCH < 9
+   return rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ?
+             nir_address_format_64bit_bounded_global :
+             nir_address_format_64bit_global_32bit_offset;
+#else
+   (void)rs;
+   return nir_address_format_vec2_index_32bit_offset;
+#endif
+}
+
 struct spirv_to_nir_options
 MALI_PER_ARCH(shader_spirv_options)(const struct vk_pipeline_robustness_state *rs)
 {
-   (void)rs;
    return (struct spirv_to_nir_options){
-      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
-      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ubo_addr_format = ubo_addr_format(),
+      .ssbo_addr_format = ssbo_addr_format(rs),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .push_const_addr_format = nir_address_format_32bit_offset,
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -618,6 +867,7 @@ MALI_PER_ARCH(shader_preprocess)(struct mali_device *dev, nir_shader *nir)
    pan_preprocess_nir(nir, pdev->props.gpu_id);
 }
 
+#if PAN_ARCH >= 9
 /* The valhall backend wants the 32bit_index_offset format; we lower buffer
  * access with vec2_index_32bit_offset so the descriptor walk keeps the
  * array size for bounds checks, and fold the index back here. */
@@ -690,6 +940,7 @@ lower_get_ssbo_size(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data
    nir_def_replace(&intr->def, size);
    return true;
 }
+#endif /* PAN_ARCH >= 9 */
 
 static bool
 mark_all_access_non_uniform(nir_builder *b, nir_instr *instr, void *data)
@@ -757,7 +1008,8 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *align = comp_size * (length == 3 ? 4 : length);
 }
 
-/* Resource lowering (panvk_lower_nir). */
+/* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
+ * allocated sets s->v7.failed and ends the lowering early. */
 static void
 lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
           struct mali_shader *s, bool allow_merging_workgroups)
@@ -771,26 +1023,43 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
+#if PAN_ARCH < 9
+   /* Bifrost reads a multisampled storage image as a 3D one, samples
+    * folded into Z. Before the descriptor lowering, which lowers the
+    * sample count query this adds (panvk_lower_nir). */
+   NIR_PASS(_, nir, pan_nir_lower_image_ms);
+
+   /* Per-type descriptor tables (mali_shader.h). */
+   if (!mali_nir_lower_descriptors_v7(nir, rs, ssbo_addr_format(rs), info->layout, &s->desc,
+                                      &s->v7)) {
+      s->v7.failed = true;
+      return;
+   }
+#else
    mali_nir_lower_descriptors(nir, rs, info->layout, &s->desc);
+#endif
 
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
 
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
-            nir_address_format_vec2_index_32bit_offset);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            nir_address_format_vec2_index_32bit_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo, ubo_addr_format());
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, ssbo_addr_format(rs));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
 
+#if PAN_ARCH >= 9
    if (rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
       NIR_PASS(_, nir, nir_lower_robust_access, is_robust_ssbo_intr, NULL);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
    }
+#else
+   /* With the bounded global format, nir_lower_explicit_io bounds-checks
+    * storage buffer accesses itself. */
+#endif
 
    if (allow_merging_workgroups) {
       /* Accesses uniform in the source may not be once workgroups share a
@@ -804,6 +1073,11 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
       nir_lower_non_uniform_texture_access | nir_lower_non_uniform_texture_query |
       nir_lower_non_uniform_image_access | nir_lower_non_uniform_image_query |
       nir_lower_non_uniform_get_ssbo_size;
+#if PAN_ARCH < 9
+   /* As panvk on Bifrost: divergent texel offsets are made warp-uniform
+    * too. */
+   non_uniform_types |= nir_lower_non_uniform_texture_offset_access;
+#endif
 
    if (allow_merging_workgroups ||
        nir_has_non_uniform_access(nir, non_uniform_types)) {
@@ -814,10 +1088,15 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
       NIR_PASS(_, nir, nir_lower_non_uniform_access, &opts);
    }
 
+#if PAN_ARCH >= 9
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_get_ssbo_size,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_shader_instructions_pass, pack_buf_idx,
             nir_metadata_control_flow, NULL);
+#else
+   /* v7: nir_lower_explicit_io takes buffer sizes from the storage buffer
+    * address, and load_ubo already carries a plain table index. */
+#endif
 
    if (mesa_shader_stage_uses_workgroup(nir->info.stage)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
@@ -1165,6 +1444,136 @@ found:
    nir_progress(true, impl, nir_metadata_control_flow);
 }
 
+#if PAN_ARCH < 9
+/* ---------------------------------------------------------------------- */
+/* Stencil tile reads                                                      */
+
+/*
+ * The conversion of a stencil tile read, S8 into 32-bit unsigned
+ * registers, as panvk packs it at PAN_ARCH < 9
+ * (panvk_vX_nir_lower_input_attachment_loads.c). The input attachment
+ * lowering, compiled once, leaves the zero conversion of v9+ there, which
+ * faults on v7 with INVALID_INSTR_ENC.
+ */
+static bool
+v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_tile_pan ||
+       nir_intrinsic_io_semantics(intr).location != FRAG_RESULT_STENCIL)
+      return false;
+   assert(nir_src_is_const(intr->src[2]) && nir_src_as_uint(intr->src[2]) == 0);
+
+   struct mali_internal_conversion_packed conv;
+   pan_pack(&conv, INTERNAL_CONVERSION, cfg) {
+      cfg.register_format = MALI_REGISTER_FILE_FORMAT_U32;
+      cfg.memory_format = GENX(pan_dithered_format_from_pipe_format)(PIPE_FORMAT_S8_UINT, false);
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[2], nir_imm_int(b, conv.opaque[0]));
+   return true;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Clip distances                                                          */
+
+/*
+ * Bifrost has no clip distance hardware. As Mesa's gallium driver does for
+ * user clip planes (nir_lower_clip_fs), the distances are varyings, and the
+ * fragment shader discards a fragment whose interpolated distance is
+ * negative.
+ *
+ * The vertex shader keeps gl_ClipDistance as vk_spirv_to_nir leaves it: a
+ * compact float array, whatever its name (a gl_PerVertex member is
+ * ".gl_ClipDistance", and stripped SPIR-V has none). nir_lower_io stores
+ * its element i in component i % 4 of VARYING_SLOT_CLIP_DIST0 + i / 4, so
+ * the vertex shader's varying layout has a slot for each of the two
+ * locations it writes, as wide as the components it writes there. The
+ * fragment shader is compiled against that layout (its key includes the
+ * vertex stage, mali_pipeline.c) and tests exactly those components.
+ *
+ * A pipeline without a fragment shader gets one that does nothing else
+ * (mali_pipeline.c clip_fs_compile).
+ *
+ * The result is that of clipping the primitive, except that:
+ *  - the distance is interpolated at the pixel centre, so under
+ *    multisampling the clipped edge is not antialiased;
+ *  - the discard makes the depth/stencil update late
+ *    (mali_pipeline_state.c earlyzs_get), but with a fragment shader that
+ *    forces early fragment tests, depth and stencil are written before the
+ *    shader runs, so clipped fragments still write them.
+ */
+
+/*
+ * The fragment shader's gl_ClipDistance input, a compact float array at
+ * VARYING_SLOT_CLIP_DIST0 with at least `count` elements: the shader's
+ * own, lengthened when it declares fewer, or a new one. Its elements lower
+ * to the components the vertex shader writes, as the vertex shader's do.
+ */
+static nir_variable *
+clip_distance_input(nir_shader *nir, unsigned count)
+{
+   const struct glsl_type *type = glsl_array_type(glsl_float_type(), count, 0);
+   nir_variable *var =
+      nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_CLIP_DIST0);
+
+   if (!var) {
+      var = nir_variable_create(nir, nir_var_shader_in, type, "gl_ClipDistance");
+      var->data.location = VARYING_SLOT_CLIP_DIST0;
+      var->data.compact = true;
+   } else if (glsl_get_length(var->type) < count) {
+      /* The variable's derefs carry its type too. */
+      var->type = type;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_deref)
+                  continue;
+               nir_deref_instr *deref = nir_instr_as_deref(instr);
+               if (deref->deref_type == nir_deref_type_var && deref->var == var)
+                  deref->type = type;
+            }
+         }
+      }
+   }
+   assert(var->data.compact);
+
+   nir->info.clip_distance_array_size =
+      MAX2(nir->info.clip_distance_array_size, glsl_get_length(var->type));
+   return var;
+}
+
+/* The discard for every clip distance the vertex shader writes
+ * (vs_layout), before the fragment shader's input locations are assigned. */
+static void
+lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layout)
+{
+   if (!vs_layout)
+      return;
+   const struct pan_varying_slot *slots[2] = {
+      pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_CLIP_DIST0),
+      pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_CLIP_DIST1),
+   };
+   if (!slots[0] && !slots[1])
+      return;
+
+   nir_variable *in = clip_distance_input(nir, slots[1] ? 4 + slots[1]->ncomps
+                                                        : slots[0]->ncomps);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *clip = nir_imm_false(&b);
+   for (unsigned i = 0; i < 2; i++) {
+      for (unsigned c = 0; slots[i] && c < slots[i]->ncomps; c++) {
+         nir_def *d = nir_load_array_var_imm(&b, in, 4 * i + c);
+         clip = nir_ior(&b, clip, nir_flt_imm(&b, d, 0.0));
+      }
+   }
+   nir_discard_if(&b, clip);
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_control_flow);
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Backend compile                                                         */
 
@@ -1236,8 +1645,66 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
 }
 
 /* ---------------------------------------------------------------------- */
+/* Bifrost Renderer State Descriptor counts                                */
+
+#if PAN_ARCH < 9
+/*
+ * The shader info the RSD is packed from, patched after the compile as
+ * panvk_compile_nir does at PAN_ARCH < 9: descriptor counts from the
+ * driver's tables (mali_nir_lower_descriptors_v7.c), with the dummy
+ * sampler for a stage with textures but no sampler; the vertex attribute
+ * count up to the highest generic location read, holes included (one
+ * descriptor per location); and images counted as attributes.
+ */
+static VkResult
+v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader *s)
+{
+   /* More images than the 9-bit Attribute Buffer index can address
+    * (mali_shader.h). Only a layout over the per-stage limits gets here;
+    * its indices would spill into the Attribute's Format bits. */
+   if (s->v7.count[MALI_V7_DESC_TABLE_IMG] > MALI_V7_MAX_STAGE_IMG_ENTRIES)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "%s shader: %u storage images and texel buffers, more than the %u a "
+                       "Bifrost stage can address",
+                       mesa_shader_stage_name(s->stage), s->v7.count[MALI_V7_DESC_TABLE_IMG],
+                       MALI_V7_MAX_STAGE_IMG_ENTRIES);
+
+   s->info.ubo_count = s->v7.count[MALI_V7_DESC_TABLE_UBO] + s->v7.dyn_ubo_count;
+   s->info.texture_count = s->v7.count[MALI_V7_DESC_TABLE_TEXTURE];
+   s->info.sampler_count = s->v7.count[MALI_V7_DESC_TABLE_SAMPLER];
+   if (s->info.texture_count && !s->info.sampler_count)
+      s->info.sampler_count = 1;
+
+   if (nir->constant_data_size) {
+      s->v7.data = malloc(nir->constant_data_size);
+      if (!s->v7.data)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      memcpy(s->v7.data, nir->constant_data, nir->constant_data_size);
+      s->v7.data_size = nir->constant_data_size;
+   }
+
+   if (s->stage == MESA_SHADER_VERTEX) {
+      const uint32_t generic =
+         (s->info.attributes_read & VERT_BIT_GENERIC_ALL) >> VERT_ATTRIB_GENERIC0;
+      s->info.attribute_count = util_last_bit(generic);
+      /* bi_should_idvs() honours no_idvs (shader_compile). */
+      assert(!s->info.vs.idvs && !s->info.vs.secondary_enable);
+   } else {
+      s->info.attribute_count = 0;
+   }
+   /* Images are attributes: behind the 16 vertex attributes in a vertex
+    * shader, from 0 elsewhere (panvk_compile_nir). */
+   if (s->v7.count[MALI_V7_DESC_TABLE_IMG])
+      s->info.attribute_count = s->v7.count[MALI_V7_DESC_TABLE_IMG] +
+                                (s->stage == MESA_SHADER_VERTEX ? MALI_MAX_VS_ATTRIBS : 0);
+   return VK_SUCCESS;
+}
+#endif /* PAN_ARCH < 9 */
+
+/* ---------------------------------------------------------------------- */
 /* Upload                                                                  */
 
+#if PAN_ARCH >= 9
 static enum mali_flush_to_zero_mode
 ftz_mode(const struct mali_shader *s)
 {
@@ -1267,12 +1734,15 @@ spd_stage(mesa_shader_stage stage)
       return MALI_SHADER_STAGE_COMPUTE;
    }
 }
+#endif /* PAN_ARCH >= 9 */
 
 /*
  * Copy the code into the executable pool and build the SPDs, using
- * panvk's v9+ shapes (the same on v9 and v11). The code is padded to 128 bytes with zeros; kraid
- * pads its output already, the memset covers the rest of the
- * sub-allocation. Both pools are CPU-uncached: no cache maintenance.
+ * panvk's v9+ shapes (the same on v9 and v11); on v7, the Renderer State
+ * Descriptors of panvk's PAN_ARCH < 9 path instead. The code is padded to
+ * 128 bytes with zeros; kraid and the Bifrost backend pad their output
+ * already, the memset covers the rest of the sub-allocation. Both pools
+ * are CPU-uncached: no cache maintenance.
  */
 #if PAN_ARCH >= 10
 /*
@@ -1385,6 +1855,18 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    s->ubo_copy.count = 0;
 #endif
 
+#if PAN_ARCH < 9
+   /* The table map, for the descriptor copy jobs (mali_jm_desc_v7.c),
+    * whatever the size of the code: a copy job reads it on its own. */
+   if (s->v7.map_count) {
+      const uint64_t bytes = s->v7.map_count * sizeof(uint32_t);
+      if (!s->v7.map ||
+          mali_bo_pool_alloc(&dev->desc_pool, bytes, 16, &s->v7.map_mem) != MALI_KBASE_SUCCESS)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      memcpy(s->v7.map_mem.cpu, s->v7.map, bytes);
+   }
+#endif
+
    if (!s->bin_size)
       return VK_SUCCESS;
 
@@ -1405,6 +1887,48 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    /* The inline constant pool is addressed as PC + a 32-bit offset. */
    assert(s->code.gpu_va >> 32 == (s->code.gpu_va + padded - 1) >> 32);
 
+#if PAN_ARCH < 9
+   /* The constant data common.constant_data points at, 64-byte aligned as
+    * in panvk_shader_upload. */
+   if (s->v7.data_size) {
+      if (mali_bo_pool_alloc(&dev->desc_pool, s->v7.data_size, 64, &s->v7.data_mem) !=
+          MALI_KBASE_SUCCESS)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      memcpy(s->v7.data_mem.cpu, s->v7.data, s->v7.data_size);
+   }
+
+   /*
+    * v7 has no Shader Program Descriptor: jobs point at a Renderer State
+    * Descriptor (panvk_shader_upload at PAN_ARCH < 9). A vertex or compute
+    * shader's RSD depends on the shader alone, so it is built here. A
+    * compute shader's goes into spd[MALI_SPD_MAIN], the State of the
+    * dispatch's Draw section (mali_jm_cmd_dispatch.c); a vertex shader's
+    * into both position slots, as there is no point-size variant (the
+    * point size goes to its own varying buffer) and no varying shader (no
+    * IDVS). A fragment shader's RSD also carries depth/stencil, multisample
+    * and pixel-kill state and is followed by the Blend descriptors, so it
+    * is built per pipeline and draw (mali_pipeline_state.c,
+    * mali_jm_cmd_draw_v7.c); spd[MALI_SPD_MAIN] holds its code address.
+    */
+   if (s->stage == MESA_SHADER_FRAGMENT) {
+      s->spd[MALI_SPD_MAIN] = s->code.gpu_va;
+      return VK_SUCCESS;
+   }
+   if (mali_bo_pool_alloc(&dev->desc_pool, pan_size(RENDERER_STATE),
+                          pan_alignment(RENDERER_STATE), &s->spd_mem) != MALI_KBASE_SUCCESS)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   pan_cast_and_pack(s->spd_mem.cpu, RENDERER_STATE, cfg) {
+      mali_v7_rsd_shader(&s->info, s->code.gpu_va, &cfg);
+   }
+   if (s->stage == MESA_SHADER_COMPUTE) {
+      s->spd[MALI_SPD_MAIN] = s->spd_mem.gpu_va;
+      return VK_SUCCESS;
+   }
+   s->spd[MALI_SPD_POS_POINTS] = s->spd_mem.gpu_va;
+   s->spd[MALI_SPD_POS_TRIANGLES] = s->spd_mem.gpu_va;
+   s->spd[MALI_SPD_VARYING] = 0;
+   return VK_SUCCESS;
+#else
    const unsigned spd_count = s->stage == MESA_SHADER_VERTEX ? 3 : 1;
    if (mali_bo_pool_alloc(&dev->desc_pool, spd_count * MALI_SPD_SIZE, MALI_SPD_SIZE,
                           &s->spd_mem) != MALI_KBASE_SUCCESS)
@@ -1458,6 +1982,7 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    }
 
    return VK_SUCCESS;
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1483,6 +2008,12 @@ shader_alloc(struct mali_device *dev, mesa_shader_stage stage, const void *key,
 static void
 shader_destroy(struct mali_device *dev, struct mali_shader *s)
 {
+#if PAN_ARCH < 9
+   mali_bo_pool_free(&dev->desc_pool, &s->v7.data_mem);
+   mali_bo_pool_free(&dev->desc_pool, &s->v7.map_mem);
+   free(s->v7.data);
+   free(s->v7.map);
+#endif
    mali_bo_pool_free(&dev->desc_pool, &s->spd_mem);
    mali_bo_pool_free(&dev->exec_pool, &s->code);
    free(s->bin);
@@ -1527,6 +2058,13 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       .view_mask = (state && state->rp && state->mv) ? state->mv->view_mask : 0,
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
+#if PAN_ARCH < 9
+      /* One plain vertex shader per Vertex job, no IDVS pair: the v7 draw
+       * is a Vertex and a Tiler job (mali_jm_cmd_draw_v7.c), the form
+       * Mesa also uses on Bifrost when the shader writes gl_PointSize
+       * (bi_should_idvs). */
+      .no_idvs = true,
+#endif
    };
    struct pan_varying_layout varying_layout;
 
@@ -1537,11 +2075,11 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 
       if (inputs.view_mask) {
 #if PAN_ARCH < 10
-         /* The lowering below relies on the v10+ tiler's view mask; v9
-          * would need a draw per view (panvk's pre-v10 path), which the
+         /* The lowering below relies on the v10+ tiler's view mask; v7 and
+          * v9 would need a draw per view (panvk's pre-v10 path), which the
           * job-manager back half does not do. ARMSX2 has no multiview. */
          result = vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                            "multiview pipelines are not supported on v9");
+                            "multiview pipelines are not supported on v" NIR_STRINGIZE(PAN_ARCH));
          goto fail;
 #endif
          nir_lower_multiview_options mv = {
@@ -1585,6 +2123,11 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       NIR_PASS(_, nir, mali_nir_lower_input_attachment_loads, PAN_ARCH,
                state, &s->fs.input_attachment_read);
 
+#if PAN_ARCH < 9
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_stencil_tile_conv,
+               nir_metadata_control_flow, NULL);
+      lower_clip_distance_fs(nir, info->vs_varying_layout);
+#endif
       /* Input slots first: their count sizes the front of the driver
        * table (mali_shader.h). */
       nir_assign_io_var_locations(nir, nir_var_shader_in);
@@ -1616,7 +2159,9 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
       /* Blend descriptors become driver-provided FAU values
-       * (load_blend_descriptor_pan -> fs.blend_descs). */
+       * (load_blend_descriptor_pan -> fs.blend_descs); on v7 the BLEND
+       * instructions read them from the hardware's blend FAU slots
+       * (lower_sysvals). */
       const bool atest = fs_needs_atest(nir, state, s->fs.input_attachment_read, info->meta);
       s->fs.no_atest = !atest;
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, !atest, 0);
@@ -1629,6 +2174,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 
    case MESA_SHADER_COMPUTE: {
       s->desc.driver_table_prefix = 0;
+#if PAN_ARCH >= 9
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
       s->info.cs.allow_merging_workgroups = valhall_can_merge_workgroups(nir);
       if (s->info.cs.allow_merging_workgroups) {
@@ -1639,6 +2185,12 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          nir_foreach_function_impl(impl, nir)
             nir_progress(true, impl, ~nir_metadata_divergence);
       }
+#else
+      /* No workgroup merging on Bifrost: the compiler has no merge_wg
+       * options before v9 (pan_get_nir_shader_compiler_options), and
+       * panvk gates this on PAN_ARCH >= 9. allow_merging_workgroups stays
+       * false. */
+#endif
       lower_nir(nir, info, s, s->info.cs.allow_merging_workgroups);
       break;
    }
@@ -1649,12 +2201,25 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       goto fail;
    }
 
+#if PAN_ARCH < 9
+   if (s->v7.failed) {
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail;
+   }
+#endif
+
    result = compile_nir(dev, nir, &inputs, state, s);
    if (result != VK_SUCCESS)
       goto fail;
 
    if (stage == MESA_SHADER_FRAGMENT)
       s->desc.needs_varying_descs = s->info.bifrost.uses_ld_var;
+
+#if PAN_ARCH < 9
+   result = v7_fixup_info(dev, nir, s);
+   if (result != VK_SUCCESS)
+      goto fail;
+#endif
 
    ralloc_free(nir);
    nir = NULL;
@@ -1698,9 +2263,44 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    }
    blob_write_uint32(blob, s->bin_size);
    blob_write_bytes(blob, s->bin, s->bin_size);
+#if PAN_ARCH < 9
+   /* The Bifrost descriptor tables and constant data. */
+   blob_write_bytes(blob, s->v7.count, sizeof(s->v7.count));
+   blob_write_uint32(blob, s->v7.dyn_ubo_count);
+   blob_write_uint32(blob, s->v7.needs_set_addrs);
+   blob_write_uint32(blob, s->v7.map_count);
+   blob_write_bytes(blob, s->v7.map, s->v7.map_count * sizeof(uint32_t));
+   blob_write_uint32(blob, s->v7.data_size);
+   blob_write_bytes(blob, s->v7.data, s->v7.data_size);
+#endif
 
    return !blob->out_of_memory;
 }
+
+#if PAN_ARCH < 9
+/*
+ * Whether a deserialized shader's v7 counts are ones a compile produces.
+ * The dynamic buffer counts size host arrays (mali_jm_desc_v7.c
+ * pack_dyn_ubos, build_dyn_ssbos), the table map has one entry per copied
+ * table entry (the descriptor copy job reads that many), and the image
+ * table is within MALI_V7_MAX_STAGE_IMG_ENTRIES (v7_fixup_info). The
+ * pushed uniform buffer words size the copy table of mali_v7_ubo_copy.
+ */
+static bool
+v7_desc_counts_valid(const struct mali_shader *s)
+{
+   uint64_t entries = 0;
+   for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++)
+      entries += s->v7.count[t];
+
+   return s->v7.dyn_ubo_count <= s->desc.dyn_bufs.count &&
+          s->v7.dyn_ubo_count <= MALI_MAX_DYNAMIC_UNIFORM_BUFFERS &&
+          s->desc.dyn_bufs.count - s->v7.dyn_ubo_count <= MALI_MAX_DYNAMIC_STORAGE_BUFFERS &&
+          entries == s->v7.map_count &&
+          s->v7.count[MALI_V7_DESC_TABLE_IMG] <= MALI_V7_MAX_STAGE_IMG_ENTRIES &&
+          s->fau.ubo_push_count <= MALI_MAX_UBO_PUSH_FAUS;
+}
+#endif
 
 static struct vk_pipeline_cache_object *
 shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
@@ -1731,10 +2331,23 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    }
    s->bin_size = blob_read_uint32(blob);
    const void *bin = blob_read_bytes(blob, s->bin_size);
+#if PAN_ARCH < 9
+   blob_copy_bytes(blob, s->v7.count, sizeof(s->v7.count));
+   s->v7.dyn_ubo_count = blob_read_uint32(blob);
+   s->v7.needs_set_addrs = blob_read_uint32(blob);
+   s->v7.map_count = blob_read_uint32(blob);
+   const void *map = blob_read_bytes(blob, s->v7.map_count * sizeof(uint32_t));
+   s->v7.data_size = blob_read_uint32(blob);
+   const void *data = blob_read_bytes(blob, s->v7.data_size);
+#endif
 
    if (blob->overrun || s->info.stage != stage ||
        s->desc.dyn_bufs.count > MALI_MAX_DYNAMIC_BUFFERS)
       goto fail;
+#if PAN_ARCH < 9
+   if (!v7_desc_counts_valid(s))
+      goto fail;
+#endif
 
    if (s->bin_size) {
       s->bin = malloc(s->bin_size);
@@ -1742,6 +2355,20 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
          goto fail;
       memcpy(s->bin, bin, s->bin_size);
    }
+#if PAN_ARCH < 9
+   if (s->v7.map_count) {
+      s->v7.map = malloc(s->v7.map_count * sizeof(uint32_t));
+      if (!s->v7.map)
+         goto fail;
+      memcpy(s->v7.map, map, s->v7.map_count * sizeof(uint32_t));
+   }
+   if (s->v7.data_size) {
+      s->v7.data = malloc(s->v7.data_size);
+      if (!s->v7.data)
+         goto fail;
+      memcpy(s->v7.data, data, s->v7.data_size);
+   }
+#endif
 
    if (shader_upload(dev, s) != VK_SUCCESS)
       goto fail;

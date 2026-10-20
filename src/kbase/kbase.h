@@ -280,6 +280,9 @@ struct mali_kbase {
    enum mali_kbase_jm_atom_layout jm_atom_layout;
    int jm_probe_errno;
    uint32_t jm_probe_event;
+   /* Job manager only: MEM_JIT_INIT failed with ENOMEM (no room for the
+    * zone in the GPU's VA) and the context runs without a JIT zone. */
+   bool jm_no_jit;
    /* SET_FLAGS succeeded: the kernel context exists. */
    bool context_created;
    /* mali_kbase_abandon was called. */
@@ -310,7 +313,8 @@ struct mali_kbase {
  *      (64-byte base_jd_atom); acceptance means the MediaTek frame_nr
  *      layout, and the atom's completion event is read back before
  *      returning, so no event or atom number is left over for the
- *      caller.
+ *      caller. An ENOMEM answer to MEM_JIT_INIT, from a GPU VA too narrow
+ *      for the zone, leaves the context without one (jm_no_jit).
  *   3. If neither answer matches, INCOMPATIBLE_KERNEL, logging both
  *      refusals.
  *

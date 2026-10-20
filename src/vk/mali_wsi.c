@@ -10,13 +10,14 @@
  *
  * Mostly frontend-neutral: gralloc usage, binding a buffer and acquire
  * touch nothing that differs between the
- * command-stream frontend (v11) and the job manager (v9) -- acquire goes
- * through the runtime's own sync-file import, which already dispatches to
- * whichever vk_sync type the physical device chose -- so they are compiled
- * once, in the non-v9 build (mali_wsi_gralloc_usage, mali_wsi_image_bind_buffer,
- * mali_wsi_acquire below). Release reads a mali_sync's payload directly
- * (its req[] has a different meaning and size per frontend, mali_jm.h vs
- * mali_queue.h), so it is compiled per architecture, like mali_sync.c;
+ * command-stream frontend (v11) and the job manager (v7 and v9) -- acquire
+ * goes through the runtime's own sync-file import, which already
+ * dispatches to whichever vk_sync type the physical device chose -- so
+ * they are compiled once, in the CSF build (mali_wsi_gralloc_usage,
+ * mali_wsi_image_bind_buffer, mali_wsi_acquire below). Release reads a
+ * mali_sync's payload directly (its req[] has a different meaning and size
+ * per frontend, mali_jm.h vs mali_queue.h), so it is compiled per
+ * architecture, like mali_sync.c;
  * mali_wsi_release (compiled once, next to the other three) dispatches to
  * the queue's frontend.
  */
@@ -43,7 +44,7 @@
 
 #include "mali_image.h"
 #include "mali_memory.h"
-#if defined(PAN_ARCH) && PAN_ARCH == 9
+#if defined(PAN_ARCH) && PAN_ARCH < 10
 #include "mali_jm.h"
 #else
 #include "mali_queue.h"
@@ -56,7 +57,7 @@
 #define wsi_errorf(obj, result, ...)                                            \
    (mesa_loge("malisx2: WSI: " __VA_ARGS__), vk_errorf(obj, result, __VA_ARGS__))
 
-#if PAN_ARCH != 9
+#if PAN_ARCH >= 10
 
 /* ---------------------------------------------------------------------- */
 /* Gralloc usage                                                           */
@@ -272,7 +273,7 @@ mali_wsi_acquire(struct mali_device *dev, int fd, VkSemaphore semaphore, VkFence
     * The driver owns fd whatever happens (the VK_ANDROID_native_buffer
     * contract); a successful import owns what it was given. Like the blob,
     * nothing waits here: the semaphore's waiter makes the GPU wait (kcpu on
-    * v11, a FENCE_WAIT atom on v9), the fence's waiter polls.
+    * v11, a FENCE_WAIT atom on the job manager), the fence's waiter polls.
     */
    int sem_fd = -1, fence_fd = -1;
    if (fd >= 0) {
@@ -333,24 +334,24 @@ mali_wsi_acquire(struct mali_device *dev, int fd, VkSemaphore semaphore, VkFence
    return result;
 }
 
-#endif /* PAN_ARCH != 9 */
+#endif /* PAN_ARCH >= 10 */
 
 /* ---------------------------------------------------------------------- */
 /* Release (per architecture: see the file comment)                        */
 
 /* How many uint64_t slots a mali_sync's req[] holds here: the done value
- * per CSF subqueue on v11, the submission number and tracker atom on v9
- * (mali_jm.h's MALI_SYNC_REQ_COUNT). Local to this function: the rest of
- * the file never looks inside a mali_sync. */
-#if PAN_ARCH == 9
+ * per CSF subqueue on v11, the submission number and tracker atom on v7
+ * and v9 (mali_jm.h's MALI_SYNC_REQ_COUNT). Local to this function: the
+ * rest of the file never looks inside a mali_sync. */
+#if PAN_ARCH < 10
 #define MALI_WSI_SYNC_REQ_COUNT MALI_SYNC_REQ_COUNT
 #else
 #define MALI_WSI_SYNC_REQ_COUNT MALI_SUBQUEUE_COUNT
 #endif
 
 /* Declared here, not in mali_queue.h/mali_jm.h: only this file defines and
- * calls the per-arch body (the dispatcher below calls the other arch's by
- * its own extern declaration). */
+ * calls the per-arch body (the dispatcher below declares the job-manager
+ * variants itself, with MALI_PER_JM_ARCH_DECL). */
 VkResult MALI_PER_ARCH(wsi_release)(struct mali_queue *queue, uint32_t count,
                                     const VkSemaphore *semaphores, int *out_fd);
 
@@ -373,8 +374,8 @@ MALI_PER_ARCH(wsi_release)(struct mali_queue *queue, uint32_t count, const VkSem
     * The blob's release: kcpu waits for every semaphore's payload, then a
     * kcpu FENCE_SIGNAL whose sync file is the release fence. Here the
     * payloads are sync files (FENCE_WAIT) and GPU work (CQS waits on the
-    * done slots on v11, the submission's tracker on v9), both in the
-    * sync_file_create hook (mali_queue.h, mali_jm.h).
+    * done slots on v11, the submission's tracker on the job manager), both
+    * in the sync_file_create hook (mali_queue.h, mali_jm.h).
     */
    pthread_mutex_lock(&dev->lock);
    if (dev->lost) {
@@ -424,22 +425,27 @@ out:
 
 #undef MALI_WSI_SYNC_REQ_COUNT
 
-#if PAN_ARCH != 9
+#if PAN_ARCH >= 10
 /*
  * vkQueueSignalReleaseImageANDROID's entry point (mali_android.c) and the
- * host tests call this name; mali_v9_wsi_release is the only other
- * variant (defined when this same file is built at PAN_ARCH=9 into
- * malisx2_vk_v9, always linked next to this, non-v9, build). Compiled
- * once here, like the three functions above.
+ * host tests call this name; mali_v7_wsi_release and mali_v9_wsi_release
+ * are the other variants (defined when this same file is built at
+ * PAN_ARCH=7 and 9 into malisx2_vk_v7 and malisx2_vk_v9, always linked
+ * next to this CSF build). Compiled once here, like the three functions
+ * above.
  */
-extern VkResult mali_v9_wsi_release(struct mali_queue *queue, uint32_t count,
-                                    const VkSemaphore *semaphores, int *out_fd);
+MALI_PER_JM_ARCH_DECL(VkResult, wsi_release, (struct mali_queue *queue, uint32_t count,
+                                              const VkSemaphore *semaphores, int *out_fd));
 
 VkResult
 mali_wsi_release(struct mali_queue *queue, uint32_t count, const VkSemaphore *semaphores,
                  int *out_fd)
 {
-   return queue->jm ? mali_v9_wsi_release(queue, count, semaphores, out_fd)
-                     : MALI_PER_ARCH(wsi_release)(queue, count, semaphores, out_fd);
+   if (queue->jm) {
+      struct mali_device *dev = container_of(queue->vk.base.device, struct mali_device, vk);
+      const uint32_t arch = mali_device_physical(dev)->arch;
+      return mali_jm_arch_dispatch(arch, wsi_release, queue, count, semaphores, out_fd);
+   }
+   return MALI_PER_ARCH(wsi_release)(queue, count, semaphores, out_fd);
 }
 #endif

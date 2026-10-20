@@ -67,6 +67,10 @@ mali_compiler_init(uint64_t gpu_id)
    util_call_once(&compiler_once, compiler_init_once);
 
    const unsigned arch = pan_arch(gpu_id);
+   /* No kraid on v7: pan_use_kraid() answers false below arch 9, so
+    * pan_shader_compile() uses Mesa's Bifrost backend. Nothing to check. */
+   if (arch < 9)
+      return MALI_COMPILE_OK;
    const mesa_shader_stage stages[] = {
       MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT, MESA_SHADER_COMPUTE,
    };

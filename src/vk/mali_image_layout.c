@@ -38,9 +38,6 @@
 /* ---------------------------------------------------------------------- */
 /* AFBC                                                                    */
 
-/* 16 bytes of header per 16x16 superblock (the AFBC format's header
- * block, AFBC_HEADER_BYTES_PER_TILE in pan_afbc.h). */
-#define AFBC_HEADER_BYTES 16
 #define AFBC_SB 16
 
 enum mali_afbc_mode
@@ -104,9 +101,8 @@ mali_afbc_can_ytr(enum pipe_format format)
           desc->colorspace == UTIL_FORMAT_COLORSPACE_RGB;
 }
 
-/* Superblocks per side of a header tile (pan_afbc_tile_size). */
-static unsigned
-afbc_tile_sbs(enum pipe_format format)
+unsigned
+mali_afbc_header_tile_sbs(enum pipe_format format)
 {
    return util_format_get_blocksizebits(format) <= 32 ? 8 : 4;
 }
@@ -114,7 +110,7 @@ afbc_tile_sbs(enum pipe_format format)
 unsigned
 mali_afbc_min_extent(enum pipe_format format)
 {
-   return AFBC_SB * afbc_tile_sbs(format) / 2;
+   return AFBC_SB * mali_afbc_header_tile_sbs(format) / 2;
 }
 
 /*
@@ -128,17 +124,17 @@ mali_afbc_min_extent(enum pipe_format format)
 static void
 afbc_slice(enum pipe_format f, unsigned w, unsigned h, struct mali_image_slice *s)
 {
-   const unsigned ts = afbc_tile_sbs(f);
+   const unsigned ts = mali_afbc_header_tile_sbs(f);
    const unsigned aw = ALIGN_POT(w, AFBC_SB * ts);
    const unsigned ah = ALIGN_POT(h, AFBC_SB * ts);
    const unsigned row_align = util_format_get_blocksizebits(f) <= 32 ? 1024 : 256;
 
-   s->row_stride = ALIGN_POT((aw / AFBC_SB) * ts * AFBC_HEADER_BYTES, row_align);
-   const unsigned row_sbs = s->row_stride / (AFBC_HEADER_BYTES * ts);
+   s->row_stride = ALIGN_POT((aw / AFBC_SB) * ts * MALI_AFBC_HEADER_BYTES, row_align);
+   const unsigned row_sbs = s->row_stride / (MALI_AFBC_HEADER_BYTES * ts);
    const uint64_t sbs = (uint64_t)row_sbs * (ah / AFBC_SB);
    const uint64_t payload = AFBC_SB * AFBC_SB * util_format_get_blocksize(f);
 
-   s->afbc_header_size = sbs * AFBC_HEADER_BYTES;
+   s->afbc_header_size = sbs * MALI_AFBC_HEADER_BYTES;
    s->surface_stride = ALIGN_POT((uint64_t)s->afbc_header_size, MALI_AFBC_ALIGN) + sbs * payload;
 }
 

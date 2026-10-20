@@ -4,20 +4,20 @@
  */
 
 /*
- * GPU timing of passes and dispatches on the job manager (v9): the
+ * GPU timing of passes and dispatches on the job manager (v7 and v9): the
  * job-manager counterpart of timing.c.
  *
  * timing.c is compiled once, at this build's fixed CSF (v11) struct
  * mali_cmd_buffer layout and mali_cmd_alloc(); calling its functions with
- * a v9 cmd pointer would read cmd->measure, and allocate command memory,
- * at the wrong offsets. This file is therefore its own implementation of
- * the pieces that touch cmd directly (region allocation out of command
- * memory, cmd->jm.measure, the pending-submit queue), built at PAN_ARCH=9
- * against mali_jm.h's struct mali_cmd_buffer. Everything else -- struct
- * mali_measure_cmd / mali_measure_region, the configuration and output
- * writers in config.c, and mali_measure_harvest / mali_measure_collect in
- * timing.c -- is the one shared implementation both frontends call; none
- * of it touches cmd.
+ * a job-manager cmd pointer would read cmd->measure, and allocate command
+ * memory, at the wrong offsets. This file is therefore its own
+ * implementation of the pieces that touch cmd directly (region allocation
+ * out of command memory, cmd->jm.measure, the pending-submit queue), built
+ * at PAN_ARCH 7 and 9 against mali_jm.h's struct mali_cmd_buffer.
+ * Everything else -- struct mali_measure_cmd / mali_measure_region, the
+ * configuration and output writers in config.c, and mali_measure_harvest /
+ * mali_measure_collect in timing.c -- is the one shared implementation both
+ * frontends call; none of it touches cmd.
  *
  * Recording: a region is a System Timestamp Write Value job with the
  * header Barrier bit into the chain the caller names (mali_jm_cmd_write_value,

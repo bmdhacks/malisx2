@@ -4,11 +4,11 @@
  */
 
 /*
- * Timestamp queries on the job manager (v9): vkCreateQueryPool,
+ * Timestamp queries on the job manager (v7 and v9): vkCreateQueryPool,
  * vkDestroyQueryPool, vkCmdResetQueryPool, vkCmdWriteTimestamp,
  * vkGetQueryPoolResults. ARMSX2 turns GPU timing on for any device
- * whose name is not "Mali-G615", so the G57 build needs these; the
- * G615 build does not (they stay waist stubs there,
+ * whose name is not "Mali-G615", so the G57 and G52 builds need these;
+ * the G615 build does not (they stay waist stubs there,
  * mali_v11_device_entrypoints never gets them -- see the file comment
  * in mali_jm.h).
  *

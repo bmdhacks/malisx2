@@ -4,12 +4,12 @@
  */
 
 /*
- * Compute dispatch on the job manager (v9): one 128-byte Compute job per
+ * Compute dispatch on the job manager (v7 and v9): one Compute job per
  * dispatch in the open batch's vtc chain (Mesa gallium pan_jm.c
  * jm_launch_grid; the T820 blob writes the same job). The FAU block,
  * resource table and Local Storage descriptor come from the builders
- * shared with the v11 back half (mali_cmd_state.h); what differs is where
- * they go:
+ * shared with the v11 back half (mali_cmd_state.h); what differs on v9,
+ * where the job is 128 bytes, is where they go:
  *
  *  - workgroup size, counts and task axis/increment in the Compute
  *    payload; offsets 0, as on v11 (the base workgroup is a system value);
@@ -23,11 +23,19 @@
  * The internal dispatches (cmd_dispatch_shader, cmd_dispatch_meta) are the
  * transfers done by compute (copies, fills, updates) and meet the barriers
  * whose destination is only the transfer stages; vkCmdDispatch does not.
+ *
+ * On v7 (Bifrost) the Compute job is 192 bytes and has no Shader
+ * Environment: its Draw section points at the shader's Renderer State
+ * Descriptor and at descriptor tables built for each dispatch
+ * (mali_jm_desc_v7.c; the v7 half of dispatch below).
  */
 
 #include "mali_cmd_state.h"
 
 #include "mali_measure.h"
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#endif
 
 static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
@@ -40,6 +48,109 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    if (!groups[0] || !groups[1] || !groups[2])
       return;
 
+#if PAN_ARCH < 9
+   /*
+    * As panvk_v7's cmd_dispatch (jm/panvk_vX_cmd_dispatch.c): the workgroup
+    * size and count as Invocation shifts, the job task split in
+    * Parameters, and a Draw section pointing at the RSD, the FAU block, the
+    * Local Storage descriptor and the descriptor tables. The tables'
+    * entries from the sets are written by a copy job in front, which this
+    * job depends on. The tables are built anew for every dispatch: compute
+    * keeps no dirty state.
+    *
+    * Internal dispatches that read textures (the AFBC plane copy,
+    * mali_cmd_image.c) use no descriptor sets and name texture i of
+    * `textures` and sampler 0 by literal index. The shader's RSD counts no
+    * textures, so such a dispatch packs an RSD of its own with the counts
+    * of its Texture table and its one nearest sampler.
+    */
+   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+   struct mali_v7_desc_tables tables;
+   if (!mali_v7_desc_prepare(cmd, cs, desc, true, &tables))
+      return;
+   uint64_t rsd = cs->spd[MALI_SPD_MAIN];
+   if (texture_count) {
+      assert(!desc && !cs->desc.used_set_mask && !cs->v7.map_count);
+      struct mali_ptr tex = mali_cmd_alloc(cmd, (uint64_t)texture_count * pan_size(TEXTURE), 64);
+      struct mali_ptr samp = mali_cmd_alloc(cmd, pan_size(SAMPLER), 64);
+      struct mali_ptr state =
+         mali_cmd_alloc(cmd, pan_size(RENDERER_STATE), pan_alignment(RENDERER_STATE));
+      if (!tex.cpu || !samp.cpu || !state.cpu)
+         return;
+      for (unsigned i = 0; i < texture_count; i++)
+         memcpy((uint8_t *)tex.cpu + i * pan_size(TEXTURE), textures[i], pan_size(TEXTURE));
+      pan_cast_and_pack(samp.cpu, SAMPLER, cfg) {
+         cfg.seamless_cube_map = false;
+         cfg.normalized_coordinates = false;
+         cfg.clamp_integer_array_indices = false;
+         cfg.minify_nearest = true;
+         cfg.magnify_nearest = true;
+      }
+      pan_cast_and_pack(state.cpu, RENDERER_STATE, cfg) {
+         mali_v7_rsd_shader(&cs->info, mali_shader_code_va(cs), &cfg);
+         cfg.shader.texture_count = texture_count;
+         cfg.shader.sampler_count = 1;
+      }
+      tables.tables[MALI_V7_DESC_TABLE_TEXTURE] = tex.gpu;
+      tables.tables[MALI_V7_DESC_TABLE_SAMPLER] = samp.gpu;
+      rsd = state.gpu;
+   }
+   const uint64_t fau =
+      mali_compute_fau(cmd, cs, &tables, push, push_size, base, groups) & BITFIELD64_MASK(56);
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (cs->fau.total_count && !fau))
+      return;
+   /* The RSD's preload.uniform_count is the shader's FAU word count; the
+    * block built here has as many words. */
+   assert(cs->fau.total_count == DIV_ROUND_UP(cs->info.fau.count, 2));
+
+   struct mali_jm_chain *c = xfer ? mali_jm_cmd_vtc_transfer(cmd) : mali_jm_cmd_vtc(cmd);
+   if (!c)
+      return;
+
+   uint16_t copy_dep = 0;
+   if (!mali_v7_desc_copy(cmd, c, cs, &tables, 0, &copy_dep))
+      return;
+
+   /* Timing. */
+   uint32_t mh = 0;
+   if (unlikely(cmd->jm.measure)) {
+      mh = mali_jm_measure_begin(cmd, MALI_MEASURE_DISPATCH, c, MALI_JM_SLOT_VTC,
+                                 cmd->dispatches);
+      uint64_t key;
+      memcpy(&key, cs->key, sizeof(key));
+      mali_jm_measure_info(cmd, mh, groups[0], groups[1], groups[2],
+                          cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2]);
+      mali_jm_measure_shader(cmd, mh, key);
+   }
+
+   struct mali_ptr job = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE,
+                                             pan_size(COMPUTE_JOB), false, copy_dep);
+   if (!job.cpu) {
+      if (unlikely(mh))
+         mali_jm_measure_end(cmd, mh, c);
+      return;
+   }
+
+   mali_v7_compute_invocation(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION),
+                              cs->cs.local_size, groups);
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = mali_v7_compute_task_split(cs->cs.local_size);
+   }
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = rsd;
+      cfg.attributes = tables.img_attribs;
+      cfg.attribute_buffers = tables.tables[MALI_V7_DESC_TABLE_IMG];
+      cfg.thread_storage = tsd;
+      cfg.uniform_buffers = tables.tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.push_uniforms = fau;
+      cfg.textures = tables.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = tables.tables[MALI_V7_DESC_TABLE_SAMPLER];
+   }
+   cmd->dispatches++;
+   if (unlikely(mh))
+      mali_jm_measure_end(cmd, mh, c);
+#else
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    const uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
@@ -96,6 +207,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    cmd->dispatches++;
    if (unlikely(mh))
       mali_jm_measure_end(cmd, mh, c);
+#endif /* PAN_ARCH >= 9 */
 }
 
 void

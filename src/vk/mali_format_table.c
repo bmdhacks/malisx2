@@ -6,9 +6,11 @@
 /*
  * The per-arch half of format support (mali_formats.c): image and buffer
  * features from Mesa's format table of this arch (pan_format.c, built once
- * per arch) and the GPU's compressed-format bits. The two arches' tables
+ * per arch) and the GPU's compressed-format bits. The arches' tables
  * differ in a few entries (v9 has no R10X6-style formats and numbers the
- * narrow ASTC formats differently); each arch answers from its own.
+ * narrow ASTC formats differently from v11; v7 gives compressed formats
+ * their own hardware format, not an interchange one); each arch answers
+ * from its own.
  */
 
 #ifndef PAN_ARCH
@@ -97,6 +99,13 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
 
    if (f->bind & PAN_BIND_DEPTH_STENCIL)
       feat |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+#if PAN_ARCH < 9
+   /* v7 blits depth and stencil through a frame shader that writes them
+    * (mali_cmd_image.c), so its sampleable depth/stencil formats are blit
+    * destinations too (nearest only, identical formats, as Vulkan asks). */
+   if ((f->bind & PAN_BIND_DEPTH_STENCIL) && (f->bind & PAN_BIND_SAMPLER_VIEW))
+      feat |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
+#endif
 
    return feat;
 }

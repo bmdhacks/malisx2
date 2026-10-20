@@ -4,12 +4,13 @@
  */
 
 /*
- * The tiler heap ring of the job-manager (v9) back half: MALI_JM_HEAP_SLOTS
- * growable GPU regions the tiler allocates polygon lists and vertex packets
- * from (mali_jm.h has the scheme). The driver owns the memory and writes
- * the Tiler Heap descriptor itself when it records, as Mesa's v9 gallium
- * driver does; there is no JIT allocation and no GPU job that sets the heap
- * up. What the heap must look like to the GPU:
+ * The tiler heap ring of the job-manager (v7 and v9) back half:
+ * MALI_JM_HEAP_SLOTS growable GPU regions the tiler allocates polygon lists
+ * from, and on v9 vertex packets too (mali_jm.h has the scheme). The
+ * driver owns the memory and writes the Tiler Heap descriptor itself when
+ * it records, as Mesa's gallium driver does; there is no JIT allocation
+ * and no GPU job that sets the heap up. What the heap must look like to
+ * the GPU:
  *
  *  - Size: the region's size; Base and Bottom: its start;
  *  - Top: the end of the first 2 MiB chunk, not the end of the region. The
@@ -21,8 +22,8 @@
  *    TILER_ALIGN_TOP with a 2 MiB commit and a 2 MiB growth step makes the
  *    kernel place the region so that start + commit is 2 MiB aligned, so
  *    start + 2 MiB is the end of the committed chunk;
- *  - word 0: Buffer, Tiler heap, 2 MiB chunks, dynamic partitioning (the
- *    genxml defaults, 0x329).
+ *  - word 0 on v9: Buffer, Tiler heap, 2 MiB chunks, dynamic partitioning
+ *    (the genxml defaults, 0x329); v7's descriptor has no fields there.
  *
  * The GPU moves Bottom and Top in the descriptor as it allocates, so the
  * passes of a batch that share one descriptor continue from each other, and
@@ -69,9 +70,11 @@ slot_alloc(struct mali_jm_device *jd, struct mali_kbase_bo *bo)
       .commit_size = MALI_JM_HEAP_CHUNK,
       .extension_pages = MALI_JM_HEAP_CHUNK / KB_PAGE_SIZE,
       /* COHERENT_LOCAL (inner shareable on the GPU), as the kernel gives
-       * its own JIT regions: the tiler reads the positions the shader
-       * cores write into this memory during the same job, which it does
-       * not see otherwise. */
+       * its own JIT regions. On v9 the tiler reads the positions the
+       * shader cores write into this memory during the same Malloc Vertex
+       * job, which it does not see otherwise. On v7 the shader cores write
+       * the varyings to command memory and only the tiler writes here (its
+       * polygon lists); the flag stays as on the JIT regions. */
       .flags = MALI_KBASE_FLAGS_DEVICE_TRANSIENT | KB_MEM_GROW_ON_GPF | KB_MEM_TILER_ALIGN_TOP,
       .mem_class = MALI_KBASE_MEM_CLASS_DEVICE_TRANSIENT,
    };

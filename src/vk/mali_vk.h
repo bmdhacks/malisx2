@@ -25,6 +25,7 @@
 
 #include "kbase/kbase.h"
 
+#include "mali_arch.h"
 #include "mali_bo_pool.h"
 
 #include "mali_entrypoints.h"
@@ -104,12 +105,12 @@ struct mali_shader;
 
 /*
  * Measurement (timing.c, shared by both frontends): has submission seq
- * completed on jd's queue? Defined in mali_jm_queue.c (v9 only); called
+ * completed on jd's queue? Defined in mali_jm_queue.c (v7 and v9); called
  * from timing.c only when dev->jm is non-NULL, so the CSF build never
- * calls it. jd is never dereferenced outside v9 files, so this needs no
+ * calls it. jd is never dereferenced outside JM files, so this needs no
  * frontend-specific type here.
  */
-bool mali_jm_measure_reached(struct mali_jm_device *jd, uint64_t seq);
+MALI_PER_JM_ARCH_DECL(bool, jm_measure_reached, (struct mali_jm_device *jd, uint64_t seq));
 
 /* Internal compute/fragment shaders for copies, fills and blits
  * (mali_cmd_copy.c, mali_cmd_meta_gfx.c). Frontend-neutral: every GPU
@@ -140,7 +141,7 @@ struct mali_queue {
    struct vk_queue vk;
    /* Queue group, rings, submit state (mali_queue.h). */
    struct mali_csf_queue *csf;
-   /* Job-manager submit state (mali_jm.h), on a v9 device instead. */
+   /* Job-manager submit state (mali_jm.h), on a v7 or v9 device instead. */
    struct mali_jm_queue *jm;
    /* Same object as csf or jm above, untyped: lets frontend-neutral code
     * hold a queue pointer without the frontend's type. Set by the
@@ -174,8 +175,8 @@ struct mali_device {
     * runs, so it exists under either frontend.
     */
 
-   /* Command-buffer memory: free 64 KiB slabs, shared by every command
-    * pool of the device. */
+   /* Command-buffer memory: free slabs (64 KiB, and on v7 also 1 MiB),
+    * shared by every command pool of the device. */
    simple_mtx_t slab_lock;
    struct list_head free_slabs;
    unsigned free_slab_count;
@@ -220,7 +221,7 @@ struct mali_device {
     * once that frontend exists. Scoreboard facts, the event thread, the
     * queue group and the kcpu queue stay inside it (mali_queue.h). */
    struct mali_csf_device *csf;
-   /* The job-manager state on a v9 device (mali_jm.h): atom numbers,
+   /* The job-manager state on a v7 or v9 device (mali_jm.h): atom numbers,
     * on-demand event reading, the sync-file stream. */
    struct mali_jm_device *jm;
    /* Same object as csf or jm above, untyped: lets frontend-neutral code
@@ -249,22 +250,25 @@ struct mali_device {
 VK_DEFINE_HANDLE_CASTS(mali_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 
 /*
- * The v9 (job-manager) back half, as code built once (mali_device.c,
+ * The job-manager back half (v7 and v9), as code built once (mali_device.c,
  * mali_physical_device.c) reaches it: device and queue setup
  * (mali_jm_queue.c), command buffers (mali_jm_cmd_buffer.c) and the sync
- * type (mali_sync.c built at v9). The v11 counterparts are in
+ * type (mali_sync.c built at v7 and v9). The v11 counterparts are in
  * mali_queue.h and mali_cmd_buffer.h.
  */
 struct vk_command_buffer_ops;
 struct vk_queue_submit;
 struct vk_sync_type;
-VkResult mali_v9_device_init(struct mali_device *dev);
-void mali_v9_device_finish(struct mali_device *dev);
-void mali_v9_device_quiesce(struct mali_device *dev);
-VkResult mali_v9_queue_init(struct mali_device *dev, struct mali_queue *queue);
-void mali_v9_queue_finish(struct mali_device *dev, struct mali_queue *queue);
-VkResult mali_v9_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit);
+MALI_PER_JM_ARCH_DECL(VkResult, device_init, (struct mali_device *dev));
+MALI_PER_JM_ARCH_DECL(void, device_finish, (struct mali_device *dev));
+MALI_PER_JM_ARCH_DECL(void, device_quiesce, (struct mali_device *dev));
+MALI_PER_JM_ARCH_DECL(VkResult, queue_init, (struct mali_device *dev, struct mali_queue *queue));
+MALI_PER_JM_ARCH_DECL(void, queue_finish, (struct mali_device *dev, struct mali_queue *queue));
+MALI_PER_JM_ARCH_DECL(VkResult, queue_submit,
+                      (struct vk_queue *vkq, struct vk_queue_submit *submit));
+extern const struct vk_command_buffer_ops mali_v7_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v9_cmd_buffer_ops;
+extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
 
@@ -301,5 +305,24 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
    *n = i + 1;
    return i < 8 || (i + 1) % 100 == 0;
 }
+
+#if defined(PAN_ARCH) && PAN_ARCH == 7
+#include "util/log.h"
+
+/*
+ * A path v7 does not support: logged once per call site, after which the
+ * caller skips that work. The command buffer records no error for it: an
+ * error recorded there is what vkEndCommandBuffer returns, and that may not
+ * be VK_ERROR_FEATURE_NOT_PRESENT.
+ */
+#define MALI_V7_UNSUPPORTED(what)                                              \
+   do {                                                                        \
+      static bool mali_v7_unsupported_said_;                                   \
+      if (!mali_v7_unsupported_said_) {                                        \
+         mali_v7_unsupported_said_ = true;                                     \
+         mesa_logw("malisx2: %s: %s is not supported on v7", __func__, what);  \
+      }                                                                        \
+   } while (0)
+#endif
 
 #endif

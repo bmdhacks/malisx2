@@ -60,6 +60,27 @@
 /* The same scheme, ending in the v9 build's own shader cache ID. */
 #define MALI_V9_DRIVER_INFO \
    "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V9_SHORT
+/* The G52 build (arch 7): the same scheme, ending in the v7 build's own
+ * shader cache ID. */
+#define MALI_V7_DRIVER_VERSION MALI_DRIVER_VERSION
+#define MALI_V7_DRIVER_INFO \
+   "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V7_SHORT
+
+static inline const char *
+driver_info_for_arch(uint32_t arch)
+{
+   return arch == 7 ? MALI_V7_DRIVER_INFO
+          : arch == 9 ? MALI_V9_DRIVER_INFO
+                      : MALI_DRIVER_INFO;
+}
+
+static inline uint32_t
+driver_version_for_arch(uint32_t arch)
+{
+   return arch == 7 ? MALI_V7_DRIVER_VERSION
+          : arch == 9 ? MALI_V9_DRIVER_VERSION
+                      : MALI_DRIVER_VERSION;
+}
 
 /* Arch the driver was built for (meson.build pan_arch). */
 #ifndef MALI_PAN_ARCH
@@ -69,6 +90,7 @@
 /* VkFence and binary VkSemaphore (mali_sync.c, built once per arch). */
 static const struct vk_sync_type *const mali_v11_sync_types[] = { &mali_v11_sync_type, NULL };
 static const struct vk_sync_type *const mali_v9_sync_types[] = { &mali_v9_sync_type, NULL };
+static const struct vk_sync_type *const mali_v7_sync_types[] = { &mali_v7_sync_type, NULL };
 
 void
 mali_kbase_log_to_vk(void *user, const char *msg)
@@ -134,9 +156,27 @@ v9_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    snprintf(buf, size, "Mali-%s MC%u", p->core_count < 7 ? "G57" : "G77", p->core_count);
 }
 
+/*
+ * Arch 7 (Bifrost, job manager): product major 2 is the Mali-G52, accepted
+ * at any arch minor and revision. Mesa's model table names arch minor 2
+ * "G52" and 4 "G52 r1"; the two differ in tile buffer size
+ * (tilebuf_budget). The other arch 7 parts (G51, G76, G31) are not
+ * supported, and physical_device_create skips them.
+ */
+static bool
+v7_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
+{
+   if ((p->product_id & 0xf00f) != 0x7002)
+      return false;
+   snprintf(buf, size, "Mali-G52");
+   return true;
+}
+
 bool
 mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
+   if (p->arch_major == 7)
+      return v7_device_name(p, buf, size);
    if (p->arch_major == 9) {
       v9_device_name(p, buf, size);
       return true;
@@ -291,7 +331,8 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * but that word holds tile-buffer read/write masks, which this
     * extension does not touch; the Flags 0 bits it needs exist on v9
     * the same as v11, and mali_jm_cmd_draw.c already copies them into
-    * the job. Advertised on both arches. */
+    * the job. On v7 the same bits are in the Renderer State Descriptor's
+    * properties word (mali_pipeline_state.c). Advertised on every arch. */
    .EXT_rasterization_order_attachment_access = true,
    .ARM_rasterization_order_attachment_access = true,
 
@@ -307,11 +348,13 @@ static const struct vk_device_extension_table mali_device_extensions = {
 
    /* Without it ARMSX2 de-indexes every flat-shaded draw on the CPU to
     * fake a last-vertex convention (up to 3x the vertices) instead of
-    * just setting the pipeline's mode. Same hardware bit on both arches. */
+    * just setting the pipeline's mode. Same hardware bit on v9 and v11;
+    * on v7 it is a bit of each tiler job's Primitive word
+    * (mali_jm_cmd_draw_v7.c). */
    .EXT_provoking_vertex = true,
 
    /* ARMSX2 pushes its texture set instead of allocating and writing a new
-    * descriptor set per draw; both arches share the same descriptor-set
+    * descriptor set per draw; every arch shares the same descriptor-set
     * code (mali_descriptor_set.c), so this needs no per-arch gate. */
    .KHR_push_descriptor = true,
 };
@@ -324,15 +367,18 @@ device_extensions_for_arch(uint32_t arch)
 }
 
 /*
- * Dual-source blending. Neither arch has a second-source operand in the
- * fixed-function blender: a render target whose equation uses a SRC1
+ * Dual-source blending. Neither v9 nor v11 has a second-source operand in
+ * the fixed-function blender: a render target whose equation uses a SRC1
  * factor runs a blend shader, and only pipelines with such an equation
  * keep the fragment shader's second colour output (mali_shader.c).
  *
- * Reported on both arches. ARMSX2 then hardware-blends some draws into
+ * Reported on v9 and v11. ARMSX2 then hardware-blends some draws into
  * 16-bit PS2 frames without the PS2's colour truncation, a few levels too
  * bright, as on every other driver that reports it; it saves those draws
  * a framebuffer read.
+ *
+ * Not reported on v7. panvk_v7 has it, through a blend shader that reads
+ * the second colour (blend2_pan) from its blend input registers.
  */
 static bool
 dual_src_blend_for_arch(uint32_t arch)
@@ -369,14 +415,21 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectFirstInstance = false,
       .depthClamp = true,
       .depthBiasClamp = true,
+      /* v7 only: clip distances are varyings the fragment shader tests
+       * and discards on (mali_shader.c, "Clip distances"). The test is
+       * per pixel, at the pixel centre, so under multisampling the
+       * clipped edge is not antialiased; and with a fragment shader that
+       * forces early fragment tests, clipped fragments still write depth
+       * and stencil. */
+      .shaderClipDistance = arch == 7,
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
       .largePoints = true,
       .alphaToOne = false,
       .multiViewport = false,
-      /* No minimum revision on v9: Mesa's model table lists none for the
-       * G57 or G68 (it does for some Bifrost parts). */
+      /* No minimum revision on v7 or v9: Mesa's model table lists none
+       * for the G52, G57 or G68 (it does for the G51 and G72). */
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
@@ -398,9 +451,10 @@ get_features(struct vk_features *f, uint32_t arch)
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,
 
-      /* VK_EXT_rasterization_order_attachment_access, both arches: the
+      /* VK_EXT_rasterization_order_attachment_access, every arch: the
        * draw descriptor's Flags 0 word (mali_pipeline_state.c) carries
-       * this on v9 the same as v11. */
+       * this on v9 the same as v11, the Renderer State Descriptor's
+       * properties word on v7. */
       .rasterizationOrderColorAttachmentAccess = true,
       .rasterizationOrderDepthAttachmentAccess = true,
       .rasterizationOrderStencilAttachmentAccess = true,
@@ -453,10 +507,16 @@ sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
  * for arch 9 (G77, and G57 from three vendors) all store the same constant
  * whatever core_features says, and Mesa's model table gives the G57 and
  * G68 the same 16 KiB.
+ *
+ * v7: Mesa's model table gives the G52 (arch minor 2) 16 KiB of colour
+ * tile buffer and the G52 r1 (arch minor 4) 8 KiB. Any arch minor from 4
+ * on is taken as the r1, any below as the G52.
  */
 static unsigned
 tilebuf_budget(const struct mali_kbase_gpu_props *p)
 {
+   if (p->arch_major == 7)
+      return p->arch_minor >= 4 ? 8192 : 16384;
    if (p->arch_major == 9)
       return 16384;
    unsigned variant = p->core_features & 0xff;
@@ -474,6 +534,16 @@ mali_physical_device_sample_counts(const struct mali_physical_device *pdev,
    return sample_counts(bytes_per_pixel, tilebuf_budget(&pdev->props));
 }
 
+/* For the tile size choice on v7, where the two G52 revisions differ
+ * (mali_fb.c, declared in mali_image.h). */
+unsigned mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev);
+
+unsigned
+mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev)
+{
+   return tilebuf_budget(&pdev->props);
+}
+
 static void
 hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
 {
@@ -489,8 +559,8 @@ hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
  * commit made every driver update start with an empty cache. It hashes
  * the architecture's shader cache ID (a hash of every source that can
  * change that architecture's shader binaries, src/vk/gen_shader_cache_id.py:
- * MALI_SHADER_CACHE_ID for the G615, MALI_SHADER_CACHE_ID_V9 for the G57)
- * and the GPU ID.
+ * MALI_SHADER_CACHE_ID for the G615, MALI_SHADER_CACHE_ID_V9 for the G57,
+ * MALI_SHADER_CACHE_ID_V7 for the G52) and the GPU ID.
  */
 static void
 pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cache_id_size,
@@ -522,11 +592,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const uint64_t max_alloc = MIN2(heap_size(p), 8ull << 30);
    const float ts_period = pdev->timestamp_hz ? 1e9f / (float)pdev->timestamp_hz : 1.0f;
 
-   /* The G57 build's own identity scheme (above). */
-   const uint32_t driver_version =
-      p->arch_major == 9 ? MALI_V9_DRIVER_VERSION : MALI_DRIVER_VERSION;
-   const char *const driver_info =
-      p->arch_major == 9 ? MALI_V9_DRIVER_INFO : MALI_DRIVER_INFO;
+   /* The G57 and G52 builds' own identity schemes (above). */
+   const uint32_t driver_version = driver_version_for_arch(p->arch_major);
+   const char *const driver_info = driver_info_for_arch(p->arch_major);
 
    *props = (struct vk_properties) {
       .apiVersion = MALI_API_VERSION,
@@ -648,9 +716,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .subgroupSize = 16,
       /*
        * Only what a 1.1 device must have until we have checked which
-       * subgroup operations kraid handles. Not in the vertex stage: the
-       * hardware may run vertex invocations for indices that are never
-       * drawn (panvk's reasoning).
+       * subgroup operations kraid (Mesa's Bifrost backend on v7) handles.
+       * Not in the vertex stage: the hardware may run vertex invocations
+       * for indices that are never drawn (panvk's reasoning).
        */
       .subgroupSupportedStages = VK_SHADER_STAGE_FRAGMENT_BIT |
                                  VK_SHADER_STAGE_COMPUTE_BIT,
@@ -673,6 +741,42 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
    };
 
+   /*
+    * The Mali-G52 (v7) has no resource tables and takes panvk_v7's limits:
+    * per set, those of the Renderer State's 16-bit sampler and texture
+    * counts and 8-bit uniform buffer count, the Uniform Buffer's 12-bit
+    * entry count and the Attribute's 9-bit buffer index
+    * (panvk_descriptor_set_layout.h); per stage, panvk_shader.h's. The
+    * exception is the per-stage sampled image limit: storage images,
+    * storage texel buffers and uniform texel buffers share a stage's image
+    * table of MALI_V7_MAX_STAGE_IMG_ENTRIES (mali_shader.h), and Vulkan
+    * counts uniform texel buffers as sampled images, so that limit is what
+    * the storage images leave of the table. Uniform buffers hold at most
+    * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
+    * (pan_subgroup_size).
+    */
+   if (p->arch_major == 7) {
+      props->maxClipDistances = MALI_V7_MAX_CLIP_DISTANCES;
+      props->maxCombinedClipAndCullDistances = MALI_V7_MAX_CLIP_DISTANCES;
+      props->maxUniformBufferRange = 1u << 16;
+      props->maxPerStageDescriptorSamplers = 128;
+      props->maxPerStageDescriptorUniformBuffers = UINT8_MAX - 32;
+      props->maxPerStageDescriptorStorageBuffers = 64;
+      props->maxPerStageDescriptorStorageImages = 32;
+      props->maxPerStageDescriptorSampledImages =
+         MALI_V7_MAX_STAGE_IMG_ENTRIES - props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageResources =
+         props->maxPerStageDescriptorSamplers + props->maxPerStageDescriptorUniformBuffers +
+         props->maxPerStageDescriptorStorageBuffers + props->maxPerStageDescriptorSampledImages +
+         props->maxPerStageDescriptorStorageImages + props->maxPerStageDescriptorInputAttachments;
+      props->maxDescriptorSetSamplers = UINT16_MAX;
+      props->maxDescriptorSetUniformBuffers = UINT8_MAX - 32;
+      props->maxDescriptorSetStorageBuffers = 1u << 12;
+      props->maxDescriptorSetSampledImages = UINT16_MAX;
+      props->maxDescriptorSetStorageImages = 1u << 8;
+      props->subgroupSize = 8;
+   }
+
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);
    /* The blob reports the device name as driverName too. */
    snprintf(props->driverName, sizeof(props->driverName), "%s", name);
@@ -684,7 +788,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    props->deviceUUID[4] = 1;
    /* driverUUID: a hash of driverInfo, so never the blob's. */
    hash_uuid(props->driverUUID, driver_info, strlen(driver_info) + 1);
-   if (p->arch_major == 9)
+   if (p->arch_major == 7)
+      pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V7,
+                          sizeof(MALI_SHADER_CACHE_ID_V7), p->gpu_id);
+   else if (p->arch_major == 9)
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V9,
                           sizeof(MALI_SHADER_CACHE_ID_V9), p->gpu_id);
    else
@@ -809,14 +916,15 @@ physical_device_create(struct mali_instance *instance, const char *path,
    mali_kbase_destroy(kb);
 
    /* The arch has to match the frontend the kernel speaks: CSF with v11,
-    * the job manager with v9. */
+    * the job manager with v7 and v9. */
    const bool arch_ok =
       (pdev->arch == MALI_PAN_ARCH && frontend == MALI_KBASE_FRONTEND_CSF) ||
-      (pdev->arch == 9 && frontend == MALI_KBASE_FRONTEND_JM);
+      (mali_arch_is_jm(pdev->arch) && frontend == MALI_KBASE_FRONTEND_JM);
    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
-                "one this driver was built for (arch %u)", path,
+                "one this driver was built for (arch %u, arch 9, or the "
+                "Mali-G52 of arch 7)", path,
                 pdev->props.product_id, pdev->props.arch_major, MALI_PAN_ARCH);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -828,7 +936,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
     * this is here. No "malisx2:" prefix: the corpus tools count those lines
     * as warnings. */
    mesa_logi("malisx2 build %s, driverInfo %s", MALI_GIT_SHA,
-            pdev->arch == 9 ? MALI_V9_DRIVER_INFO : MALI_DRIVER_INFO);
+            driver_info_for_arch(pdev->arch));
 
    struct vk_features features;
    struct vk_properties props;
@@ -852,11 +960,14 @@ physical_device_create(struct mali_instance *instance, const char *path,
    vk_physical_device_dispatch_table_from_entrypoints(
       &pdev->vk.dispatch_table, &mali_waist_physical_device_entrypoints, false);
 
-   pdev->vk.supported_sync_types = pdev->arch == 9 ? mali_v9_sync_types : mali_v11_sync_types;
+   pdev->vk.supported_sync_types = pdev->arch == 7 ? mali_v7_sync_types
+                                   : pdev->arch == 9 ? mali_v9_sync_types
+                                                     : mali_v11_sync_types;
 
    /* Compiled shaders are what pipeline caches hold. */
-   pdev->vk.pipeline_cache_import_ops = pdev->arch == 9 ? mali_v9_pipeline_cache_import_ops
-                                                        : mali_v11_pipeline_cache_import_ops;
+   pdev->vk.pipeline_cache_import_ops = pdev->arch == 7 ? mali_v7_pipeline_cache_import_ops
+                                        : pdev->arch == 9 ? mali_v9_pipeline_cache_import_ops
+                                                          : mali_v11_pipeline_cache_import_ops;
 
    *out = &pdev->vk;
    return VK_SUCCESS;

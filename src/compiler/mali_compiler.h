@@ -5,10 +5,11 @@
 
 /*
  * The backend end of the shader compile path: Mesa's panfrost compiler with
- * kraid as the only backend. The Vulkan layer (src/vk/mali_shader.c) takes
- * SPIR-V through vtn, the Vulkan runtime and its own NIR lowering; this
- * file does the checks around that and the final NIR-to-machine-code
- * step.
+ * kraid as the backend on v9 and v11, and Mesa's Bifrost backend on v7
+ * (pan_use_kraid() answers false below arch 9). The Vulkan layer
+ * (src/vk/mali_shader.c) takes SPIR-V through vtn, the Vulkan runtime and
+ * its own NIR lowering; this file does the checks around that and the
+ * final NIR-to-machine-code step.
  *
  * Two things here exist because the vendored compiler can take the
  * process down:
@@ -54,10 +55,12 @@ enum mali_compile_status {
 const char *mali_compile_status_string(enum mali_compile_status status);
 
 /*
- * One-time process setup (GLSL type singleton), then a check that Mesa's
- * compiler selects kraid for every stage of this architecture. Thread-safe;
- * cheap after the first call. Returns MALI_COMPILE_NO_KRAID if the build
- * lost the kraid selection (mesa-glue/src/panfrost/compiler/meson.build).
+ * One-time process setup (GLSL type singleton), then, from arch 9, a check
+ * that Mesa's compiler selects kraid for every stage of this architecture.
+ * Below arch 9 there is nothing to check: Mesa's Bifrost backend compiles.
+ * Thread-safe; cheap after the first call. Returns MALI_COMPILE_NO_KRAID
+ * if the build lost the kraid selection
+ * (mesa-glue/src/panfrost/compiler/meson.build).
  */
 enum mali_compile_status mali_compiler_init(uint64_t gpu_id);
 
@@ -70,16 +73,18 @@ enum mali_compile_status mali_compiler_init(uint64_t gpu_id);
 bool mali_spirv_structure_ok(const uint32_t *words, size_t word_count);
 
 /*
- * pan_shader_compile() behind the kraid guard. Consumes nothing: the caller
- * still owns nir. On MALI_COMPILE_UNSUPPORTED, why (if not NULL) says what
- * kraid would not have handled.
+ * pan_shader_compile() behind the kraid guard, which only v9 and v11
+ * shaders reach: on v7 pan_shader_compile() never calls kraid. Consumes
+ * nothing: the caller still owns nir. On MALI_COMPILE_UNSUPPORTED, why (if
+ * not NULL) says what kraid would not have handled.
  */
 enum mali_compile_status
 mali_compile_nir(nir_shader *nir, struct pan_compile_inputs *inputs,
                  struct util_dynarray *binary, struct pan_shader_info *info,
                  char *why, size_t why_size);
 
-/* Disassemble kraid output for the given GPU. */
+/* Disassemble compiled code for the given GPU: kraid's on v9 and v11, the
+ * Bifrost backend's on v7 (pan_disassemble picks by arch). */
 void mali_disassemble(FILE *fp, uint64_t gpu_id, const void *code, size_t size);
 
 /* Number of shaders the kraid guard refused, over the whole process

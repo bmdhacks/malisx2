@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Derived from Mesa src/panfrost/compiler/bifrost/meson.build. The bifrost
-# backend is built only because pan_compiler.c and kraid link against it
-# (kraid is the only compile path).
+# backend is the compile path on v7; on v9 and v11 kraid compiles, and
+# pan_compiler.c and kraid link against this library.
 
 _vb = mesa_src / 'panfrost' / 'compiler' / 'bifrost'
 

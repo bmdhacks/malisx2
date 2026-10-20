@@ -7,11 +7,11 @@
 # does not touch the compiler, and is thrown away when one does.
 #
 # There is one hash per GPU architecture the driver is built for (--arch),
-# because each GPU only runs shaders built for its own: a file only one
-# architecture's build compiles (the job-manager back half, mali_jm*, is
-# v9 only) is left out of the other architectures' hashes, so a change to
-# it does not empty the other GPU's pipeline cache. The first --arch is the
-# one MALI_SHADER_CACHE_ID names; each also gets MALI_SHADER_CACHE_ID_V<n>.
+# because each GPU only runs shaders built for its own: a file only some
+# architectures' builds compile or use (ARCH_ONLY below) is left out of the
+# other architectures' hashes, so a change to it does not empty the other
+# GPUs' pipeline caches. The first --arch is the one MALI_SHADER_CACHE_ID
+# names; each also gets MALI_SHADER_CACHE_ID_V<n>.
 #
 # Hashing too much only costs a needless recompile; hashing too little lets a
 # stale shader binary be reused. So the hash covers the whole source tree and
@@ -75,12 +75,22 @@ EXCLUDE_FILES = {
 }
 
 
-# Files only one architecture's build compiles or reads: arch -> a test on
-# the path relative to the source root.
-ARCH_ONLY = {
-    9: lambda rel: (rel.startswith('src/vk/mali_jm') or
-                    rel == 'mesa/src/panfrost/genxml/v9.xml'),
-}
+# Files only some architectures' builds compile or read: a test on the path
+# relative to the source root, and those architectures. A file several
+# tests match is hashed only for the architectures every one of them names.
+# The job-manager back half (mali_jm*) is built at 7 and 9, except its
+# draws: mali_jm_cmd_draw.c at 9 and mali_jm_cmd_draw_v7.c at 7. The
+# v7-only sources are named *_v7.c and *_v7.h. Shaders take their
+# descriptor lowering from mali_nir_lower_descriptors.c on 9 and 11 and
+# from mali_nir_lower_descriptors_v7.c on 7 (mali_shader.c).
+ARCH_ONLY = [
+    (lambda rel: rel.startswith('src/vk/mali_jm'), {7, 9}),
+    (lambda rel: rel == 'src/vk/mali_jm_cmd_draw.c', {9}),
+    (lambda rel: rel == 'src/vk/mali_nir_lower_descriptors.c', {9, 11}),
+    (lambda rel: rel == 'mesa/src/panfrost/genxml/v9.xml', {9}),
+    (lambda rel: (rel == 'mesa/src/panfrost/genxml/v7.xml' or
+                  rel.endswith(('_v7.c', '_v7.h'))), {7}),
+]
 
 
 def excluded(rel, arch):
@@ -88,7 +98,7 @@ def excluded(rel, arch):
         return True
     if '__pycache__' in rel.split('/'):
         return True
-    if any(a != arch and only(rel) for a, only in ARCH_ONLY.items()):
+    if any(arch not in archs and only(rel) for only, archs in ARCH_ONLY):
         return True
     return any(rel.startswith(d + '/') for d in EXCLUDE_DIRS)
 

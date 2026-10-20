@@ -14,7 +14,10 @@
  * whose Buffer descriptor is packed at the write. Dynamic buffers have no
  * slot: their address and range stay in the set's host memory and the
  * command buffer writes them, with the dynamic offset applied, into the
- * driver's resource table (table 0) at draw or dispatch time.
+ * driver's resource table (table 0) at draw or dispatch time. v7 has no
+ * resource tables: a dynamic uniform buffer goes into the stage's Uniform
+ * Buffer table behind the regular ones, a dynamic storage buffer into the
+ * stage's dynamic storage buffer table (mali_jm_desc_v7.c).
  *
  * Set memory is CPU-uncached and GPU read-only (the blob's descriptor pool
  * without dynamic bindings), so a CPU write needs no cache maintenance and
@@ -27,6 +30,7 @@
 #include <stdint.h>
 
 #include "util/bitset.h"
+#include "util/u_math.h"
 #include "util/vma.h"
 #include "vk_buffer_view.h"
 #include "vk_object.h"
@@ -49,7 +53,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(mali_sampler, vk.base, VkSampler,
 
 struct mali_buffer_view {
    struct vk_buffer_view vk;
-   struct mali_hw_desc desc;    /* Buffer, type Structure */
+   /* Buffer, type Structure; on v7 a 1D Attribute Buffer and an Attribute
+    * (Bifrost reads texel buffers as images). */
+   struct mali_hw_desc desc;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_buffer_view, vk.base, VkBufferView,
@@ -116,6 +122,42 @@ mali_descriptor_set_size(const struct mali_descriptor_set *set)
    return (uint64_t)set->layout->desc_count * MALI_DESCRIPTOR_SIZE;
 }
 
+/* Where a dynamic buffer bound to nothing points: an address the GPU's
+ * memory sink absorbs (panvk). */
+#define MALI_NULL_BUFFER_ADDR (0x8ull << 60)
+
+/*
+ * v7: a storage buffer's set slot, and an entry of a stage's dynamic
+ * storage buffer table (panvk_ssbo_addr): what the shader's
+ * load_vulkan_descriptor reads (mali_nir_lower_descriptors_v7.c).
+ */
+struct mali_v7_ssbo_addr {
+   uint64_t base_addr;
+   uint32_t size;
+   uint32_t zero[5];
+};
+static_assert(sizeof(struct mali_v7_ssbo_addr) == MALI_DESCRIPTOR_SIZE, "one slot");
+
+/* The v7 storage buffer entry of range bytes at addr. The size is rounded
+ * up to 4 bytes, as panvk's, and kept within its 32 bits. */
+static inline struct mali_v7_ssbo_addr
+mali_v7_ssbo_addr(uint64_t addr, uint64_t range)
+{
+   return (struct mali_v7_ssbo_addr){
+      .base_addr = addr,
+      .size = (uint32_t)MIN2(align64(range, 4), UINT32_MAX & ~3ull),
+   };
+}
+
+/* The Entries of a v7 Uniform Buffer descriptor of range bytes: 16-byte
+ * entries, at least one (the field is the count minus one) and at most
+ * 4096: 64 KiB, this arch's maxUniformBufferRange. */
+static inline uint32_t
+mali_v7_ubo_entries(uint64_t range)
+{
+   return CLAMP(DIV_ROUND_UP(range, 16), 1, 1u << 12);
+}
+
 /* ---------------------------------------------------------------------- */
 /* For the command buffer: what a bound set contributes to the shader
  * resource tables of a draw or dispatch. None of these touch the command
@@ -128,7 +170,8 @@ mali_descriptor_set_size(const struct mali_descriptor_set *set)
  * The Resource entry for a bound set (resource table set + 1): the set's
  * memory, Contains descriptors set, size in bytes. set may be NULL (an
  * unbound or unused set number): an empty entry. out: 16 bytes, 16-byte
- * aligned in a 64-byte aligned table.
+ * aligned in a 64-byte aligned table. v9 and v11 only: v7 has no resource
+ * tables.
  */
 MALI_PER_ARCH_DECL(void, descriptor_set_pack_resource,
                    (const struct mali_descriptor_set *set, void *out));
@@ -138,14 +181,16 @@ MALI_PER_ARCH_DECL(void, descriptor_set_pack_resource,
  * offset applied, for the driver table (table 0) slot the shader's
  * mali_shader_desc_info::dyn_bufs map names. Sizes are rounded up to 16
  * bytes for uniform buffers and 4 for storage buffers (panvk). out: 32
- * bytes.
+ * bytes. v9 and v11 only: v7 packs its dynamic buffers into the stage's
+ * tables (mali_jm_desc_v7.c).
  */
 MALI_PER_ARCH_DECL(void, descriptor_set_pack_dyn_buf,
                    (const struct mali_descriptor_set *set, uint32_t idx,
                     uint32_t dynamic_offset, void *out));
 
-/* The driver table's dummy sampler (texel fetches still name a sampler on
- * Valhall). out: 32 bytes. */
+/* The dummy sampler of the driver table, or on v7 of a stage's Sampler
+ * table (texel fetches still name a sampler on Valhall and Bifrost). out:
+ * 32 bytes. */
 MALI_PER_ARCH_DECL(void, pack_dummy_sampler, (void *out));
 
 /* ---------------------------------------------------------------------- */

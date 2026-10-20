@@ -27,7 +27,7 @@
 #include "mali_pipeline.h"
 
 /* ---------------------------------------------------------------------- */
-/* Interned keys (mali_pipeline.h), shared by both arches' pipelines      */
+/* Interned keys (mali_pipeline.h), shared by every arch's pipelines      */
 
 struct key_entry {
    uint32_t id;
@@ -143,13 +143,16 @@ queue_init(struct mali_device *dev, struct mali_queue *queue,
       return result;
    /* CSF: the queue group, its rings and the tiler heap (mali_queue.c).
     * Job manager: the slot-order and submission state (mali_jm_queue.c). */
-   const bool jm = mali_device_physical(dev)->arch == 9;
-   result = jm ? mali_v9_queue_init(dev, queue) : mali_csf_queue_init(dev, queue);
+   const uint32_t arch = mali_device_physical(dev)->arch;
+   const bool jm = mali_arch_is_jm(arch);
+   result = jm ? mali_jm_arch_dispatch(arch, queue_init, dev, queue)
+               : mali_csf_queue_init(dev, queue);
    if (result != VK_SUCCESS) {
       vk_queue_finish(&queue->vk);
       return result;
    }
-   queue->vk.driver_submit = jm ? mali_v9_queue_submit : mali_queue_submit;
+   queue->vk.driver_submit = !jm ? mali_queue_submit
+                             : arch == 7 ? mali_v7_queue_submit : mali_v9_queue_submit;
    return VK_SUCCESS;
 }
 
@@ -157,7 +160,7 @@ static void
 queue_finish(struct mali_device *dev, struct mali_queue *queue)
 {
    if (queue->jm)
-      mali_v9_queue_finish(dev, queue);
+      mali_jm_arch_dispatch(mali_device_physical(dev)->arch, queue_finish, dev, queue);
    else
       mali_csf_queue_finish(dev, queue);
    vk_queue_finish(&queue->vk);
@@ -169,7 +172,7 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    /* Job manager: no atom may still be running when its memory is freed
     * below (bounded wait; mali_jm.h). */
    if (dev->jm)
-      mali_v9_device_quiesce(dev);
+      mali_jm_arch_dispatch(mali_device_physical(dev)->arch, device_quiesce, dev);
    /* Reads the last results while the queue's done slots still exist. */
    mali_measure_finish(dev);
    for (uint32_t i = 0; i < dev->queue_count; i++)
@@ -177,7 +180,7 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    /* Command-stream state: event thread (CSF-specific; mali_csf_device
     * itself), or the job-manager state. */
    if (dev->jm)
-      mali_v9_device_finish(dev);
+      mali_jm_arch_dispatch(mali_device_physical(dev)->arch, device_finish, dev);
    else
       mali_csf_device_finish(dev);
    /* Frontend-neutral device state: command memory, internal shaders
@@ -214,16 +217,19 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return vk_error(pdev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /*
-    * Four layers, first match wins: the device's own arch (mali_v9_* or
-    * mali_v11_*, MALI_PER_ARCH in the per-arch and command-stream files),
-    * then our arch-independent entry points, then Mesa's common entry
-    * points (added by vk_device_init), then the waist stubs. Only the
-    * first layer depends on pdev->arch; everything below it is the same
-    * table regardless of which GPU this is.
+    * Four layers, first match wins: the device's own arch (mali_v7_*,
+    * mali_v9_* or mali_v11_*, MALI_PER_ARCH in the per-arch and
+    * command-stream files), then our arch-independent entry points, then
+    * Mesa's common entry points (added by vk_device_init), then the waist
+    * stubs. Only the first layer depends on pdev->arch; everything below
+    * it is the same table regardless of which GPU this is.
     */
    struct vk_device_dispatch_table dispatch;
    vk_device_dispatch_table_from_entrypoints(
-      &dispatch, pdev->arch == 9 ? &mali_v9_device_entrypoints : &mali_v11_device_entrypoints,
+      &dispatch,
+      pdev->arch == 7 ? &mali_v7_device_entrypoints
+      : pdev->arch == 9 ? &mali_v9_device_entrypoints
+                        : &mali_v11_device_entrypoints,
       true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &mali_device_entrypoints, false);
 
@@ -282,10 +288,14 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       char layout[192];
       mesa_logi("malisx2 job-manager atom layout: %s",
                 mali_kbase_jm_atom_layout_str(dev->kbase, layout, sizeof(layout)));
+      if (dev->kbase->jm_no_jit)
+         mesa_logi("malisx2 job-manager context without a JIT zone: the kernel refused "
+                   "MEM_JIT_INIT (GPU MMU VA %u bits)", dev->kbase->props.va_bits);
    }
 
-   /* Shaders: kraid must be the compiler, code goes to the executable
-    * zone, and pipelines created without a VkPipelineCache still share
+   /* Shaders: kraid must be the compiler on v9 and v11 (v7 compiles
+    * through Mesa's Bifrost backend), code goes to the executable zone,
+    * and pipelines created without a VkPipelineCache still share
     * identical shaders through the device's own in-memory cache. */
    mali_bo_pool_init_exec(&dev->exec_pool, dev->kbase);
    mali_bo_pool_init_desc(&dev->desc_pool, dev->kbase);
@@ -301,8 +311,11 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    /* Command buffers and the queue's shared state: the frontend the
-    * physical device's arch has (CSF on v11, the job manager on v9). */
-   if (pdev->arch == 9) {
+    * physical device's arch has (CSF on v11, the job manager on v7 and v9). */
+   if (pdev->arch == 7) {
+      dev->vk.command_buffer_ops = &mali_v7_cmd_buffer_ops;
+      result = mali_v7_device_init(dev);
+   } else if (pdev->arch == 9) {
       dev->vk.command_buffer_ops = &mali_v9_cmd_buffer_ops;
       result = mali_v9_device_init(dev);
    } else {

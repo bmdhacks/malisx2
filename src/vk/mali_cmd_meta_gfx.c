@@ -25,6 +25,15 @@
  * Built per arch. The v9 Draw descriptor has no Flags 2 (the tile-buffer
  * read and write masks), and takes the FAU count in its own field, as
  * v11's does.
+ *
+ * v7 (Bifrost) has no resource tables, Shader Environments or frame
+ * argument: the shaders use texture i and sampler 0 of the draw's own
+ * tables, the Draw section points at a Renderer State Descriptor with the
+ * Blend descriptors behind it, and a layered frame shader takes the layer
+ * from its push constants, one Draw per layer, as panvk's v7 frame shaders
+ * do (panvk_vX_cmd_frame_shaders.c). With no Fullscreen job, in-pass draws
+ * (clears) are Tiler jobs drawing a rectangle (mali_jm_cmd_render.c
+ * mali_v7_cmd_meta_quads).
  */
 
 #ifndef PAN_ARCH
@@ -51,11 +60,24 @@
 #include "mali_descriptor_set.h"
 #include "mali_image.h"
 #include "mali_vk.h"
+#if PAN_ARCH < 9
+#include "compiler/nir/nir_format_convert.h"
+#include "mali_rsd_v7.h"
+#include "pan_format.h"
+#endif
 
 #define META_FS_CACHE_SIZE 64
 
 struct mali_meta_gfx {
+#if PAN_ARCH < 9
+   /* v7 reads a texture source, an AFBC plane, only in a copy format, so
+    * copy[] holds the raw sources alone ([0][log2 block bytes]) and the
+    * copies out of AFBC planes are kept by copy format. */
+   struct mali_shader *copy[1][5];
+   struct mali_shader *copy_tex_fmt[MALI_META_COPY_FMT_COUNT];
+#else
    struct mali_shader *copy[2][5];   /* [source is a texture][log2 block bytes] */
+#endif
    struct mali_shader *copy_quad[3]; /* [log2 block bytes] */
    unsigned count;
    struct {
@@ -91,7 +113,9 @@ out_type(enum mali_meta_fs_type t)
    }
 }
 
-/* A texture instruction on table 0: texture 1 + tex, sampler 0. */
+/* A texture instruction reading texture `tex` with sampler 0: entries
+ * 1 + tex and 0 of resource table 0, or on v7 entries tex and 0 of the
+ * draw's or dispatch's Texture and Sampler tables. */
 static nir_def *
 tex_op(nir_builder *b, nir_texop op, unsigned tex, nir_def *coord, bool array,
        nir_alu_type type)
@@ -101,8 +125,15 @@ tex_op(nir_builder *b, nir_texop op, unsigned tex, nir_def *coord, bool array,
    t->sampler_dim = GLSL_SAMPLER_DIM_2D;
    t->is_array = array;
    t->dest_type = type;
+#if PAN_ARCH < 9
+   /* v7 has no resource tables: texture `tex` and sampler 0 of the draw's
+    * tables (panvk_vX_cmd_frame_shaders.c compact_tex_indices). */
+   t->texture_index = tex;
+   t->sampler_index = 0;
+#else
    t->texture_index = pan_res_handle(0, 1 + tex);
    t->sampler_index = pan_res_handle(0, 0);
+#endif
    t->coord_components = coord->num_components;
    t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
    t->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, op == nir_texop_txf ? nir_imm_int(b, 0)
@@ -165,6 +196,36 @@ copy_raw_load(nir_builder *b, const struct mali_meta_fs_key *key, nir_def *sxy, 
    return raw_to_uvec4(b, nir_load_global(b, comps, bits, addr, .align_mul = MIN2(elem, 16)));
 }
 
+/* The BLIT source coordinate: normalized, with the source layer as z for
+ * an array. */
+static nir_def *
+blit_coord(nir_builder *b, nir_def *pos, nir_def *layer)
+{
+   nir_def *scale = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, blit_scale));
+   nir_def *offset = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, blit_offset));
+   nir_def *uv = nir_ffma(b, pos, scale, offset);
+   if (!layer)
+      return uv;
+   return nir_vec3(b, nir_channel(b, uv, 0), nir_channel(b, uv, 1),
+                   nir_fadd(b, nir_u2f32(b, layer),
+                            push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, blit_layer))));
+}
+
+#if PAN_ARCH < 9
+/* A depth or stencil BLIT (v7 only): the source plane (texture tex)
+ * sampled at the transformed position inside the area, the target plane
+ * (texture tex + 1) outside it. */
+static nir_def *
+blit_zs(nir_builder *b, unsigned tex, nir_def *pos, nir_def *xy, nir_def *layer,
+        nir_def *inside, nir_alu_type type)
+{
+   nir_def *s = nir_channel(b, tex_op(b, nir_texop_txl, tex, blit_coord(b, pos, layer),
+                                      layer != NULL, type), 0);
+   nir_def *d = nir_channel(b, fetch(b, tex + 1, xy, layer, type), 0);
+   return nir_bcsel(b, inside, s, d);
+}
+#endif
+
 static nir_shader *
 build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
 {
@@ -176,7 +237,15 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
    nir_def *fc = nir_load_frag_coord(b);
    nir_def *pos = nir_trim_vector(b, fc, 2);
    nir_def *xy = nir_f2i32(b, pos);
+#if PAN_ARCH < 9
+   /* v7 has no frame argument: the frame shader Draws of layer l carry l in
+    * their push constants (panvk_vX_cmd_frame_shaders.c
+    * panvk_fb_sysvals.layer_id). */
+   nir_def *layer =
+      key->layered ? push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, layer)) : NULL;
+#else
    nir_def *layer = key->layered ? nir_load_layer_id(b) : NULL;
+#endif
 
    nir_def *inside = NULL;
    bool need_area = false;
@@ -186,6 +255,9 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
                    key->rt_op[i] == MALI_META_FS_COPY;
    need_area |= key->z_op == MALI_META_FS_CLEAR_IN_AREA ||
                 key->s_op == MALI_META_FS_CLEAR_IN_AREA;
+#if PAN_ARCH < 9
+   need_area |= key->z_op == MALI_META_FS_BLIT || key->s_op == MALI_META_FS_BLIT;
+#endif
    if (need_area) {
       nir_def *area = push_load(b, 4, 32, offsetof(struct mali_meta_fs_push, area));
       nir_def *x = nir_channel(b, xy, 0), *y = nir_channel(b, xy, 1);
@@ -214,15 +286,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          v = nir_bcsel(b, inside, clear, fetch(b, tex++, xy, layer, type));
          break;
       case MALI_META_FS_BLIT: {
-         nir_def *scale = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, blit_scale));
-         nir_def *offset = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, blit_offset));
-         nir_def *uv = nir_ffma(b, pos, scale, offset);
-         if (layer) {
-            uv = nir_vec3(b, nir_channel(b, uv, 0), nir_channel(b, uv, 1),
-                          nir_fadd(b, nir_u2f32(b, layer),
-                                   push_load(b, 1, 32,
-                                             offsetof(struct mali_meta_fs_push, blit_layer))));
-         }
+         nir_def *uv = blit_coord(b, pos, layer);
          nir_def *s = tex_op(b, nir_texop_txl, tex, uv, layer != NULL, type);
          nir_def *d = fetch(b, tex + 1, xy, layer, type);
          tex += 2;
@@ -235,11 +299,33 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
          nir_def *sxy = nir_iadd(b, xy, delta);
          nir_push_if(b, inside);
+#if PAN_ARCH < 9
+         /* v7: an AFBC source is read in its own format and packed into
+          * the block's bits; an AFBC target takes them unpacked into its
+          * own format (mali_meta_copy_fmt). Exact for these UNORM formats:
+          * n / (2^k - 1) converts back to n. */
+         nir_def *in;
+         if (key->copy_src_fmt) {
+            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+            in = raw_to_uvec4(
+               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+         } else {
+            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                                   : copy_raw_load(b, key, sxy, layer);
+         }
+         if (key->copy_dst_fmt)
+            in = nir_format_unpack_rgba(b, nir_channel(b, in, 0),
+                                        mali_meta_copy_fmt_pipe(key->copy_dst_fmt));
+         nir_push_else(b, NULL);
+         nir_def *out = fetch(b, tex + (key->copy_src_tex ? 1 : 0), xy, layer,
+                              key->copy_dst_fmt ? nir_type_float32 : nir_type_uint32);
+#else
          nir_def *in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
                                          : copy_raw_load(b, key, sxy, layer);
          nir_push_else(b, NULL);
          nir_def *out = fetch(b, tex + (key->copy_src_tex ? 1 : 0), xy, layer,
                               nir_type_uint32);
+#endif
          nir_pop_if(b, NULL);
          v = nir_if_phi(b, in, out);
          tex += key->copy_src_tex ? 2 : 1;
@@ -251,7 +337,17 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
       store_out(b, FRAG_RESULT_DATA0 + i, out_type(key->rt_type[i]), v);
    }
 
+#if PAN_ARCH < 9
+   /* v7 also blits depth and stencil (MALI_META_FS_BLIT on z_op / s_op:
+    * two textures each, the source plane and the target plane). */
+   if (key->z_op == MALI_META_FS_BLIT) {
+      store_out(b, FRAG_RESULT_DEPTH, glsl_float_type(),
+                blit_zs(b, tex, pos, xy, layer, inside, nir_type_float32));
+      tex += 2;
+   } else if (key->z_op != MALI_META_FS_NONE) {
+#else
    if (key->z_op != MALI_META_FS_NONE) {
+#endif
       nir_def *clear = push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, clear_depth));
       nir_def *v = key->z_op == MALI_META_FS_CLEAR ? clear :
                    nir_channel(b, fetch(b, tex++, xy, layer, nir_type_float32), 0);
@@ -259,7 +355,15 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          v = nir_bcsel(b, inside, clear, v);
       store_out(b, FRAG_RESULT_DEPTH, glsl_float_type(), v);
    }
+#if PAN_ARCH < 9
+   if (key->s_op == MALI_META_FS_BLIT) {
+      store_out(b, FRAG_RESULT_STENCIL, glsl_int_type(),
+                blit_zs(b, tex, pos, xy, layer, inside, nir_type_uint32));
+      tex += 2;
+   } else if (key->s_op != MALI_META_FS_NONE) {
+#else
    if (key->s_op != MALI_META_FS_NONE) {
+#endif
       nir_def *clear = push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, clear_stencil));
       nir_def *v = key->s_op == MALI_META_FS_CLEAR ? clear :
                    nir_channel(b, fetch(b, tex++, xy, layer, nir_type_uint32), 0);
@@ -340,6 +444,10 @@ MALI_PER_ARCH(meta_gfx_finish)(struct mali_device *dev)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_quad[i]);
    for (unsigned i = 0; i < mg->count; i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->e[i].shader);
+#if PAN_ARCH < 9
+   for (unsigned i = 0; i < ARRAY_SIZE(mg->copy_tex_fmt); i++)
+      MALI_PER_ARCH(shader_unref)(dev, mg->copy_tex_fmt[i]);
+#endif
    free(mg);
    dev->meta_gfx = NULL;
 }
@@ -349,7 +457,8 @@ MALI_PER_ARCH(cmd_pack_plane_texture)(struct mali_cmd_buffer *cmd, const struct 
                                       unsigned plane, enum pipe_format format, unsigned level,
                                       unsigned first_layer, unsigned layer_count, uint32_t out[8])
 {
-   struct mali_ptr p = mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(layer_count), 64);
+   struct mali_ptr p =
+      mali_cmd_alloc(cmd, mali_image_plane_texture_desc_size(image, layer_count), 64);
    if (!p.cpu)
       return false;
    MALI_PER_ARCH(image_pack_plane_texture)(image, plane, format, level, first_layer, layer_count,
@@ -357,12 +466,215 @@ MALI_PER_ARCH(cmd_pack_plane_texture)(struct mali_cmd_buffer *cmd, const struct 
    return true;
 }
 
+#if PAN_ARCH < 9
+/*
+ * Bifrost (v7) Draw sections for the internal fragment shaders, following
+ * panvk's v7 frame-shader DCD (panvk_vX_cmd_frame_shaders.c cmd_emit_dcd)
+ * and gallium's preload (pan_fb_preload.c pan_preload_emit_dcd). A frame
+ * shader draws a full-framebuffer rectangle scissored to the pass's
+ * bounding box grown to 32-pixel tiles, with Clean Fragment Write so that
+ * tiles it only preloads stay clean; an in-pass draw gets its rectangle
+ * and scissor per job (mali_v7_cmd_meta_quads).
+ */
+
+/* Opaque for the targets written, off for the rest (panvk fill_bds, gallium
+ * pan_preload_emit_blend). */
+static void
+v7_meta_blends(const struct mali_render_state *r, const struct mali_meta_fs_key *key, void *out)
+{
+   for (unsigned i = 0; i < r->rt_count; i++) {
+      void *o = (uint8_t *)out + i * pan_size(BLEND);
+      const bool written = i < MALI_MAX_RTS && key->rt_op[i] != MALI_META_FS_NONE &&
+                           i < r->desc.rt_count && r->desc.rt[i].image;
+      if (!written) {
+         pan_cast_and_pack(o, BLEND, cfg) {
+            cfg.enable = false;
+            cfg.internal.mode = MALI_BLEND_MODE_OFF;
+            cfg.internal.fixed_function.num_comps = 4;
+         }
+         continue;
+      }
+      /* The opaque Blend every arch packs, with the register format of
+       * the shader's output type, which v7's conversion carries. */
+      struct mali_blend_packed b, conv;
+      MALI_PER_ARCH(pack_opaque_blend)(r->desc.rt[i].format, i, b.opaque);
+      pan_pack(&conv, BLEND, cfg) {
+         cfg.internal.fixed_function.conversion.register_format =
+            mali_v7_register_format(nir_type(key->rt_type[i]));
+      }
+      pan_merge(&b, &conv, BLEND);
+      memcpy(o, &b, sizeof(b));
+   }
+}
+
+/* pan_preload_emit_rsd at PAN_ARCH 7, with the blends behind it. The
+ * texture and sampler counts are this draw's: the shader info counts
+ * descriptor-set tables only. */
+static uint64_t
+v7_meta_rsd(struct mali_cmd_buffer *cmd, const struct mali_shader *fs,
+            const struct mali_meta_fs_key *key, unsigned texture_count, bool frame_shader)
+{
+   const struct mali_render_state *r = &cmd->gfx.render;
+   struct mali_ptr m = mali_cmd_alloc(cmd, pan_size(RENDERER_STATE) + r->rt_count * pan_size(BLEND),
+                                      pan_alignment(RENDERER_STATE));
+   if (!m.cpu)
+      return 0;
+
+   const bool zs = key->z_op != MALI_META_FS_NONE || key->s_op != MALI_META_FS_NONE;
+   pan_cast_and_pack(m.cpu, RENDERER_STATE, cfg) {
+      mali_v7_rsd_shader(&fs->info, fs->spd[MALI_SPD_MAIN], &cfg);
+      cfg.shader.texture_count = texture_count;
+      cfg.shader.sampler_count = 1;
+
+      cfg.multisample_misc.sample_mask = 0xffff;
+      cfg.multisample_misc.multisample_enable = false;
+      cfg.multisample_misc.depth_function = MALI_FUNC_ALWAYS;
+      cfg.multisample_misc.depth_write_mask = key->z_op != MALI_META_FS_NONE;
+
+      cfg.stencil_mask_misc.stencil_enable = key->s_op != MALI_META_FS_NONE;
+      cfg.stencil_mask_misc.stencil_mask_front = 0xff;
+      cfg.stencil_mask_misc.stencil_mask_back = 0xff;
+      cfg.stencil_front.compare_function = MALI_FUNC_ALWAYS;
+      cfg.stencil_front.stencil_fail = MALI_STENCIL_OP_REPLACE;
+      cfg.stencil_front.depth_fail = MALI_STENCIL_OP_REPLACE;
+      cfg.stencil_front.depth_pass = MALI_STENCIL_OP_REPLACE;
+      cfg.stencil_front.mask = 0xff;
+      cfg.stencil_back = cfg.stencil_front;
+
+      if (zs) {
+         /* ZS_EMIT needs late update and kill. */
+         cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_LATE;
+         cfg.properties.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_LATE;
+      } else {
+         /* Skipping ATEST needs forced early depth/stencil. */
+         cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         cfg.properties.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+      }
+      cfg.properties.allow_forward_pixel_to_kill = frame_shader && !zs;
+   }
+   v7_meta_blends(r, key, (uint8_t *)m.cpu + pan_size(RENDERER_STATE));
+   return m.gpu;
+}
+
+/* A Viewport descriptor whose scissor is [minx, maxx] x [miny, maxy]
+ * (inclusive); depth range 0..1 (the genxml defaults). The frame shaders
+ * and the in-pass draws (mali_v7_cmd_meta_quads) use it. 0 on failure. */
+uint64_t
+mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint32_t miny, uint32_t maxx,
+                      uint32_t maxy)
+{
+   struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(VIEWPORT), pan_alignment(VIEWPORT));
+   if (!p.cpu)
+      return 0;
+   pan_cast_and_pack(p.cpu, VIEWPORT, cfg) {
+      cfg.scissor_minimum_x = MIN2(minx, UINT16_MAX);
+      cfg.scissor_minimum_y = MIN2(miny, UINT16_MAX);
+      cfg.scissor_maximum_x = MIN2(maxx, UINT16_MAX);
+      cfg.scissor_maximum_y = MIN2(maxy, UINT16_MAX);
+   }
+   return p.gpu;
+}
+
+/* Four screen-space positions (x, y, z, w) of the rectangle [x0, x1) x
+ * [y0, y1), the vertices of a 4-vertex triangle strip (gallium
+ * GENX(pan_preload_fb)). 0 on failure. */
+uint64_t
+mali_v7_meta_rect_positions(struct mali_cmd_buffer *cmd, float x0, float y0, float x1, float y1)
+{
+   const float rect[16] = {
+      x0, y0, 0.0f, 1.0f,
+      x1, y0, 0.0f, 1.0f,
+      x0, y1, 0.0f, 1.0f,
+      x1, y1, 0.0f, 1.0f,
+   };
+   struct mali_ptr p = mali_cmd_alloc(cmd, sizeof(rect), 64);
+   if (!p.cpu)
+      return 0;
+   memcpy(p.cpu, rect, sizeof(rect));
+   return p.gpu;
+}
+#endif /* PAN_ARCH < 9 */
+
 bool
 MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader *fs,
                            const struct mali_meta_fs_key *key, const struct mali_meta_fs_push *push,
                            const uint32_t (*textures)[8], unsigned texture_count,
                            const uint32_t *sampler, bool frame_shader, void *out)
 {
+#if PAN_ARCH < 9
+   struct mali_render_state *r = &cmd->gfx.render;
+   assert(r->tsd);
+
+   r->tls_size = MAX2(r->tls_size, fs->info.tls_size);
+
+   const uint64_t rsd = v7_meta_rsd(cmd, fs, key, texture_count, frame_shader);
+   /* Tables 64-byte aligned, as mali_jm_desc_v7.c allocates them. */
+   struct mali_ptr samp = mali_cmd_alloc(cmd, pan_size(SAMPLER), 64);
+   struct mali_ptr tex = {0};
+   if (texture_count)
+      tex = mali_cmd_alloc(cmd, texture_count * pan_size(TEXTURE), 64);
+   if (!rsd || !samp.cpu || (texture_count && !tex.cpu))
+      return false;
+   if (sampler) {
+      memcpy(samp.cpu, sampler, pan_size(SAMPLER));
+   } else {
+      pan_cast_and_pack(samp.cpu, SAMPLER, cfg) {
+         cfg.seamless_cube_map = false;
+         cfg.normalized_coordinates = false;
+         cfg.clamp_integer_array_indices = false;
+         cfg.minify_nearest = true;
+         cfg.magnify_nearest = true;
+      }
+   }
+   for (unsigned i = 0; i < texture_count; i++)
+      memcpy((uint8_t *)tex.cpu + i * pan_size(TEXTURE), textures[i], pan_size(TEXTURE));
+
+   uint64_t position = 0, viewport = 0;
+   if (frame_shader) {
+      const uint32_t minx = ROUND_DOWN_TO(r->minx, 32), miny = ROUND_DOWN_TO(r->miny, 32);
+      const uint32_t maxx = MIN2(ALIGN_POT(r->maxx + 1, 32), r->desc.width) - 1;
+      const uint32_t maxy = MIN2(ALIGN_POT(r->maxy + 1, 32), r->desc.height) - 1;
+      viewport = mali_v7_meta_viewport(cmd, minx, miny, maxx, maxy);
+      position = mali_v7_meta_rect_positions(cmd, 0.0f, 0.0f, (float)r->desc.width,
+                                             (float)r->desc.height);
+      if (!viewport || !position)
+         return false;
+   }
+
+   /* No fs.blend_descs on v7: BLEND reads the Blend descriptors behind the
+    * RSD through the blend FAU slots (bifrost_compile.c BIR_FAU_BLEND_0). */
+   struct mali_graphics_sysvals sv;
+   memset(&sv, 0, sizeof(sv));
+   memset(sv.iam, 0xff, sizeof(sv.iam));
+
+   const unsigned layers = frame_shader ? MAX2(r->desc.layer_count, 1) : 1;
+   struct mali_meta_fs_push lp = *push;
+   for (unsigned l = 0; l < layers; l++) {
+      lp.layer = l;
+      const uint64_t fau = MALI_PER_ARCH(cmd_gfx_fau)(cmd, fs, &sv, &lp, sizeof(lp));
+      if (fs->fau.total_count && !fau)
+         return false;
+      /* The RSD's preload.uniform_count is the shader's FAU word count;
+       * the block built here has as many words. */
+      assert((fau >> 56) == DIV_ROUND_UP(fs->info.fau.count, 2));
+
+      struct mali_draw_packed dcd;
+      pan_pack(&dcd, DRAW, cfg) {
+         cfg.state = rsd;
+         cfg.textures = texture_count ? tex.gpu : 0;
+         cfg.samplers = samp.gpu;
+         cfg.push_uniforms = fau & BITFIELD64_MASK(56);
+         cfg.thread_storage = r->tsd;
+         cfg.position = position;
+         cfg.viewport = viewport;
+         cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+         cfg.clean_fragment_write = frame_shader;
+      }
+      memcpy((uint8_t *)out + (uint64_t)l * MALI_FRAME_SHADER_DCDS * pan_size(DRAW), &dcd,
+             sizeof(dcd));
+   }
+   return true;
+#else
    struct mali_render_state *r = &cmd->gfx.render;
    assert(r->tsd);
 
@@ -496,6 +808,7 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
       cfg.shader.fau_count = fs->fau.total_count;
    }
    return true;
+#endif /* PAN_ARCH >= 9 */
 }
 
 /* ---------------------------------------------------------------------- */
@@ -667,6 +980,10 @@ copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
    struct mali_shader *s = NULL;
 
    assert(elem_log2 < 5);
+#if PAN_ARCH < 9
+   /* v7 has no texture-source slots here (struct mali_meta_gfx). */
+   assert(!src_tex);
+#endif
    simple_mtx_lock(&dev->meta_lock);
    if (!dev->meta_gfx)
       dev->meta_gfx = calloc(1, sizeof(struct mali_meta_gfx));
@@ -749,11 +1066,105 @@ MALI_PER_ARCH(meta_copy_quad_get)(struct mali_cmd_buffer *cmd, unsigned elem_log
    return s;
 }
 
+#if PAN_ARCH >= 9
 const struct mali_shader *
 MALI_PER_ARCH(meta_copy_tex_get)(struct mali_cmd_buffer *cmd, unsigned elem_log2)
 {
    return copy_get(cmd, elem_log2, true);
 }
+#else
+/*
+ * The copy out of a v7 AFBC plane: build_copy with a texture source,
+ * except that the texel is fetched in the copy format and packed into the
+ * block's bits (one value of at most 32 bits) where build_copy fetches
+ * the bits as uint. These shaders are cached by copy format, not by block
+ * size as copy_get's are, so they have a builder and a getter of their
+ * own.
+ */
+static nir_shader *
+build_copy_tex_fmt(struct mali_device *dev, enum mali_meta_copy_fmt fmt)
+{
+   const enum pipe_format pf = mali_meta_copy_fmt_pipe(fmt);
+   const unsigned elem = util_format_get_blocksize(pf);
+   unsigned comps, bits;
+   raw_block_type(elem, &comps, &bits);
+   assert(comps == 1);
+
+   nir_builder bld = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_copy_tex_%s", util_format_short_name(pf));
+   nir_builder *b = &bld;
+   b->shader->info.workgroup_size[0] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[1] = MALI_META_COPY_WG;
+   b->shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_load_global_invocation_id(b, 32);
+   nir_def *gx = nir_channel(b, id, 0), *gy = nir_channel(b, id, 1), *gz = nir_channel(b, id, 2);
+   nir_def *w = copy_push(b, 32, COPY_PUSH(width));
+   nir_def *h = copy_push(b, 32, COPY_PUSH(height));
+
+   nir_push_if(b, nir_iand(b, nir_ult(b, gx, w), nir_ult(b, gy, h)));
+   {
+      nir_def *sx = nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(src_x)));
+      nir_def *sy = nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(src_y)));
+      nir_def *t = fetch(b, 0, nir_vec2(b, sx, sy), gz, nir_type_float32);
+      nir_def *v = nir_format_pack_rgba(b, pf, t);
+      if (bits < 32)
+         v = nir_u2uN(b, v, bits);
+      nir_def *da = surface_addr(
+         b, copy_push(b, 64, COPY_PUSH(dst)), copy_push(b, 64, COPY_PUSH(dst_layer_stride)),
+         copy_push(b, 32, COPY_PUSH(dst_row_stride)),
+         nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(dst_x))),
+         nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(dst_y))), gz,
+         copy_push(b, 32, COPY_PUSH(dst_tile_shift)), elem);
+      nir_store_global(b, v, da, .write_mask = 0x1, .align_mul = elem);
+   }
+   nir_pop_if(b, NULL);
+   return b->shader;
+}
+
+const struct mali_shader *
+MALI_PER_ARCH(meta_copy_tex_fmt_get)(struct mali_cmd_buffer *cmd, enum mali_meta_copy_fmt fmt)
+{
+   struct mali_device *dev = cmd->dev;
+   struct mali_shader *s = NULL;
+
+   assert(fmt > MALI_META_COPY_FMT_RAW && fmt < MALI_META_COPY_FMT_COUNT);
+   simple_mtx_lock(&dev->meta_lock);
+   if (!dev->meta_gfx)
+      dev->meta_gfx = calloc(1, sizeof(struct mali_meta_gfx));
+   struct mali_meta_gfx *mg = dev->meta_gfx;
+   if (mg) {
+      s = mg->copy_tex_fmt[fmt];
+      if (!s) {
+         nir_shader *nir = build_copy_tex_fmt(dev, fmt);
+         MALI_PER_ARCH(shader_preprocess)(dev, nir);
+         const struct vk_pipeline_robustness_state rs = {
+            .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+            .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+         };
+         const struct mali_shader_compile_info info = {.nir = nir, .rs = &rs};
+         const uint32_t fmt_word = fmt;
+         blake3_hash hash;
+         struct mesa_blake3 h;
+         _mesa_blake3_init(&h);
+         _mesa_blake3_update(&h, "mali-meta-copy-tex-fmt", 22);
+         _mesa_blake3_update(&h, &fmt_word, sizeof(fmt_word));
+         _mesa_blake3_final(&h, hash);
+         if (MALI_PER_ARCH(shader_compile)(dev, &info, hash, &s) != VK_SUCCESS)
+            s = NULL;
+         mg->copy_tex_fmt[fmt] = s;
+      }
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+
+   if (!s)
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   return s;
+}
+#endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
 /* vkCmdClearAttachments                                                   */
@@ -774,7 +1185,8 @@ fs_type(enum pipe_format f)
  * same RUN_FULLSCREEN, Mesa's v9 driver in a Fullscreen job). Depth and
  * stencil are written by the shader (ZS emit), so no depth-bias trick is
  * needed. The back half's cmd_run_fullscreen draws it: RUN_FULLSCREEN on
- * v11, one Fullscreen job per layer on v9.
+ * v11, one Fullscreen job per layer on v9. v7 has no Fullscreen job:
+ * mali_v7_cmd_meta_quads draws the rectangle as one Tiler job per layer.
  */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdClearAttachments)(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
@@ -821,6 +1233,22 @@ MALI_PER_ARCH(CmdClearAttachments)(VkCommandBuffer commandBuffer, uint32_t attac
       return;
    }
    const struct mali_shader *fs = MALI_PER_ARCH(meta_fs_get)(cmd, &key);
+#if PAN_ARCH < 9
+   /* v7 has no Fullscreen job: each rectangle is one Tiler job per layer,
+    * copying this Draw template with the rectangle as its positions and
+    * scissor (mali_v7_cmd_meta_quads). */
+   struct mali_draw_packed tmpl;
+   if (!fs ||
+       !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, &key, &push, NULL, 0, NULL, false, &tmpl)) {
+      if (!vk_command_buffer_has_error(&cmd->vk))
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   for (uint32_t i = 0; i < rectCount; i++) {
+      mali_v7_cmd_meta_quads(cmd, &tmpl, &pRects[i].rect, pRects[i].baseArrayLayer,
+                             pRects[i].layerCount, true);
+   }
+#else
    struct mali_ptr dcd = mali_cmd_alloc(cmd, pan_size(DRAW), 64);
    if (!fs || !dcd.cpu ||
        !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, &key, &push, NULL, 0, NULL, false, dcd.cpu)) {
@@ -832,4 +1260,5 @@ MALI_PER_ARCH(CmdClearAttachments)(VkCommandBuffer commandBuffer, uint32_t attac
       MALI_PER_ARCH(cmd_run_fullscreen)(cmd, dcd.gpu, &pRects[i].rect, pRects[i].baseArrayLayer,
                                         pRects[i].layerCount);
    }
+#endif
 }

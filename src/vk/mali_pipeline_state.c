@@ -52,6 +52,9 @@
 #include "vk_format.h"
 
 #include "mali_arch.h"
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Blend                                                                    */
@@ -59,7 +62,8 @@
 
 /* Formats the fixed-function blender handles (Mesa's blendable format
  * table for v9+: 8-bit UNORM/sRGB, 565, 4444, 5551, 10-10-10-2 and the
- * 16-bit/11-11-10 float formats). */
+ * 16-bit/11-11-10 float formats). The float formats are v9+ only: on v7
+ * a blended float target takes a blend shader. */
 static bool
 format_supports_hw_blend(VkFormat format)
 {
@@ -87,11 +91,14 @@ format_supports_hw_blend(VkFormat format)
    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      return true;
+#if PAN_ARCH >= 9
    case VK_FORMAT_R16_SFLOAT:
    case VK_FORMAT_R16G16_SFLOAT:
    case VK_FORMAT_R16G16B16A16_SFLOAT:
    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
       return true;
+#endif
    default:
       return false;
    }
@@ -612,6 +619,7 @@ compare_func(VkCompareOp op)
    return (enum mali_func)op;
 }
 
+#if PAN_ARCH >= 9
 static void
 pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
@@ -662,6 +670,7 @@ pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       cfg.depth_bias_clamp = rs->depth_bias.clamp;
    }
 }
+#endif /* PAN_ARCH >= 9 */
 
 /* ---------------------------------------------------------------------- */
 /* DCD flags and tiler flags                                                */
@@ -753,6 +762,38 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       modifies_coverage = fs->info.fs.writes_coverage || fs->info.fs.can_discard || a2c;
    }
 
+#if PAN_ARCH < 9
+   /*
+    * v7 has no DCD flag words: their early-ZS, multisample and pixel-kill
+    * state is in the fragment RSD (pack_rsd_state). dcd0 is the low half
+    * of the Tiler job's Draw word 0: culling, front face and flat-shading
+    * vertex (panvk_emit_tiler_dcd), alike for both occlusion variants (no
+    * occlusion queries on v7). The per-draw instance sizes in the upper
+    * half are packed as 1 (the padded encoding has no zero) and masked off.
+    */
+   {
+      const bool polygon = reduced == MESA_PRIM_TRIANGLES;
+      struct mali_draw_packed d;
+      pan_pack(&d, DRAW, cfg) {
+         cfg.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+         cfg.cull_front_face = polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT);
+         cfg.cull_back_face = polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT);
+         /* Lines take their flat-shading vertex from this bit; every other
+          * primitive from the Primitive section's First provoking vertex
+          * (panvk). */
+         cfg.flat_shading_vertex = reduced == MESA_PRIM_LINES;
+         cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+         cfg.instance_size = 1;
+         cfg.instance_primitive_size = 1;
+      }
+      out->dcd0[0] = out->dcd0[1] = d.opaque[0] & 0xffff;
+   }
+   (void)writes_zs;
+   (void)modifies_coverage;
+   (void)msaa;
+   out->dcd1 = 0;
+   out->dcd2 = 0;
+#else
    for (unsigned oq = 0; oq < 2; oq++) {
       struct mali_dcd_flags_0_packed dcd0;
 
@@ -845,6 +886,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    /* No Flags 2 on v9: the tile-buffer read and write masks have no home. */
    out->dcd2 = 0;
 #endif
+#endif /* PAN_ARCH >= 9 */
 
    /* Tiler flags; the index type is set per draw. */
    const bool points = prim == MESA_PRIM_POINTS;
@@ -853,19 +895,36 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 #if PAN_ARCH >= 10
    struct mali_primitive_flags_packed tiler;
    pan_pack(&tiler, PRIMITIVE_FLAGS, cfg) {
-#else
+#elif PAN_ARCH == 9
    /* The Primitive section of the Malloc Vertex job; word 0 is the flags. */
    struct mali_primitive_packed tiler;
    pan_pack(&tiler, PRIMITIVE, cfg) {
       cfg.allow_rotating_primitives = false;
+#else
+   /* v7: the Primitive section of the Tiler job; word 0 is the flags, with
+    * no rotation, index override or layer bits. The draw sets the index
+    * type and the pass's first_provoking_vertex bit in it. */
+   struct mali_primitive_packed tiler;
+   pan_pack(&tiler, PRIMITIVE, cfg) {
+      /* panvk_emit_tiler_primitive: the tiler's task split, and the
+       * primitive index written back for a fragment shader that reads it. */
+      cfg.job_task_split = 6;
+      cfg.primitive_index_writeback = fs_reads_prim_id;
+      /* The counts are per draw and only word 0 is kept; the packer
+       * stores the index count minus one and asserts it is at least 1. */
+      cfg.index_count = 1;
 #endif
       cfg.draw_mode = draw_mode(prim);
       cfg.primitive_index_enable = fs_reads_prim_id;
+#if PAN_ARCH >= 9
       cfg.primitive_index_override =
          fs_reads_prim_id && (vs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID);
+#endif
       cfg.point_size_array_format = writes_psiz ? MALI_POINT_SIZE_ARRAY_FORMAT_FP16
                                                 : MALI_POINT_SIZE_ARRAY_FORMAT_NONE;
+#if PAN_ARCH >= 9
       cfg.layer_index_enable = vs->info.outputs_written & VARYING_BIT_LAYER;
+#endif
 #if PAN_ARCH >= 10
       cfg.position_fifo_format = (writes_psiz || vs->info.vs.needs_extended_fifo) ?
                                     MALI_FIFO_FORMAT_EXTENDED : MALI_FIFO_FORMAT_BASIC;
@@ -873,7 +932,14 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       cfg.low_depth_cull = cfg.high_depth_cull =
          vk_rasterization_state_depth_clip_enable(rs);
       cfg.secondary_shader = vs->info.vs.secondary_enable && fs != NULL;
+#if PAN_ARCH >= 9
       cfg.primitive_restart = dyn->ia.primitive_restart_enable;
+#else
+      /* An enum on v7: the implicit restart index of the index type
+       * (panvk_emit_tiler_primitive). */
+      cfg.primitive_restart = dyn->ia.primitive_restart_enable ? MALI_PRIMITIVE_RESTART_IMPLICIT
+                                                               : MALI_PRIMITIVE_RESTART_NONE;
+#endif
 #if PAN_ARCH >= 10
       cfg.view_mask = in->view_mask;
 #else
@@ -888,6 +954,120 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    out->tls_size = MAX2(vs->info.tls_size, fs ? fs->info.tls_size : 0);
 }
 
+#if PAN_ARCH < 9
+/*
+ * v7: words 4 to 11 of the fragment Renderer State Descriptor (properties,
+ * depth bias, multisample misc, stencil), packed into out->zsd as
+ * panvk_draw_prepare_fs_rsd packs them at draw time. The draw overlays
+ * them on the shader half (mali_rsd_v7.h); the properties word also takes
+ * the shader's fields here, so it is complete.
+ */
+static void
+pack_rsd_state(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
+{
+   const struct vk_dynamic_graphics_state *dyn = in->dyn;
+   const struct vk_depth_stencil_state *ds = &dyn->ds;
+   const struct vk_rasterization_state *rs = &dyn->rs;
+   const struct mali_shader *fs = in->fs;
+   const bool test_s = has_stencil(in->rp) && ds->stencil.test_enable;
+   const bool test_z = has_depth(in->rp) && ds->depth.test_enable;
+   const bool writes_z = writes_depth(in);
+   const bool writes_zs = writes_z || writes_stencil(in);
+   const bool a2c = dyn->ms.alpha_to_coverage_enable;
+   const uint8_t rt_mask = in->rp->attachments & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+   const enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
+   const bool bresenham = u_reduced_prim(prim) == MESA_PRIM_LINES &&
+                          rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
+   /* Bresenham lines are rasterized at pixel centres. */
+   const bool msaa = dyn->ms.rasterization_samples > 1 && !bresenham;
+
+   struct mali_renderer_state_packed rsd;
+   pan_pack(&rsd, RENDERER_STATE, cfg) {
+      if (fs) {
+         mali_v7_rsd_shader(&fs->info, 0, &cfg);
+
+         const bool zs_read = attachment_read(fs, dyn->ial.depth_att) ||
+                              attachment_read(fs, dyn->ial.stencil_att) ||
+                              (dyn->rasterization_order_access &
+                               (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+         const bool roa_color = dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+
+         cfg.properties.allow_forward_pixel_to_kill =
+            fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
+            !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read && !roa_color;
+         /* The hardware does the early ZS check for FPK on v7 (panvk). */
+         cfg.properties.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
+
+         struct earlyzs ezs = earlyzs_get(&fs->info, writes_zs, a2c, zs_test_always_passes(in),
+                                          zs_read ? ZS_READ : ZS_NOT_READ);
+         cfg.properties.pixel_kill_operation = ezs.kill;
+         cfg.properties.zs_update_operation = ezs.update;
+         if (fs->fs.no_atest) {
+            /* No ATEST (mali_shader.c): nothing late is possible, so force
+             * early, as on v9+. */
+            assert(ezs.kill != MALI_PIXEL_KILL_FORCE_LATE &&
+                   ezs.update != MALI_PIXEL_KILL_FORCE_LATE);
+            cfg.properties.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+            cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+         }
+         /* Sample shading only (panvk). The draw adds per-sample evaluation
+          * for a blend shader under multisampling once it knows which
+          * targets got one (mali_jm_cmd_draw_v7.c build_fs_rsd). */
+         cfg.multisample_misc.evaluate_per_sample =
+            fs->info.fs.sample_shading && dyn->ms.rasterization_samples > 1;
+      } else {
+         cfg.properties.depth_source = MALI_DEPTH_SOURCE_FIXED_FUNCTION;
+         cfg.properties.allow_forward_pixel_to_kill = true;
+         cfg.properties.allow_forward_pixel_to_be_killed = true;
+         cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
+      }
+
+      cfg.multisample_misc.multisample_enable = msaa;
+      cfg.multisample_misc.sample_mask = dyn->ms.sample_mask;
+      cfg.multisample_misc.depth_function =
+         test_z ? compare_func(ds->depth.compare_op) : MALI_FUNC_ALWAYS;
+      cfg.multisample_misc.depth_write_mask = writes_z;
+      cfg.multisample_misc.fixed_function_near_discard =
+         cfg.multisample_misc.fixed_function_far_discard =
+            vk_rasterization_state_depth_clip_enable(rs);
+      cfg.multisample_misc.fixed_function_depth_range_fixed = !rs->depth_clamp_enable;
+      cfg.multisample_misc.shader_depth_range_fixed = true;
+
+      cfg.stencil_mask_misc.stencil_enable = test_s;
+      cfg.stencil_mask_misc.alpha_to_coverage = a2c;
+      cfg.stencil_mask_misc.alpha_test_compare_function = MALI_FUNC_ALWAYS;
+      cfg.stencil_mask_misc.front_facing_depth_bias = rs->depth_bias.enable;
+      cfg.stencil_mask_misc.back_facing_depth_bias = rs->depth_bias.enable;
+      cfg.stencil_mask_misc.aligned_line_ends =
+         rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
+
+      cfg.depth_units = rs->depth_bias.constant_factor;
+      cfg.depth_factor = rs->depth_bias.slope_factor;
+      cfg.depth_bias_clamp = rs->depth_bias.clamp;
+
+      cfg.stencil_front.mask = ds->stencil.front.compare_mask;
+      cfg.stencil_back.mask = ds->stencil.back.compare_mask;
+      cfg.stencil_mask_misc.stencil_mask_front = ds->stencil.front.write_mask;
+      cfg.stencil_mask_misc.stencil_mask_back = ds->stencil.back.write_mask;
+      cfg.stencil_front.reference_value = ds->stencil.front.reference;
+      cfg.stencil_back.reference_value = ds->stencil.back.reference;
+      if (test_s) {
+         cfg.stencil_front.compare_function = compare_func(ds->stencil.front.op.compare);
+         cfg.stencil_front.stencil_fail = stencil_op(ds->stencil.front.op.fail);
+         cfg.stencil_front.depth_fail = stencil_op(ds->stencil.front.op.depth_fail);
+         cfg.stencil_front.depth_pass = stencil_op(ds->stencil.front.op.pass);
+         cfg.stencil_back.compare_function = compare_func(ds->stencil.back.op.compare);
+         cfg.stencil_back.stencil_fail = stencil_op(ds->stencil.back.op.fail);
+         cfg.stencil_back.depth_fail = stencil_op(ds->stencil.back.op.depth_fail);
+         cfg.stencil_back.depth_pass = stencil_op(ds->stencil.back.op.pass);
+      }
+   }
+
+   STATIC_ASSERT(sizeof(out->zsd) == MALI_V7_RSD_STATE_WORDS * sizeof(uint32_t));
+   memcpy(out->zsd, &rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST], sizeof(out->zsd));
+}
+#endif /* PAN_ARCH < 9 */
+
 void
 MALI_PER_ARCH(gfx_pack_state)(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
@@ -899,6 +1079,12 @@ MALI_PER_ARCH(gfx_pack_state)(const struct mali_gfx_pack_input *in, struct mali_
    /* Blend first: DCD0 depends on whether any RT reads the destination or
     * needs a blend shader. */
    pack_blend(in, out);
+#if PAN_ARCH >= 9
    pack_zsd(in, out);
    pack_flags(in, out);
+#else
+   /* v7: pack_rsd_state reads the render target masks pack_flags computes. */
+   pack_flags(in, out);
+   pack_rsd_state(in, out);
+#endif
 }

@@ -4,11 +4,13 @@
  */
 
 /*
- * The v9 (job manager) command buffer: command memory, batches and job
- * chains, job writing and linking, barriers, begin/end, and what a command
- * buffer that runs more than once needs restored.
+ * The job-manager (v7 and v9) command buffer: command memory, batches and
+ * job chains, job writing and linking, barriers, begin/end, and what a
+ * command buffer that runs more than once needs restored.
  *
- * Every vkCmd* writes finished v9 jobs when it is recorded. A command
+ * Every vkCmd* writes finished jobs when it is recorded, except a v7 draw's
+ * Tiler job, whose header and link are written when it goes into the chain
+ * (mali_v7_link_tilers), at the latest when the batch closes. A command
  * buffer is a list of batches (mali_jm.h); a batch is one vertex/tiler/
  * compute ("vtc") job chain, which runs as one atom on job slot 1, and
  * fragment segments, each a fragment chain that runs as one atom on slot 0
@@ -79,6 +81,15 @@
  * mali_cmd_slabs_finish. */
 #define MALI_CMD_FREE_SLABS_MAX 512
 
+/* v7: blocks larger than half a slab and at most 1 MiB, such as a draw's
+ * varying buffers (vertex count times varying stride), are carved from
+ * 1 MiB slabs the device keeps for reuse instead of a dedicated BO each,
+ * which costs an mmap and a GPU MMU update per allocation and an munmap
+ * and MMU flush per reset. Big slabs sit at the tail of free_slabs,
+ * standard ones at the head; at most this many big ones are kept. */
+#define MALI_CMD_BIG_SLAB_SIZE (1024 * 1024)
+#define MALI_CMD_FREE_BIG_SLABS_MAX 32
+
 /* A slab of command memory: CPU and GPU read/write (the GPU writes job
  * headers back), CPU-uncached, written and never read by the CPU. */
 static struct mali_cmd_slab *
@@ -88,9 +99,24 @@ slab_new(struct mali_device *dev, uint64_t size, bool recycle)
       simple_mtx_lock(&dev->slab_lock);
       struct mali_cmd_slab *s = NULL;
       if (!list_is_empty(&dev->free_slabs)) {
+#if PAN_ARCH < 9
+         /* Standard slabs at the head, big ones at the tail. */
+         struct list_head *e = size == MALI_CMD_SLAB_SIZE ? dev->free_slabs.next
+                                                           : dev->free_slabs.prev;
+         s = list_entry(e, struct mali_cmd_slab, link);
+         if (s->bo.size != size) {
+            s = NULL;
+         } else {
+            list_del(&s->link);
+            dev->free_slab_count--;
+            if (size != MALI_CMD_SLAB_SIZE)
+               dev->jm->free_big_slabs--;
+         }
+#else
          s = list_first_entry(&dev->free_slabs, struct mali_cmd_slab, link);
          list_del(&s->link);
          dev->free_slab_count--;
+#endif
       }
       simple_mtx_unlock(&dev->slab_lock);
       if (s)
@@ -118,6 +144,17 @@ slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
 {
    if (s->recycle) {
       simple_mtx_lock(&dev->slab_lock);
+#if PAN_ARCH < 9
+      if (s->bo.size != MALI_CMD_SLAB_SIZE) {
+         if (dev->jm->free_big_slabs < MALI_CMD_FREE_BIG_SLABS_MAX &&
+             dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
+            list_addtail(&s->link, &dev->free_slabs);
+            dev->free_slab_count++;
+            dev->jm->free_big_slabs++;
+            s = NULL;
+         }
+      } else
+#endif
       if (dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
          list_add(&s->link, &dev->free_slabs);
          dev->free_slab_count++;
@@ -144,6 +181,11 @@ release_memory(struct mali_cmd_buffer *cmd)
    cmd->cur_offset = 0;
    cmd->cur_cpu = NULL;
    cmd->cur_gpu = 0;
+#if PAN_ARCH < 9
+   cmd->big_cpu = NULL;
+   cmd->big_gpu = 0;
+   cmd->big_offset = 0;
+#endif
    cmd->tls.size = 0;
    cmd->tls.gpu = 0;
 }
@@ -155,6 +197,22 @@ MALI_PER_ARCH(cmd_alloc_slow)(struct mali_cmd_buffer *cmd, uint64_t size, uint64
    size = MAX2(size, 1);
 
    if (size > MALI_CMD_SLAB_SIZE / 2) {
+#if PAN_ARCH < 9
+      if (size <= MALI_CMD_BIG_SLAB_SIZE) {
+         uint64_t boff = ALIGN_POT(cmd->big_offset, align);
+         if (!cmd->big_cpu || boff + size > MALI_CMD_BIG_SLAB_SIZE) {
+            struct mali_cmd_slab *s = slab_new(cmd->dev, MALI_CMD_BIG_SLAB_SIZE, true);
+            if (!s)
+               goto oom;
+            list_addtail(&s->link, &cmd->slabs);
+            cmd->big_cpu = s->bo.cpu;
+            cmd->big_gpu = s->bo.gpu_va;
+            boff = 0;
+         }
+         cmd->big_offset = boff + size;
+         return (struct mali_ptr){cmd->big_cpu + boff, cmd->big_gpu + boff};
+      }
+#endif
       struct mali_cmd_slab *s = slab_new(cmd->dev, size, false);
       if (!s)
          goto oom;
@@ -233,8 +291,14 @@ mali_jm_cmd_prepare_submit(struct mali_cmd_buffer *cmd)
 static inline bool
 job_is_tiler_side(enum mali_job_type type)
 {
+#if PAN_ARCH >= 9
    return type == MALI_JOB_TYPE_MALLOC_VERTEX || type == MALI_JOB_TYPE_FULLSCREEN ||
           type == MALI_JOB_TYPE_TILER;
+#else
+   /* v7 has no Malloc Vertex or Fullscreen jobs: a draw is a Vertex job
+    * (compute side) and a Tiler job that depends on it. */
+   return type == MALI_JOB_TYPE_TILER;
+#endif
 }
 
 /* Header and link of a job at job (size bytes, from command memory). */
@@ -268,10 +332,40 @@ chain_has_room(struct mali_cmd_buffer *cmd, const struct mali_jm_chain *c)
    return false;
 }
 
+#if PAN_ARCH < 9
+void
+mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
+{
+   struct mali_jm_cmd *jm = &cmd->jm;
+   if (jm->pend_tilers <= keep)
+      return;
+   assert(jm->open);
+   struct mali_jm_chain *c = &jm->cur.vtc;
+   const unsigned n = jm->pend_tilers - keep;
+   for (unsigned i = 0; i < n; i++) {
+      if (!chain_has_room(cmd, c))
+         break;
+      link_job(cmd, c, jm->pend_tiler[i], MALI_JOB_TYPE_TILER, false, jm->pend_tiler_dep1[i]);
+   }
+   for (unsigned i = 0; i < keep; i++) {
+      jm->pend_tiler[i] = jm->pend_tiler[n + i];
+      jm->pend_tiler_dep1[i] = jm->pend_tiler_dep1[n + i];
+   }
+   jm->pend_tilers = keep;
+}
+#endif
+
 struct mali_ptr
 mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                     enum mali_job_type type, unsigned size, bool barrier, uint16_t dep1)
 {
+#if PAN_ARCH < 9
+   /* Every job but a draw's copy jobs and its Vertex job, which go in
+    * while tiler_defer is set (mali_jm_cmd_draw_v7.c), goes in behind the
+    * pending Tiler jobs. */
+   if (unlikely(cmd->jm.pend_tilers) && !cmd->jm.tiler_defer)
+      mali_v7_link_tilers(cmd, 0);
+#endif
    if (!chain_has_room(cmd, c))
       return (struct mali_ptr){0};
 
@@ -366,6 +460,9 @@ mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd)
 {
    if (!cmd->jm.open)
       return;
+#if PAN_ARCH < 9
+   mali_v7_link_tilers(cmd, 0);
+#endif
    cmd->jm.open = false;
    struct mali_jm_batch *b = &cmd->jm.cur;
    if (!b->vtc.jobs && !batch_has_frag_jobs(cmd)) {
@@ -543,19 +640,31 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
 /* ---------------------------------------------------------------------- */
 /* Barriers                                                                */
 
+/* On v7 a blit region that is a plain copy runs as the compute copy on the
+ * vtc slot (mali_cmd_image.c blit_region_v7) and any other region as a
+ * fragment pass, so the blit stage is a transfer on both slots
+ * (FRAG_XFER_STAGES has it too). A synchronization2 mask can name the blit
+ * stage without the copy stage. On v9 a blit is always a fragment pass. */
+#if PAN_ARCH < 9
+#define VTC_BLIT_STAGES VK_PIPELINE_STAGE_2_BLIT_BIT
+#else
+#define VTC_BLIT_STAGES 0
+#endif
+
 /* Stages whose work runs on the vtc slot: vertex and compute shading,
  * indirect and vertex input, and transfers done by compute (buffer copies,
- * fills, updates, buffer<->image copies). */
+ * fills, updates, buffer<->image copies, plain-copy blits on v7). */
 #define VTC_STAGES                                                             \
    (VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | \
     VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | \
     VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |                      \
     VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |                   \
     VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | \
-    VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT)
+    VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VTC_BLIT_STAGES)
 
 /* The vtc-slot stages that are transfers. */
-#define VTC_XFER_STAGES (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT)
+#define VTC_XFER_STAGES                                                        \
+   (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VTC_BLIT_STAGES)
 
 /* Stages of rendering on the fragment slot. */
 #define FRAG_RENDER_STAGES                                                     \
@@ -620,6 +729,40 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
    cmd->jm.req |= req;
 }
 
+#if PAN_ARCH < 9
+/* Source accesses that can write buffer memory, once
+ * vk_filter_src_access_flags2 has expanded MEMORY_WRITE and SHADER_WRITE
+ * for the source stages: shader storage writes, transfer writes and host
+ * writes. Attachment writes reach images only. */
+#define BUFFER_WRITE_ACCESS                                                    \
+   (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |    \
+    VK_ACCESS_2_HOST_WRITE_BIT)
+
+/*
+ * v7 fragment shaders read their pushed uniform buffer words from FAU,
+ * which a copy job on the vtc chain fills (mali_v7_ubo_copy). A buffer or
+ * global barrier that makes fragment-shader uniform reads wait for buffer
+ * writes therefore orders that job too: its source accesses include
+ * BUFFER_WRITE_ACCESS, and its destination stages include the fragment
+ * shader with UNIFORM_READ among the accesses (MEMORY_READ includes it,
+ * vk_filter_dst_access_flags2). SHADER_READ does not: vk.xml defines it
+ * as sampled, storage and binding table reads, and synchronization1's
+ * SHADER_READ, which the runtime passes on unchanged, never covered
+ * uniform buffers either. A render-to-texture barrier writes only
+ * attachments and is not one.
+ */
+static bool
+ubo_copy_dep(VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access,
+             VkPipelineStageFlags2 dst_stages, VkAccessFlags2 dst_access)
+{
+   src_stages = vk_expand_src_stage_flags2(src_stages);
+   dst_stages = vk_expand_dst_stage_flags2(dst_stages);
+   return (vk_filter_src_access_flags2(src_stages, src_access) & BUFFER_WRITE_ACCESS) &&
+          (dst_stages & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) &&
+          (vk_filter_dst_access_flags2(dst_stages, dst_access) & VK_ACCESS_2_UNIFORM_READ_BIT);
+}
+#endif
+
 /*
  * Image barriers after which the image's CRCs may not describe its memory
  * (the same rule as on v11, mali_cmd_buffer.c): a transition from
@@ -665,6 +808,12 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       srca |= m->srcAccessMask;
       dsta |= m->dstAccessMask;
    }
+#if PAN_ARCH < 9
+   /* The buffer and global dependencies (an image barrier's access scope
+    * is the image), for ubo_copy_dep. */
+   const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
+   const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
+#endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
       src |= m->srcStageMask;
@@ -689,6 +838,11 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       return;
    }
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
+#if PAN_ARCH < 9
+   if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
+      mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                          VK_ACCESS_2_UNIFORM_READ_BIT);
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -758,6 +912,12 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.resets);
    util_dynarray_clear(&cmd->jm.reset_data);
    cmd->jm.open = false;
+#if PAN_ARCH < 9
+   cmd->jm.pend_tilers = 0;
+   cmd->jm.tiler_defer = false;
+   cmd->jm.copy_tsd = 0;
+   util_dynarray_clear(&cmd->jm.buf_writes);
+#endif
    cmd->jm.req = cmd->jm.end_req = 0;
    cmd->jm.resubmit = false;
    cmd->jm.submitted = false;
@@ -768,6 +928,14 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    memset(&cmd->gfx, 0, sizeof(cmd->gfx));
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = cmd->draws = cmd->passes = 0;
+#if PAN_ARCH < 9
+   /* The v7 draw state goes with gfx: its descriptor tables were in the
+    * command memory released above (a draw after the reset must not keep
+    * them, mali_v7_desc_refresh), its index buffer view belongs to the
+    * binding in gfx.draw.ib, and everything else is rebuilt by
+    * MALI_GFX_DIRTY_ALL. */
+   mali_jm_draw_tmpl_init(&cmd->jm.draw);
+#endif
 }
 
 static VkResult
@@ -792,6 +960,9 @@ cmd_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
    util_dynarray_init(&cmd->jm.frags, NULL);
    util_dynarray_init(&cmd->jm.resets, NULL);
    util_dynarray_init(&cmd->jm.reset_data, NULL);
+#if PAN_ARCH < 9
+   util_dynarray_init(&cmd->jm.buf_writes, NULL);
+#endif
    list_inithead(&cmd->slabs);
    mali_jm_draw_tmpl_init(&cmd->jm.draw);
    cmd->vk.dynamic_graphics_state.vi = &cmd->dyn_vi;
@@ -820,6 +991,9 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
    util_dynarray_fini(&cmd->jm.frags);
    util_dynarray_fini(&cmd->jm.resets);
    util_dynarray_fini(&cmd->jm.reset_data);
+#if PAN_ARCH < 9
+   util_dynarray_fini(&cmd->jm.buf_writes);
+#endif
    mali_push_shadows_fini(&cmd->push_shadow, &cmd->vk.pool->alloc);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&cmd->vk.pool->alloc, cmd);

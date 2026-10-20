@@ -19,6 +19,13 @@
  * which pulls in the panthor kernel interface (kmod/pan_kmod.h). The
  * fixed-function half is in mali_pipeline_state.c.
  *
+ * The same NIR serves v7, compiled with Mesa's Bifrost backend instead of
+ * kraid (mali_compiler.c). There the shader returns to the Blend
+ * descriptor's Return Value, which the draw sets per render target
+ * (mali_jm_cmd_draw_v7.c emit_blend_descs), and the opaque Internal Blend
+ * word also names the register format (pan_blend_get_internal_desc at
+ * PAN_ARCH < 9).
+ *
  * Placement: the code goes into the device's executable pool with the
  * pipelines' shaders, so it shares their
  * 4 GiB window; the Blend descriptor holds only the low 32 bits of its
@@ -52,6 +59,9 @@
 
 #include "mali_compiler.h"
 #include "mali_vk.h"
+#if PAN_ARCH < 9
+#include "mali_rsd_v7.h"
+#endif
 
 #define BLEND_CODE_ALIGN 128
 
@@ -94,10 +104,11 @@ shader_format(enum pipe_format format)
 }
 
 /* The Internal Blend word pair of an opaque store of `format` to render
- * target `rt` (pan_blend_get_internal_desc for v9+). The shader's own
- * tile read and BLEND use it. */
+ * target `rt` (pan_blend_get_internal_desc). The shader's own tile read
+ * and BLEND use it. On v7 its conversion also names the register format
+ * of `dest_type`, the type the shader blends in. */
 static uint64_t
-opaque_internal_desc(enum pipe_format format, unsigned rt)
+opaque_internal_desc(enum pipe_format format, unsigned rt, nir_alu_type dest_type)
 {
    const struct util_format_description *desc = util_format_description(format);
    struct mali_internal_blend_packed res;
@@ -106,6 +117,11 @@ opaque_internal_desc(enum pipe_format format, unsigned rt)
       cfg.mode = MALI_BLEND_MODE_OPAQUE;
       cfg.fixed_function.num_comps = desc->nr_channels;
       cfg.fixed_function.rt = rt;
+#if PAN_ARCH < 9
+      cfg.fixed_function.conversion.register_format = mali_v7_register_format(dest_type);
+#else
+      (void)dest_type;
+#endif
       cfg.fixed_function.conversion.memory_format =
          GENX(pan_dithered_format_from_pipe_format)(format, false);
    }
@@ -158,7 +174,7 @@ MALI_PER_ARCH(blend_shader_nir)(const struct mali_blend_shader_key *key)
       src1 = nir_vector_insert_imm(b, src1, one, 3);
    }
 
-   const uint64_t opaque = opaque_internal_desc(format, key->rt);
+   const uint64_t opaque = opaque_internal_desc(format, key->rt, dest_type);
    nir_def *sample = key->nr_samples > 1 ? nir_load_sample_id(b) : nir_imm_int(b, 0);
    nir_def *dest = nir_load_tile_pan(
       b, 4, dest_bits, pan_nir_tile_rt_sample(b, nir_imm_int(b, key->rt), sample),

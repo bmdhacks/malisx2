@@ -20,6 +20,9 @@
  *   fragment = BLAKE3("fs", stage, layout, vertex stage, the state the
  *              fragment lowering reads)
  *   compute  = BLAKE3("cs", stage, layout)
+ * and on v7, for the fragment shader that only clips (clip_fs_compile),
+ *   BLAKE3("mali-v7-clip-fs", the vertex shader's varying layout, the
+ *          state the fragment lowering reads)
  * "stage" is the runtime's hash of the stage create info (SPIR-V, entry
  * point, specialization, flags, robustness). The fragment shader is
  * compiled against the vertex shader's varying layout, so its key includes
@@ -460,8 +463,8 @@ copy_varying_layout(struct pan_varying_layout *dst, const struct pan_varying_lay
 }
 
 /* The bind block (struct mali_gfx_bind): register words, the static
- * states the draw reads, table keys, and a GPU copy of the Depth/stencil
- * descriptor when nothing dynamic feeds it. */
+ * states the draw reads, table keys, and on v9 and v11 a GPU copy of the
+ * Depth/stencil descriptor when nothing dynamic feeds it. */
 static VkResult
 fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
 {
@@ -549,6 +552,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->fs_srt_key = mali_device_intern_key(dev, &fkey, sizeof(fkey));
 
    bd->zsd = 0;
+#if PAN_ARCH >= 9
    if (!bk->uses_dynamic_state) {
       if (mali_bo_pool_alloc(&dev->desc_pool, sizeof(bk->zsd), 32, &p->zsd_mem) !=
           MALI_KBASE_SUCCESS)
@@ -556,8 +560,91 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
       memcpy(p->zsd_mem.cpu, bk->zsd, sizeof(bk->zsd));
       bd->zsd = p->zsd_mem.gpu_va;
    }
+#else
+   /* v7 has no Depth/stencil descriptor: the draw copies baked.zsd into
+    * its fragment Renderer State Descriptor (mali_jm_cmd_draw_v7.c
+    * build_fs_rsd). */
+#endif
    return VK_SUCCESS;
 }
+
+#if PAN_ARCH < 9
+/*
+ * v7 clips in the fragment shader (mali_shader.c, "Clip distances"), so a
+ * pipeline whose vertex shader writes clip distances and that has no
+ * fragment shader gets one that only clips: an empty fragment shader, to
+ * which the fragment compile adds the clip discard. Like no fragment
+ * shader, it writes no colour (every colour target stays off,
+ * mali_pipeline_state.c pack_blend); its discard makes the depth/stencil
+ * update late, so a clipped fragment writes no depth or stencil.
+ */
+static bool
+vs_writes_clip_distances(const struct mali_shader *vs)
+{
+   const struct pan_varying_layout *vl = &vs->info.varyings.formats;
+   return pan_varying_layout_find_slot(vl, VARYING_SLOT_CLIP_DIST0) ||
+          pan_varying_layout_find_slot(vl, VARYING_SLOT_CLIP_DIST1);
+}
+
+/* Its cache key covers what its compile reads: the vertex shader's
+ * varying layout and the fragment state (hash_fs_state). */
+static void
+clip_fs_key(const struct mali_device *dev, const struct vk_graphics_pipeline_state *state,
+            const struct mali_shader *vs, blake3_hash key)
+{
+   struct pan_varying_layout vl;
+   memset(&vl, 0, sizeof(vl));
+   copy_varying_layout(&vl, &vs->info.varyings.formats);
+
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, "mali-v7-clip-fs", 15);
+   _mesa_blake3_update(&h, &vl, sizeof(vl));
+   hash_fs_state(&h, dev, state);
+   _mesa_blake3_final(&h, key);
+}
+
+static VkResult
+clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
+                const struct vk_graphics_pipeline_state *state, const struct mali_shader *vs,
+                struct stage *st)
+{
+   const int64_t start = os_time_get_nano();
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_FRAGMENT),
+      "mali_v7_clip_fs");
+   MALI_PER_ARCH(shader_preprocess)(dev, b.shader);
+
+   /* The shader reads no buffer or image. */
+   const struct vk_pipeline_robustness_state rs = {
+      .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .vertex_inputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
+      .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
+   };
+   const struct mali_shader_compile_info info = {
+      .nir = b.shader,
+      .rs = &rs,
+      .state = state,
+      .vs_varying_layout = &vs->info.varyings.formats,
+   };
+
+   struct mali_shader *shader;
+   VkResult result = MALI_PER_ARCH(shader_compile)(dev, &info, st->key, &shader);
+   if (result != VK_SUCCESS)
+      return result;
+   p_atomic_inc(&dev->pipeline_stats.shaders_compiled);
+
+   if (cache) {
+      struct vk_pipeline_cache_object *obj =
+         vk_pipeline_cache_add_object(cache, &shader->base);
+      shader = container_of(obj, struct mali_shader, base);
+   }
+   st->shader = shader;
+   st->duration_ns = os_time_get_nano() - start;
+   return VK_SUCCESS;
+}
+#endif /* PAN_ARCH < 9 */
 
 static VkResult
 create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
@@ -570,6 +657,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    struct vk_pipeline_cache *cache = pick_cache(dev, cache_handle);
    struct stage stages[2];
    struct stage *vs = NULL, *fs = NULL;
+#if PAN_ARCH < 9
+   /* The fragment shader that only clips (clip_fs_compile), if needed. */
+   struct stage clip = {0};
+#endif
    uint32_t stage_count = 0;
    VkResult result;
 
@@ -650,6 +741,23 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       if (result != VK_SUCCESS)
          goto out;
    }
+#if PAN_ARCH < 9
+   if (!fs && vs_writes_clip_distances(vs->shader)) {
+      clip_fs_key(dev, &state, vs->shader, clip.key);
+      if (!stage_lookup(dev, cache, &clip)) {
+         if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+            result = VK_PIPELINE_COMPILE_REQUIRED;
+            goto out;
+         }
+         result = clip_fs_compile(dev, cache, &state, vs->shader, &clip);
+         if (result != VK_SUCCESS)
+            goto out;
+         /* Creation feedback counts it with the vertex stage. */
+         vs->cache_hit = false;
+         vs->duration_ns += clip.duration_ns;
+      }
+   }
+#endif
 
    struct mali_graphics_pipeline *p =
       vk_pipeline_zalloc(&dev->vk, &graphics_pipeline_ops,
@@ -667,6 +775,12 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       p->fs = fs->shader;
       fs->shader = NULL;
    }
+#if PAN_ARCH < 9
+   if (clip.shader) {
+      p->fs = clip.shader;
+      clip.shader = NULL;
+   }
+#endif
 
    /* The static state, and the words baked from it. */
    BITSET_COPY(p->dynamic, state.dynamic);
@@ -702,6 +816,9 @@ out:
                   os_time_get_nano() - start);
    for (uint32_t i = 0; i < stage_count; i++)
       stage_finish(dev, &stages[i]);
+#if PAN_ARCH < 9
+   stage_finish(dev, &clip);
+#endif
    return result;
 }
 

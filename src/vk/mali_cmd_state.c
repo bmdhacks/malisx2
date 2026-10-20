@@ -20,6 +20,7 @@
 #include "vk_pipeline_layout.h"
 
 #include "mali_arch.h"
+#include "mali_memory.h"
 
 /* ---------------------------------------------------------------------- */
 /* Binding                                                                 */
@@ -146,7 +147,10 @@ MALI_PER_ARCH(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer, uint32_t fir
    }
    if (pStrides)
       vk_cmd_set_vertex_binding_strides(&cmd->vk, firstBinding, bindingCount, pStrides);
+#if PAN_ARCH >= 9
+   /* v9+: the attributes live in the VS table (v7 packs them per draw). */
    d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -165,6 +169,16 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
       d->ib.addr = 0;
       d->ib.size = 0;
    }
+#if PAN_ARCH < 9
+   /* v7 runs the vertex shader over the index range of an indexed draw,
+    * which the v7 draw finds by reading the indices on the CPU
+    * (mali_jm_cmd_draw_v7.c): the buffer's CPU view, NULL for an imported
+    * dma-buf, which has none. */
+   const struct mali_buffer *mb = buf ? container_of(buf, struct mali_buffer, vk) : NULL;
+   cmd->jm.draw.ib_cpu = (mb && mb->mem && mb->mem->bo.cpu)
+                            ? (const uint8_t *)mb->mem->bo.cpu + mb->mem_offset + offset
+                            : NULL;
+#endif
    d->dirty |= MALI_GFX_DIRTY_INDEX;
 }
 
@@ -204,8 +218,8 @@ MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader
       tmp[n++] = v;
    }
    n += mali_shader_fau_consts(&s->fau, &tmp[n]);
-   /* Uniform-buffer words (v11): zero here, copied in by the GPU
-    * (mali_cmd_draw.c emit_ubo_push). */
+   /* Pushed uniform-buffer words: zero here, copied in by the GPU
+    * (mali_shader.h struct mali_shader_fau). */
    assert(!s->fau.ubo_push_count || n == s->fau.ubo_push_start);
    for (unsigned i = n; i < total; i++)
       tmp[i] = 0;

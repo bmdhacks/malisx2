@@ -25,6 +25,22 @@
 #include "vk_format.h"
 #include "vk_util.h"
 
+/* Whether an image's memory is shared outside the device: external memory,
+ * a swapchain image or an Android native buffer. Other processes and the
+ * display read and write its bytes directly. */
+static bool
+external_memory(const VkImageCreateInfo *info)
+{
+   if (vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
+       vk_find_struct_const(info->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR))
+      return true;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   if (vk_find_struct_const(info->pNext, NATIVE_BUFFER_ANDROID))
+      return true;
+#endif
+   return false;
+}
+
 /*
  * AFBC (lossless framebuffer compression) for the images whose memory
  * traffic is the GPU's own: colour and depth/stencil attachments. Kept to
@@ -44,8 +60,11 @@
  * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
  * pan_mod_afbc_test_props).
  *
- * Both arches. On a G57 at 2x upscaling, uncompressed render targets made
+ * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
+ *
+ * v7 has narrower rules of its own, colour attachments only
+ * (v7_can_use_afbc).
  */
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
@@ -91,10 +110,70 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
 }
 
 /*
+ * The plane formats v7 AFBC takes here: 8-bit UNORM R, RG and RGBA (sRGB
+ * as a flag on RGBA8), whose component order the v7 texture unit accepts
+ * with AFBC as it is. pan_afbc_format at PAN_ARCH 7 accepts more (RGB565,
+ * RGB5A1, RGBA4, RGB10A2, the BGR orders); those are left uncompressed
+ * here. The BGR orders also need pan_texture_afbc_reswizzle, with the
+ * sampler border colours swizzled to match (panvk_vX_sampler.c).
+ */
+static bool
+v7_afbc_format(enum pipe_format f)
+{
+   switch (f) {
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * AFBC on v7 (panvk_image_can_use_mod and pan_mod_afbc_test_props at
+ * PAN_ARCH 7, narrowed): a single-plane 2D colour attachment in a format
+ * of v7_afbc_format, optimal tiling, single-sampled, one level and one
+ * layer, at least half a header tile each way. Not for images whose bytes
+ * are read or written uncompressed (storage, host transfer, external
+ * memory, swapchain and Android native buffers), nor for mutable,
+ * block-compatible or aliased ones (v7 cannot read an AFBC plane in
+ * another format), nor for disjoint or sparse ones.
+ */
+static bool
+v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
+                const VkImageCreateInfo *info)
+{
+   const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
+   if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+      return false;
+   if (image->plane_count != 1 || vk_format_is_depth_or_stencil(image->vk.format) ||
+       !v7_afbc_format(formats[0]))
+      return false;
+   if (image->vk.create_flags &
+       (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+        VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_DISJOINT_BIT |
+        VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
+      return false;
+   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != 1 ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1)
+      return false;
+   if (external_memory(info))
+      return false;
+   const unsigned min = mali_afbc_min_extent(formats[0]);
+   return image->vk.extent.width >= min && image->vk.extent.height >= min;
+}
+
+/*
  * The layout of an image, by panvk's rules for the modifiers we use
  * (panvk_image_can_use_mod, pan_mod_u_tiled_test_props):
  *
- * - AFBC when can_use_afbc says so;
+ * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7);
  * - linear when the application asks for linear tiling, for 1D images,
  *   and when the base level is a single texel wide or high (tiling cannot
  *   help then);
@@ -104,9 +183,10 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
  * - 16x16 u-interleaved otherwise.
  */
 static uint64_t
-choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch)
+choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
+                const VkImageCreateInfo *info)
 {
-   if (can_use_afbc(image, formats, arch))
+   if (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
        image->vk.image_type == VK_IMAGE_TYPE_1D ||
@@ -153,13 +233,8 @@ mali_image_wants_crc(const VkImageCreateInfo *info, uint64_t modifier)
    if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                       VK_IMAGE_CREATE_ALIAS_BIT))
       return false;
-   if (vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
-       vk_find_struct_const(info->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR))
+   if (external_memory(info))
       return false;
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-   if (vk_find_struct_const(info->pNext, NATIVE_BUFFER_ANDROID))
-      return false;
-#endif
    if (vk_format_is_depth_or_stencil(info->format) || vk_format_is_compressed(info->format) ||
        vk_format_get_plane_count(info->format) != 1)
       return false;
@@ -193,10 +268,11 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       goto fail;
    }
    const unsigned arch = mali_device_physical(dev)->arch;
-   image->vk.drm_format_mod = choose_modifier(image, formats, arch);
-   /* No CRC on v9 yet: the job manager cannot update the seed from the
+   image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
+   /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
     * GPU, and the CPU-side seed it needs is not written yet. */
-   const bool crc = arch != 9 && mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+   const bool crc = !mali_arch_is_jm(arch) &&
+                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    /* Planes follow each other; each starts 4 KiB aligned (data_size is
     * rounded so). */
@@ -299,7 +375,7 @@ mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
 }
 
 /* The CRC knobs (mali_cmd_gfx.h): here, in code compiled once, so the
- * render-pass code of either arch reads the same ones. */
+ * render-pass code of every arch reads the same ones. */
 struct mali_crc_options mali_crc_options = {
    .empty_tile_read = true,
    .empty_tile_write = true,

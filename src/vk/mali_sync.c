@@ -23,13 +23,14 @@
  * (has a submit's work been reached, noticing a fault
  * before the next event, sync-file import/export) go through the
  * MALI_PER_ARCH() hooks declared in mali_queue.h (CSF, v11) and mali_jm.h
- * (job manager, v9). The file is built once per arch; on v9 a GPU signal's
- * payload is a submission number and its tracker atom instead of per-
- * subqueue done values, and a sleeping host wait reads kbase events itself
- * (mali_jm_queue.c) instead of waiting for an event thread.
+ * (job manager, v7 and v9). The file is built once per arch; on the job
+ * manager a GPU signal's payload is a submission number and its tracker
+ * atom instead of per-subqueue done values, and a sleeping host wait reads
+ * kbase events itself (mali_jm_queue.c) instead of waiting for an event
+ * thread.
  */
 
-#if defined(PAN_ARCH) && PAN_ARCH == 9
+#if defined(PAN_ARCH) && PAN_ARCH < 10
 #include "mali_jm.h"
 #else
 #include "mali_queue.h"

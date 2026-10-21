@@ -42,6 +42,25 @@ The result is a Vulkan HAL module (`HMI`) with 16 KiB-aligned segments,
 needing only `libc`, `libm`, `libdl` and `liblog`. ARMSX2 loads it as an
 adrenotools driver pack: the library plus a `meta.json` in a zip.
 
+ROCKNIX (arm64 Linux, RK3566/RK3568 devices running ROCKNIX's
+`mali_kbase`) is a cross build against the toolchain of a ROCKNIX build
+tree, with the build machine's clang and lld. Name the tree's toolchain
+directory in a machine file of your own and pass it first (see
+`cross/rocknix-aarch64.ini`):
+
+    # ~/rocknix-toolchain.ini
+    [constants]
+    toolchain = '/path/to/distribution/build.ROCKNIX-RK3566.aarch64/toolchain'
+
+    meson setup build-rocknix \
+        --cross-file ~/rocknix-toolchain.ini --cross-file cross/rocknix-aarch64.ini \
+        --native-file ~/rocknix-toolchain.ini --native-file cross/rocknix-native.ini
+    ninja -C build-rocknix
+
+With libclang 22, bindgen 0.71.x generates broken bindings; use 0.72.1.
+On Linux the driver presents through Mesa's WSI (`VK_KHR_display`) and
+through Arm's WSI layer (Wayland), which imports linear dma-bufs.
+
 ## Measurement
 
 `MALISX2_MEASURE=timing` (or `draws`, `csf`, `both`, `shaders`; on Android

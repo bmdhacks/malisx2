@@ -239,6 +239,22 @@ out:
    return VK_SUCCESS;
 }
 
+/* The memory types a dma-buf can be imported into: the host-visible ones,
+ * as for any image or buffer (an import is CPU-mapped through its fd, with
+ * DMA_BUF_IOCTL_SYNC around CPU access whatever the type). */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_GetMemoryFdPropertiesKHR(VkDevice _device, VkExternalMemoryHandleTypeFlagBits handleType,
+                              int fd, VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT || fd < 0)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "fd %d of handle type 0x%x (only dma-buf is supported)", fd, handleType);
+   pMemoryFdProperties->memoryTypeBits = MALI_MEMORY_TYPES_HOST_VISIBLE;
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 mali_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
                 const VkAllocationCallbacks *pAllocator)

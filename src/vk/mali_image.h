@@ -147,11 +147,18 @@ struct mali_image_layout_info {
    uint32_t levels;
    uint32_t layers;
    bool crc;                 /* add a CRC table after level 0 */
+   uint32_t explicit_row_stride; /* non-zero: an imported linear layout with
+                                    this row stride (one level, one layer,
+                                    one sample), the plane at exactly the
+                                    offset given */
 };
 
 /*
  * Lay out one plane starting at offset (a multiple of 64). Returns false
- * for a modifier or format the rules do not cover.
+ * for a modifier or format the rules do not cover, and for an explicit
+ * layout the GPU cannot use: row stride or offset not a multiple of 64
+ * (Mesa's pan_linear_or_tiled_row_align_req on v7 and later), or a row
+ * stride narrower than the image.
  */
 bool mali_image_plane_layout_init(const struct mali_image_layout_info *info,
                                   uint64_t offset,

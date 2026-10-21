@@ -179,6 +179,8 @@ v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  * The layout of an image, by panvk's rules for the modifiers we use
  * (panvk_image_can_use_mod, pan_mod_u_tiled_test_props):
  *
+ * - DRM_FORMAT_MOD_LINEAR for DRM format modifier tiling, the only
+ *   modifier offered (mali_formats.c; checked in mali_CreateImage);
  * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7);
  * - linear when the application asks for linear tiling, for 1D images,
  *   and when the base level is a single texel wide or high (tiling cannot
@@ -195,7 +197,7 @@ choose_modifier(const struct mali_image *image, const enum pipe_format *formats,
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
-   if (image->wsi_scanout)
+   if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       return DRM_FORMAT_MOD_LINEAR;
    if (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
@@ -261,10 +263,29 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    VkResult result;
 
    /* Swapchain images (VkNativeBufferANDROID) are laid out and bound
-    * below; AHB images are not supported. */
-   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "DRM format modifier tiling is not supported");
+    * below; AHB images are not supported. DRM format modifier tiling
+    * takes DRM_FORMAT_MOD_LINEAR from a list, or explicitly with the
+    * exporter's row stride and offset for one plane (the WSI layer's
+    * imports). */
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit = NULL;
+   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkImageDrmFormatModifierListCreateInfoEXT *mod_list =
+         vk_find_struct_const(pCreateInfo->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+      mod_explicit = vk_find_struct_const(pCreateInfo->pNext,
+                                          IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+      bool linear = false;
+      if (mod_explicit) {
+         linear = mod_explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
+                  mod_explicit->drmFormatModifierPlaneCount == 1;
+      } else if (mod_list) {
+         for (uint32_t i = 0; i < mod_list->drmFormatModifierCount; i++)
+            linear |= mod_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR;
+      }
+      if (!linear)
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "DRM format modifier tiling without DRM_FORMAT_MOD_LINEAR "
+                          "(the only modifier supported)");
+   }
 
 #ifndef __ANDROID__
    const struct wsi_image_create_info *wsi_info =
@@ -295,9 +316,17 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    const bool crc = !mali_arch_is_jm(arch) &&
                     mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
+   if (mod_explicit && image->plane_count != 1) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "explicit DRM format modifier layout of a %u-plane format",
+                         image->plane_count);
+      goto fail;
+   }
+
    /* Planes follow each other; each starts 4 KiB aligned (data_size is
-    * rounded so). */
-   uint64_t offset = 0;
+    * rounded so). An explicit layout places the one plane where the
+    * exporter put it. */
+   uint64_t offset = mod_explicit ? mod_explicit->pPlaneLayouts[0].offset : 0;
    for (unsigned p = 0; p < image->plane_count; p++) {
       const struct mali_image_layout_info info = {
          .format = formats[p],
@@ -309,15 +338,20 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
          .levels = image->vk.mip_levels,
          .layers = image->vk.array_layers,
          .crc = crc && p == 0,
+         .explicit_row_stride = mod_explicit ? mod_explicit->pPlaneLayouts[0].rowPitch : 0,
       };
       image->planes[p].format = formats[p];
-      if (!mali_image_plane_layout_init(&info, offset, &image->planes[p].layout)) {
-         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "no layout for plane %u of a %ux%ux%u image of format %d", p,
-                            info.width, info.height, info.depth, image->vk.format);
+      if ((mod_explicit && (!info.explicit_row_stride ||
+                            mod_explicit->pPlaneLayouts[0].rowPitch > UINT32_MAX)) ||
+          !mali_image_plane_layout_init(&info, offset, &image->planes[p].layout)) {
+         result = vk_errorf(dev, mod_explicit ? VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+                                              : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "no layout for plane %u of a %ux%ux%u image of format %d%s", p,
+                            info.width, info.height, info.depth, image->vk.format,
+                            mod_explicit ? " with the explicit DRM format modifier layout" : "");
          goto fail;
       }
-      offset += image->planes[p].layout.data_size;
+      offset = image->planes[p].layout.slices[0].offset + image->planes[p].layout.data_size;
    }
    image->size = offset;
 

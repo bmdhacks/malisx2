@@ -6,8 +6,8 @@
 /*
  * Plane layouts for linear, 16x16 u-interleaved and AFBC images, with the
  * rules of Mesa's pan_mod.c (linear, u_tiled and afbc init_slice_layout),
- * pan_afbc.h and pan_layout.c (pan_image_layout_init) for arch 11, without
- * explicit (imported) layouts:
+ * pan_afbc.h and pan_layout.c (pan_image_layout_init) for arch 11, and
+ * explicit (imported) layouts for linear single-level images only:
  *
  * - rows and slices are 64-byte aligned (arch >= 7 row alignment for
  *   non-YUV formats, raised to a cache line);
@@ -180,6 +180,17 @@ mali_image_plane_layout_init(const struct mali_image_layout_info *info,
    }
    const unsigned tile_bytes = tile_w * tile_h * block_bytes;
 
+   /* An imported layout (pan_mod_linear_init_slice_layout with a WSI row
+    * pitch): the exporter chose the stride and offset; check that the GPU
+    * can address them. */
+   const uint32_t explicit_stride = info->explicit_row_stride;
+   if (explicit_stride &&
+       (info->modifier != DRM_FORMAT_MOD_LINEAR || info->levels != 1 || info->layers != 1 ||
+        info->samples != 1 || info->depth != 1 || info->crc ||
+        explicit_stride % ROW_ALIGN || offset % ROW_ALIGN ||
+        explicit_stride < DIV_ROUND_UP(info->width, bw) * block_bytes))
+      return false;
+
    *layout = (struct mali_image_plane_layout){0};
    uint64_t pos = ALIGN_POT(offset, afbc ? MALI_AFBC_ALIGN : ROW_ALIGN);
    const uint64_t start = pos;
@@ -201,7 +212,7 @@ mali_image_plane_layout_init(const struct mali_image_layout_info *info,
             s->surface_stride = ALIGN_POT((uint64_t)s->row_stride * DIV_ROUND_UP(h_el, tile_h),
                                           ROW_ALIGN);
          } else {
-            s->row_stride = ALIGN_POT(w_el * block_bytes, ROW_ALIGN);
+            s->row_stride = explicit_stride ? explicit_stride : ALIGN_POT(w_el * block_bytes, ROW_ALIGN);
             s->surface_stride = ALIGN_POT((uint64_t)s->row_stride * h_el, ROW_ALIGN);
          }
          s->size = s->surface_stride * d_el * info->samples;

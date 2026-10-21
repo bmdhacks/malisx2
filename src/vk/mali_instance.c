@@ -45,6 +45,11 @@ static const struct vk_instance_extension_table mali_instance_extensions = {
    .KHR_display = true,
    .KHR_get_display_properties2 = true,
    .EXT_headless_surface = true,
+   /* Vulkan 1.1 core, listed for Arm's WSI layer: for an application that
+    * asks for Vulkan 1.0 (vkmark, vkcube) it enables these by name. */
+   .KHR_external_fence_capabilities = true,
+   .KHR_external_memory_capabilities = true,
+   .KHR_external_semaphore_capabilities = true,
 #endif
 };
 

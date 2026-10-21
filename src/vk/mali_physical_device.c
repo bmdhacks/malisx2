@@ -328,6 +328,27 @@ static const struct vk_device_extension_table mali_device_extensions = {
    /* The Linux window system: Mesa's WSI owns the swapchain for a
     * VK_KHR_display surface (mali_wsi_linux.c). */
    .KHR_swapchain = true,
+   /* What Arm's WSI layer (vulkan-wsi-layer, which ROCKNIX installs) needs
+    * for Wayland swapchains: it allocates linear dma-bufs itself, imports
+    * them with an explicit DRM format modifier layout, and calibrates
+    * present timing against the device clock. Only DRM_FORMAT_MOD_LINEAR
+    * is offered, and image formats report dma-bufs as importable only
+    * (mali_formats.c): export is limited to the display swapchain's
+    * dedicated GBM allocations (mali_device_memory.c). */
+   .KHR_external_memory_fd = true,
+   .EXT_external_memory_dma_buf = true,
+   .EXT_image_drm_format_modifier = true,
+   .KHR_image_format_list = true,
+   .KHR_calibrated_timestamps = true,
+   /* Vulkan 1.1 core; for an application that asks for Vulkan 1.0 the
+    * layer enables them by name. */
+   .KHR_bind_memory2 = true,
+   .KHR_dedicated_allocation = true,
+   .KHR_external_fence = true,
+   .KHR_external_memory = true,
+   .KHR_external_semaphore = true,
+   .KHR_get_memory_requirements2 = true,
+   .KHR_maintenance1 = true,
 #endif
    /* ARMSX2's in-tile destination read (the blob advertises both names).
     * Without it ARMSX2 reads the destination through an input attachment

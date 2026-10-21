@@ -203,6 +203,19 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    vk_free2(&dev->vk.physical->instance->alloc, alloc, dev);
 }
 
+/* VK_TIME_DOMAIN_DEVICE for Mesa's calibrated-timestamp entry points: the
+ * GPU system timestamp, the counter timestamp queries write (ticks of
+ * timestampPeriod). */
+static VkResult
+device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
+{
+   struct mali_device *dev = container_of(vk_dev, struct mali_device, vk);
+   uint64_t mono_ns;
+   return mali_kbase_timeinfo(dev->kbase, &mono_ns, timestamp) == MALI_KBASE_SUCCESS ?
+             VK_SUCCESS :
+             VK_ERROR_DEVICE_LOST;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_CreateDevice(VkPhysicalDevice physicalDevice,
                   const VkDeviceCreateInfo *pCreateInfo,
@@ -291,6 +304,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       vk_free2(&instance->vk.alloc, pAllocator, dev);
       return result;
    }
+   dev->vk.get_timestamp = device_get_timestamp;
    if (dev->kbase->frontend == MALI_KBASE_FRONTEND_JM) {
       /* No "malisx2:" prefix: this is information, not a warning. */
       char layout[192];

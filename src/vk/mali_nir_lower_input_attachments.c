@@ -77,19 +77,27 @@ readonly_color_mask(nir_shader *nir, const struct vk_graphics_pipeline_state *st
    return in_mask & ~out_mask;
 }
 
+/* The subpassLoad() intrinsics vk_spirv_to_nir produces (vk_nir.c): one
+ * for colour attachments, which carries the attachment index, and one each
+ * for the depth and the stencil aspect. Source 0 is the variable's deref,
+ * 1 the offset, 2 the sample. */
+static bool
+is_input_attachment_load(const nir_intrinsic_instr *intr)
+{
+   return intr->intrinsic == nir_intrinsic_image_deref_input_attachment_load ||
+          intr->intrinsic == nir_intrinsic_image_deref_depth_input_attachment_load ||
+          intr->intrinsic == nir_intrinsic_image_deref_stencil_input_attachment_load;
+}
+
 static bool
 lower_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    struct ia_ctx *ctx = data;
 
-   if (intr->intrinsic != nir_intrinsic_image_deref_load &&
-       intr->intrinsic != nir_intrinsic_image_deref_sparse_load)
+   if (!is_input_attachment_load(intr))
       return false;
 
    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-   enum glsl_sampler_dim dim = glsl_get_sampler_dim(deref->type);
-   if (dim != GLSL_SAMPLER_DIM_SUBPASS && dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
-      return false;
 
    b->cursor = nir_before_instr(&intr->instr);
 
@@ -214,12 +222,7 @@ is_subpass_load(const nir_instr *instr)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
-   const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-   if (intr->intrinsic != nir_intrinsic_image_deref_load)
-      return false;
-   const nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-   const enum glsl_sampler_dim dim = glsl_get_sampler_dim(deref->type);
-   return dim == GLSL_SAMPLER_DIM_SUBPASS || dim == GLSL_SAMPLER_DIM_SUBPASS_MS;
+   return is_input_attachment_load(nir_instr_as_intrinsic(instr));
 }
 
 /* Per component: the same scalar, equal constants, or both undefined. */
@@ -248,7 +251,8 @@ same_value(nir_def *a, nir_def *b)
 static bool
 same_subpass_load(const nir_intrinsic_instr *a, const nir_intrinsic_instr *b)
 {
-   if (a->def.num_components != b->def.num_components ||
+   if (a->intrinsic != b->intrinsic ||
+       a->def.num_components != b->def.num_components ||
        a->def.bit_size != b->def.bit_size ||
        nir_intrinsic_dest_type(a) != nir_intrinsic_dest_type(b))
       return false;

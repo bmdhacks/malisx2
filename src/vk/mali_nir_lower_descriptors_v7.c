@@ -475,6 +475,17 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
       return true;
    }
 
+   /* nir_lower_input_attachments leaves the attachment index in
+    * texture_index (and a texture_offset for an array of attachments).
+    * The deref carries the same information and this pass turns it into
+    * the table index below, so drop them (panvk does the same). */
+   if (tex->input_attachment_index) {
+      tex->texture_index = 0;
+      int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+      if (offset_src >= 0)
+         nir_tex_instr_remove_src(tex, offset_src);
+   }
+
    int sampler_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
       nir_def *plane = nir_steal_tex_src(tex, nir_tex_src_plane);

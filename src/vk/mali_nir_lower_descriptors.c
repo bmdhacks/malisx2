@@ -198,6 +198,17 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 
    b->cursor = nir_before_instr(&tex->instr);
 
+   /* nir_lower_input_attachments leaves the attachment index in
+    * texture_index (and a texture_offset for an array of attachments).
+    * The deref carries the same information and this pass turns it into
+    * the handle below, so drop them (panvk does the same). */
+   if (tex->input_attachment_index) {
+      tex->texture_index = 0;
+      int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+      if (offset_src >= 0)
+         nir_tex_instr_remove_src(tex, offset_src);
+   }
+
    /* Valhall takes complete handles in nir_tex_src_texture_handle and
     * nir_tex_src_sampler_handle and nothing in texture_index and
     * sampler_index (pan_nir_lower_tex.c). */

@@ -397,23 +397,26 @@ device_extensions_for_arch(uint32_t arch)
 }
 
 /*
- * Dual-source blending. Neither v9 nor v11 has a second-source operand in
- * the fixed-function blender: a render target whose equation uses a SRC1
+ * Dual-source blending. No arch has a second-source operand in the
+ * fixed-function blender: a render target whose equation uses a SRC1
  * factor runs a blend shader, and only pipelines with such an equation
- * keep the fragment shader's second colour output (mali_shader.c).
+ * keep the fragment shader's second colour output (mali_shader.c). The
+ * fragment shader's BLEND passes that colour in r4-r7 (blend2_pan) and the
+ * blend shader reads it from there (load_blend_input_pan); on v7 Mesa's
+ * Bifrost backend does both, as for panvk_v7.
  *
- * Reported on v9 and v11. ARMSX2 then hardware-blends some draws into
+ * Reported on v7, v9 and v11. ARMSX2 then hardware-blends some draws into
  * 16-bit PS2 frames without the PS2's colour truncation, a few levels too
  * bright, as on every other driver that reports it; it saves those draws
- * a framebuffer read.
- *
- * Not reported on v7. panvk_v7 has it, through a blend shader that reads
- * the second colour (blend2_pan) from its blend input registers.
+ * a framebuffer read. Without it ARMSX2 also takes its render-target-read
+ * path for stencil shadows (fast_stencil_shadow needs it); on a G52 those
+ * reads cost a pass and a copy each.
  */
 static bool
 dual_src_blend_for_arch(uint32_t arch)
 {
    switch (arch) {
+   case 7:
    case 9:
    case 11:
       return true;

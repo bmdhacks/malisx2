@@ -252,7 +252,7 @@ select_tile_size(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
       z_budget = V9_TILEBUF_Z / 2;
    } else {
       const struct mali_physical_device *pdev = mali_device_physical(cmd->dev);
-      const struct pan_model *model = pan_get_model(pdev->props.gpu_id, 0);
+      const struct pan_model *model = pdev->model;
       rt_budget = model ? model->tilebuffer.color_size / 2 : 16384;
       z_budget = model ? model->tilebuffer.z_size / 2 : 8192;
    }

@@ -22,7 +22,8 @@ foreach n : _pc_names
   libpanfrost_compiler_files += files(_vpc / n)
 endforeach
 
-libpanfrost_compiler_c_args = [mesa_c_args, '-DWITH_PANFROST_RUST']
+libpanfrost_compiler_c_args = [mesa_c_args, '-DWITH_PANFROST_RUST',
+                               '-DWITH_PANFROST_DISASSEMBLE']
 
 subdir('kraid')
 subdir('bifrost')

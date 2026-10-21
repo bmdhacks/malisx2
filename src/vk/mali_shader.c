@@ -864,7 +864,7 @@ MALI_PER_ARCH(shader_preprocess)(struct mali_device *dev, nir_shader *nir)
    NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_core_max_id_arm,
             core_max_id);
 
-   pan_preprocess_nir(nir, pdev->props.gpu_id);
+   pan_preprocess_nir(nir, pdev->arch);
 }
 
 #if PAN_ARCH >= 9
@@ -2054,7 +2054,8 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       robust_modes |= nir_var_mem_ssbo;
 
    struct pan_compile_inputs inputs = {
-      .gpu_id = pdev->props.gpu_id,
+      .arch = pdev->arch,
+      .model = pdev->model,
       .view_mask = (state && state->rp && state->mv) ? state->mv->view_mask : 0,
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
@@ -2110,8 +2111,8 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       lower_nir_io(nir);
       NIR_PASS(_, nir, nir_opt_constant_folding);
 
-      pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id);
-      pan_build_varying_layout_compact(&varying_layout, nir, inputs.gpu_id);
+      pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
+      pan_build_varying_layout_compact(&varying_layout, nir, inputs.arch);
       inputs.varying_layout = &varying_layout;
       break;
 

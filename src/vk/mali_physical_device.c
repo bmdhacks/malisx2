@@ -23,6 +23,7 @@
 #include "util/u_math.h"
 #include "util/os_misc.h"
 #include "util/os_time.h"
+#include "model/pan_model.h"
 #include "vk_alloc.h"
 #include "vk_limits.h"
 #include "vk_util.h"
@@ -945,6 +946,13 @@ physical_device_create(struct mali_instance *instance, const char *path,
    pdev->props = kb->props;
    pdev->cs_work_registers = kb->glb.cs_work_registers;
    pdev->arch = pdev->props.arch_major;
+   /* Mesa's model table keys the command-stream parts by the low byte of
+    * CORE_FEATURES (what panthor reports as the variant) and lists the
+    * job-manager parts as variant 0 (the panfrost kernel driver reports
+    * none). */
+   pdev->model = pan_get_model(pdev->props.gpu_id,
+                               pdev->arch >= 10 ? pdev->props.core_features & 0xff : 0,
+                               pdev->props.core_count, pdev->props.gpu_features);
    const enum mali_kbase_frontend frontend = kb->frontend;
    mali_kbase_destroy(kb);
 

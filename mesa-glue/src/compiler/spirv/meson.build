@@ -29,7 +29,8 @@ vtn_generator_ids_h = custom_target(
 
 files_libvtn = []
 foreach n : ['gl_spirv.c', 'spirv_to_nir.c', 'vtn_alu.c', 'vtn_amd.c',
-             'vtn_cfg.c', 'vtn_cmat.c', 'vtn_debug.c', 'vtn_glsl450.c',
+             'vtn_cfg.c', 'vtn_cmat.c', 'vtn_constants.c', 'vtn_debug.c',
+             'vtn_glsl450.c',
              'vtn_opencl.c', 'vtn_structured_cfg.c', 'vtn_subgroup.c',
              'vtn_variables.c']
   files_libvtn += files(_vs / n)

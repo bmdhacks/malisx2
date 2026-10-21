@@ -60,6 +60,7 @@ void mali_instance_set_kbase_backend(const struct mali_kbase_backend *backend);
 /* Mesa's shared Vulkan WSI device state (src/vulkan/wsi/wsi_common.h). */
 struct wsi_device;
 struct gbm_device;
+struct pan_model;
 #endif
 
 struct mali_physical_device {
@@ -73,6 +74,12 @@ struct mali_physical_device {
     * the per-arch device entry points (mali_CreateDevice) and internals
     * (mali_arch_dispatch) without reaching back into props. */
    uint32_t arch;
+
+   /* Mesa's model-table entry for this GPU (core count and feature bits
+    * included in the match), or NULL when the table has none. The compiler
+    * takes it with the arch: Bifrost's workarounds are chosen from the
+    * model's architecture minor version. */
+   const struct pan_model *model;
 
    VkPhysicalDeviceMemoryProperties memory;
    uint64_t timestamp_hz;              /* 0: no timestamps */

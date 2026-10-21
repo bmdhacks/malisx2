@@ -286,14 +286,15 @@ compile_blend_shader(struct mali_device *dev, const struct mali_blend_shader_key
             NULL);
 
    struct pan_compile_inputs inputs = {
-      .gpu_id = pdev->props.gpu_id,
+      .arch = pdev->arch,
+      .model = pdev->model,
       .is_blend = true,
       /* The blend constants, 32-bit words. */
       .fau.reserved = 4,
    };
    struct pan_shader_info info;
    memset(&info, 0, sizeof(info));
-   pan_preprocess_nir(nir, inputs.gpu_id);
+   pan_preprocess_nir(nir, inputs.arch);
    pan_postprocess_nir(nir, &inputs, &info);
 
    struct util_dynarray bin;

@@ -101,6 +101,7 @@ libpanfrost_kraid = static_library(
   rust_args : [
     panfrost_rust_args,
     '--cfg', 'kraid_isa_xml_path="' + _vk + '"',
+    '--cfg', 'kraid_disasm',
     '-Clink-arg=-Wno-unused-command-line-argument',
   ],
   dependencies : [dep_bitflags, dep_paste, dep_rustc_hash, idep_compiler_rs,

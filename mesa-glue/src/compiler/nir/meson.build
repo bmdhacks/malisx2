@@ -154,7 +154,7 @@ _nir_names = [
   'nir_opt_rematerialize_compares.c', 'nir_opt_remove_phis.c',
   'nir_opt_scalar_array_vars_to_vec.c', 'nir_opt_shared_vars_to_subgroup.c',
   'nir_opt_shrink_stores.c', 'nir_opt_shrink_vectors.c', 'nir_opt_sink.c',
-  'nir_opt_undef.c', 'nir_opt_uniform_atomics.c',
+  'nir_opt_uadd_carry.c', 'nir_opt_undef.c', 'nir_opt_uniform_atomics.c',
   'nir_opt_uniform_subgroup.c', 'nir_opt_uub.c', 'nir_opt_varyings.c',
   'nir_opt_vectorize.c', 'nir_opt_vectorize_io.c',
   'nir_opt_vectorize_io_vars.c', 'nir_passthrough_gs.c',

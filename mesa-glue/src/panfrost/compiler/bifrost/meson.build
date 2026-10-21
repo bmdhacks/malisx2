@@ -17,6 +17,7 @@ _bi_names = [
   'bi_helper_invocations.c', 'bi_layout.c', 'bi_liveness.c',
   'bi_lower_divergent_indirects.c', 'bi_lower_mkvec_swz.c',
   'bi_lower_spill.c', 'bi_lower_swizzle.c', 'bi_print.c',
+  'bi_print_common.c',
   'bi_opt_control_flow.c', 'bi_opt_constant_fold.c', 'bi_opt_copy_prop.c',
   'bi_opt_dce.c', 'bi_opt_cse.c', 'bi_opt_push_ubo.c', 'bi_opt_mod_props.c',
   'bi_opt_dual_tex.c', 'bi_iterator_schedule.c', 'bi_pressure_schedule.c',
@@ -123,7 +124,7 @@ bifrost_nir_algebraic_c = custom_target(
 
 libpanfrost_bifrost_disasm = static_library(
   'panfrost_bifrost_disasm',
-  [files(_vb / 'bifrost' / 'disassemble.c', _vb / 'bi_print_common.c'), bifrost_gen_disasm_c],
+  [files(_vb / 'bifrost' / 'disassemble.c'), bifrost_gen_disasm_c],
   include_directories : [inc_include, inc_src, inc_valhall],
   dependencies : [idep_nir],
   c_args : mesa_c_args,

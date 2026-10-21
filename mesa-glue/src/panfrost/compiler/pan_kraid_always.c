@@ -5,10 +5,10 @@
 
 /*
  * The option lookup pan_compiler.c is built with (see meson.build here).
- * PAN_USE_KRAID is always "all": on v9 and v11 every stage and internal
- * shaders go through kraid, whatever the environment says (below arch 9
- * pan_use_kraid() does not read the option). Other names go to Mesa's
- * normal lookup.
+ * PAN_USE_KRAID is always "all", which is also Mesa's default: on v9 and
+ * v11 every stage and internal shaders go through kraid, and the
+ * environment cannot turn that off (below arch 9 pan_use_kraid() does not
+ * read the option). Other names go to Mesa's normal lookup.
  */
 
 #include <string.h>

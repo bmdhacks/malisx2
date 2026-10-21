@@ -30,10 +30,12 @@ subdir('bifrost')
 subdir('midgard')
 
 # kraid selection without the environment. pan_compiler.c reads the backend
-# choice from PAN_USE_KRAID through debug_get_option_cached(). kraid is the
-# only backend we use on v9 and v11 (below arch 9 pan_use_kraid() answers
-# false whatever the option says, and v7 compiles through the Bifrost
-# backend), and setting the variable at run time would race with other
+# choice from PAN_USE_KRAID through debug_get_option_cached(). Mesa's own
+# default is now "all", but the variable still overrides it, and the
+# application's environment must not change the backend: kraid is the only
+# one we use on v9 and v11 (below arch 9 pan_use_kraid() answers false
+# whatever the option says, and v7 compiles through the Bifrost backend).
+# Setting the variable ourselves at run time instead would race with other
 # threads of the application reading the environment. So this one file is
 # built with that call renamed to mali_pan_debug_option_cached()
 # (pan_kraid_always.c), which answers "all" for PAN_USE_KRAID and forwards

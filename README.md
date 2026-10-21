@@ -58,8 +58,15 @@ directory in a machine file of your own and pass it first (see
     ninja -C build-rocknix
 
 With libclang 22, bindgen 0.71.x generates broken bindings; use 0.72.1.
-On Linux the driver presents through Mesa's WSI (`VK_KHR_display`) and
-through Arm's WSI layer (Wayland), which imports linear dma-bufs.
+
+On Linux the driver presents `VK_KHR_display` swapchains itself, through
+Mesa's WSI code built into the library. Wayland swapchains come from Arm's
+[vulkan-wsi-layer](https://gitlab.freedesktop.org/mesa/vulkan-wsi-layer)
+(MIT licensed), a separate implicit Vulkan layer that the system installs,
+as ROCKNIX does. The layer allocates linear dma-bufs from a dma-buf heap and
+imports them into the driver (`VK_EXT_image_drm_format_modifier` with
+`DRM_FORMAT_MOD_LINEAR`, `VK_EXT_external_memory_dma_buf`); none of its code
+is part of this repository or linked into the library.
 
 ## Measurement
 

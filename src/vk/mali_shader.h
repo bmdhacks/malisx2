@@ -234,9 +234,10 @@ struct mali_ubo_push_word {
  * Pushed uniform-buffer words come from dynamic uniform buffers. On v11
  * they are pushed in fragment shaders, and the draw copies them into the
  * FAU block with command-stream loads and stores (mali_cmd_draw.c
- * emit_ubo_push). On v7 and v9 they are pushed in vertex and fragment
- * shaders, and a Compute job ahead of the job that reads the block copies
- * them (mali_jm_ubo.c mali_jm_ubo_copy).
+ * emit_ubo_push). On v7 they are pushed in vertex and fragment shaders,
+ * and a Compute job ahead of the job that reads the block copies them
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy). v9 shaders load from the buffer
+ * (ubo_push_count 0).
  *
  * The block's GPU address and total_count reach the hardware as one FAU
  * word on v11 (address | count << 56, the FAU register), as the Shader

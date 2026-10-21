@@ -471,6 +471,7 @@ lower_load_push_consts(nir_shader *nir, struct mali_shader *s)
 /* ---------------------------------------------------------------------- */
 /* Dynamic uniform buffers in FAU                                          */
 
+#if PAN_ARCH >= 10 || PAN_ARCH < 9
 /* Replaces a uniform buffer load with a read of its words in FAU, the
  * first of which is FAU word fau_word; offset is the load's byte offset
  * in the buffer. */
@@ -499,8 +500,9 @@ ubo_push_list(struct mali_shader *s, const BITSET_WORD *used, unsigned size,
       };
    }
 }
+#endif
 
-#if PAN_ARCH >= 9
+#if PAN_ARCH >= 10
 
 /* The FAU block may hold this many words once the uniform-buffer words are
  * added; the rest is left for constants the backend promotes. */
@@ -565,19 +567,11 @@ ubo_push_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 /*
- * Replace a shader's constant-offset reads of dynamic uniform buffers with
- * FAU reads. Each such read is otherwise an LD_PKA per warp (an
- * attribute-unit instruction and a load/store-unit read); in FAU the value
- * is an operand of the instruction that uses it.
- *
- * v11: the draw copies the words with command-stream loads and stores
- * (mali_cmd_draw.c). Fragment shaders only there.
- *
- * v9: the job manager has no command stream, so the draw's vtc chain gets a
- * Compute job that copies the words into the FAU block before the jobs that
- * read it (mali_jm_ubo.c). Vertex shaders too: theirs is the stage the job
- * manager is bound by (the G57's IDVS vertex work), and a vertex shader's
- * uniform reads are otherwise loads and register spills.
+ * Replace a fragment shader's constant-offset reads of dynamic uniform
+ * buffers with FAU reads. Each such read is otherwise an LD_PKA per warp
+ * (an attribute-unit instruction and a load/store-unit read); in FAU the
+ * value is an operand of the instruction that uses it. The draw fills the
+ * words from the buffer when it is recorded (mali_cmd_gfx_fau).
  *
  * All or nothing: when the words do not fit, nothing is pushed.
  */
@@ -587,13 +581,7 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
    s->fau.ubo_push_start = s->fau.total_count;
    s->fau.ubo_push_count = 0;
 
-   const bool stage_ok =
-#if PAN_ARCH >= 10
-      nir->info.stage == MESA_SHADER_FRAGMENT;
-#else
-      nir->info.stage == MESA_SHADER_FRAGMENT || nir->info.stage == MESA_SHADER_VERTEX;
-#endif
-   if (!stage_ok || !s->desc.dyn_bufs.count)
+   if (nir->info.stage != MESA_SHADER_FRAGMENT || !s->desc.dyn_bufs.count)
       return;
 
    struct ubo_push_ctx ctx = {
@@ -772,6 +760,18 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_ubo_push_intr,
             nir_metadata_control_flow, &ctx);
    s->fau.total_count += n;
+}
+#else
+/* v9: nothing is pushed; shaders load from the buffer. The v9 draw
+ * (mali_jm_cmd_draw.c) has no step that copies the words into the FAU
+ * block: v11 copies them with command-stream loads and stores, which the
+ * job manager does not have, and v7 with a Compute job of its own
+ * (mali_jm_desc_v7.c mali_v7_ubo_copy). */
+static void
+lower_ubo_push(nir_shader *nir, struct mali_shader *s)
+{
+   s->fau.ubo_push_start = s->fau.total_count;
+   s->fau.ubo_push_count = 0;
 }
 #endif
 

@@ -127,16 +127,6 @@ tset64(uint32_t *w, unsigned i, uint64_t v)
    memcpy(&w[i], &v, sizeof(v));
 }
 
-/* A Shader Environment's FAU block address (without the count in the top
- * byte). */
-static inline uint64_t
-env_fau(const uint32_t *env)
-{
-   uint64_t fau;
-   memcpy(&fau, &env[ENV_FAU], sizeof(fau));
-   return fau;
-}
-
 /* The FAU word of the builders (address | count << 56) into a Shader
  * Environment's FAU pointer and FAU count. */
 static inline void
@@ -234,6 +224,9 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
       if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
          return false;
+      /* v9 shaders keep no uniform-buffer words in FAU (no stream to
+       * copy them with). */
+      assert(!p->fs || !p->fs->fau.ubo_push_count);
       env_set_fau(fs_env, v);
    }
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
@@ -341,12 +334,12 @@ copy_job(void *restrict dst, const void *restrict src)
 
 /* The template as the next job of chain c. */
 static bool
-emit_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, uint16_t dep1)
+emit_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c)
 {
    struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
    struct mali_ptr job;
 
-   if (likely(!c->pending && !dep1 && c->index < UINT16_MAX - 2)) {
+   if (likely(!c->pending && c->index < UINT16_MAX - 2)) {
       job = mali_cmd_alloc(cmd, pan_size(MALLOC_VERTEX_JOB), 128);
       if (!job.cpu)
          return false;
@@ -361,7 +354,7 @@ emit_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, uint16_t dep1)
       /* A barrier owed to this chain (a Cache Flush job first), or a
        * chain out of indices (an error): the general path. */
       job = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_MALLOC_VERTEX,
-                                pan_size(MALLOC_VERTEX_JOB), false, dep1);
+                                pan_size(MALLOC_VERTEX_JOB), false, 0);
       if (!job.cpu)
          return false;
       memcpy((uint8_t *)job.cpu + 32, (const uint8_t *)t->w + 32,
@@ -377,7 +370,6 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    struct mali_render_state *r = &cmd->gfx.render;
-   const struct mali_graphics_pipeline *p = d->pipeline;
 
    if (!di->count || !di->instance_count)
       return;
@@ -408,26 +400,7 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    w[TW_INSTANCES] = di->instance_count;
    tset64(w, TW_INDICES, indices);
 
-   struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
-   if (!c)
-      return;
-
-   /* The stages' pushed uniform buffer words (mali_shader.c lower_ubo_push),
-    * copied into the FAU block by a Compute job in this chain: the Vertex
-    * job depends on the vertex shader's copy; the fragment shader's needs no
-    * dependency, the fragment job starting after the whole vtc atom. Every
-    * draw copies: the words come from a buffer the application may write in
-    * place between two draws whose FAU block is otherwise the same (v11
-    * copies them per draw too). */
-   uint16_t vs_dep = 0;
-   if (p->vs && p->vs->fau.ubo_push_count &&
-       !mali_jm_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, env_fau(&w[TW_POS_ENV]), 0, &vs_dep))
-      return;
-   if (p->fs && p->fs->fau.ubo_push_count &&
-       !mali_jm_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, env_fau(&w[TW_FS_ENV]), 0, NULL))
-      return;
-
-   if (!emit_job(cmd, c, vs_dep))
+   if (!emit_job(cmd, mali_jm_cmd_pass_vtc(cmd)))
       return;
 
    /* Heap use: every vertex's packet (with an index count, an upper

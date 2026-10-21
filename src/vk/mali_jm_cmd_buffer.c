@@ -739,11 +739,10 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
     VK_ACCESS_2_HOST_WRITE_BIT)
 
 /*
- * Fragment shaders on the job manager read their pushed uniform buffer
- * words from FAU, which a copy job on the vtc chain fills
- * (mali_jm_ubo_copy). A buffer or global barrier that makes
- * fragment-shader uniform reads wait for buffer writes therefore orders
- * that job too: its source accesses include
+ * v7 fragment shaders read their pushed uniform buffer words from FAU,
+ * which a copy job on the vtc chain fills (mali_v7_ubo_copy). A buffer or
+ * global barrier that makes fragment-shader uniform reads wait for buffer
+ * writes therefore orders that job too: its source accesses include
  * BUFFER_WRITE_ACCESS, and its destination stages include the fragment
  * shader with UNIFORM_READ among the accesses (MEMORY_READ includes it,
  * vk_filter_dst_access_flags2). SHADER_READ does not: vk.xml defines it
@@ -752,7 +751,6 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
  * uniform buffers either. A render-to-texture barrier writes only
  * attachments and is not one.
  */
-#if PAN_ARCH < 9
 static bool
 ubo_copy_dep(VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access,
              VkPipelineStageFlags2 dst_stages, VkAccessFlags2 dst_access)
@@ -763,7 +761,6 @@ ubo_copy_dep(VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access,
           (dst_stages & VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT) &&
           (vk_filter_dst_access_flags2(dst_stages, dst_access) & VK_ACCESS_2_UNIFORM_READ_BIT);
 }
-#endif
 #endif
 
 /*
@@ -842,9 +839,6 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    }
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
 #if PAN_ARCH < 9
-   /* v7 adds the fragment shader's copy job after the Vertex job, so the
-    * barrier above was consumed before it; order it too. (On v9 the copy
-    * jobs go in first and carry the barrier themselves.) */
    if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
       mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                           VK_ACCESS_2_UNIFORM_READ_BIT);

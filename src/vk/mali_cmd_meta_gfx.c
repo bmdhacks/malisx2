@@ -56,6 +56,7 @@
 #include "vk_pipeline.h"
 
 #include "panfrost/compiler/pan_compiler.h"
+#include "panfrost/compiler/pan_nir.h"
 
 #include "mali_descriptor_set.h"
 #include "mali_image.h"
@@ -120,7 +121,11 @@ static nir_def *
 tex_op(nir_builder *b, nir_texop op, unsigned tex, nir_def *coord, bool array,
        nir_alu_type type)
 {
+#if PAN_ARCH < 9
    nir_tex_instr *t = nir_tex_instr_create(b->shader, 2);
+#else
+   nir_tex_instr *t = nir_tex_instr_create(b->shader, 4);
+#endif
    t->op = op;
    t->sampler_dim = GLSL_SAMPLER_DIM_2D;
    t->is_array = array;
@@ -130,14 +135,18 @@ tex_op(nir_builder *b, nir_texop op, unsigned tex, nir_def *coord, bool array,
     * tables (panvk_vX_cmd_frame_shaders.c compact_tex_indices). */
    t->texture_index = tex;
    t->sampler_index = 0;
-#else
-   t->texture_index = pan_res_handle(0, 1 + tex);
-   t->sampler_index = pan_res_handle(0, 0);
 #endif
    t->coord_components = coord->num_components;
    t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
    t->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, op == nir_texop_txf ? nir_imm_int(b, 0)
                                                                          : nir_imm_float(b, 0.0f));
+#if PAN_ARCH >= 9
+   /* Valhall takes complete handles as sources (pan_nir_lower_tex.c). */
+   t->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_handle,
+                                   pan_nir_res_handle(b, 0, 1 + tex, NULL));
+   t->src[3] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle,
+                                   pan_nir_res_handle(b, 0, 0, NULL));
+#endif
    nir_def_init(&t->instr, &t->def, 4, 32);
    nir_builder_instr_insert(b, &t->instr);
    return &t->def;

@@ -198,6 +198,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 
    b->cursor = nir_before_instr(&tex->instr);
 
+   /* Valhall takes complete handles in nir_tex_src_texture_handle and
+    * nir_tex_src_sampler_handle and nothing in texture_index and
+    * sampler_index (pan_nir_lower_tex.c). */
    int sampler_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
       nir_def *plane = nir_steal_tex_src(tex, nir_tex_src_plane);
@@ -218,17 +221,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
       uint32_t sampler_index =
          shader_desc_idx(ctx, set, binding, MALI_SUBDESC_SAMPLER) + index_imm * stride;
 
-      if (index_ssa) {
-         nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, index_ssa, stride),
-                                        sampler_index);
-         nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset, offset);
-      } else {
-         tex->sampler_index = sampler_index;
-      }
+      nir_def *handle = nir_imm_int(b, sampler_index);
+      if (index_ssa)
+         handle = nir_iadd(b, handle, nir_imul_imm(b, index_ssa, stride));
+      nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, handle);
       progress = true;
    } else {
       /* Texel fetches still name a sampler on Valhall. */
-      tex->sampler_index = ctx->dummy_sampler_handle;
+      nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle,
+                            nir_imm_int(b, ctx->dummy_sampler_handle));
+      progress = true;
    }
 
    int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
@@ -247,13 +249,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
       uint32_t texture_index =
          shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) + index_imm * stride;
 
-      if (index_ssa) {
-         nir_def *offset = nir_iadd_imm(b, nir_imul_imm(b, index_ssa, stride),
-                                        texture_index);
-         nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, offset);
-      } else {
-         tex->texture_index = texture_index;
-      }
+      nir_def *handle = nir_imm_int(b, texture_index);
+      if (index_ssa)
+         handle = nir_iadd(b, handle, nir_imul_imm(b, index_ssa, stride));
+      nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
       progress = true;
    }
 

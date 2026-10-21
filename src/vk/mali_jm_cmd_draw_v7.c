@@ -514,7 +514,7 @@ struct draw_data {
    bool vs_copy, fs_copy;
    uint32_t vs_img_buf_offset;
    /* The stages whose FAU block was rebuilt for this draw with uniform
-    * buffer words still to be copied in (mali_v7_ubo_copy). */
+    * buffer words still to be copied in (mali_jm_ubo_copy). */
    bool vs_ubo_copy, fs_ubo_copy;
 };
 
@@ -1233,14 +1233,14 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
     * from its FAU block: a copy job between the descriptor copy and it. */
    uint16_t vs_dep = vs_copy;
    if (dd.vs_ubo_copy &&
-       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
+       !mali_jm_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
       goto fail;
    if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
       goto fail;
    /* The fragment shader's uniform buffer words, which only the fragment
     * job reads. */
    if (tiling && dd.fs_ubo_copy &&
-       !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
+       !mali_jm_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
       goto fail;
    struct mali_ptr vj = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_VERTEX, pan_size(COMPUTE_JOB),
                                             pending && !vs_dep && (fs_copy || fs_ubo), vs_dep);

@@ -74,6 +74,11 @@
 #define mali_jm_measure_submit MALI_PER_ARCH(jm_measure_submit)
 #define mali_jm_sync_file_finish MALI_PER_ARCH(jm_sync_file_finish)
 #define mali_jm_wait_locked MALI_PER_ARCH(jm_wait_locked)
+#define mali_jm_add_copy_job MALI_PER_ARCH(jm_add_copy_job)
+#define mali_jm_copy_tsd MALI_PER_ARCH(jm_copy_tsd)
+#define mali_jm_meta_shader MALI_PER_ARCH(jm_meta_shader)
+#define mali_jm_ubo_copy MALI_PER_ARCH(jm_ubo_copy)
+#define mali_jm_ubo_finish MALI_PER_ARCH(jm_ubo_finish)
 #endif
 
 #ifndef MALI_ARCH_H

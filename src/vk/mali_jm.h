@@ -317,6 +317,9 @@ struct mali_jm_cmd {
    /* Timing regions (measurement/timing_jm.c); NULL unless
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
+   /* The Local Storage descriptor of the copy jobs (mali_jm_ubo.c
+    * mali_jm_copy_tsd), 0 until the first one. */
+   uint64_t copy_tsd;
 #if PAN_ARCH < 9
    /* Tiler jobs written and waiting to be linked into the open batch's
     * vtc chain (mali_v7_link_tilers). Each goes in behind the Vertex job
@@ -329,9 +332,6 @@ struct mali_jm_cmd {
    uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER];
    uint8_t pend_tilers;          /* pending, oldest first */
    bool tiler_defer;
-   /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
-    * copy_tsd), 0 until the first one. */
-   uint64_t copy_tsd;
    /* The buffer memory that the transfers recorded so far write
     * (mali_v7_note_buffer_write): struct mali_v7_range, sorted, disjoint
     * and not touching. Empty unless the command buffer has such a
@@ -672,10 +672,6 @@ bool mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
  * (when not NULL): that job's index, or dep when there is nothing to copy.
  * False on failure, with the command buffer's error set.
  */
-bool mali_v7_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
-                      const struct mali_shader *s, const struct mali_desc_state *desc,
-                      uint64_t fau_va, uint16_t dep, uint16_t *index);
-
 /* The v7_desc.sets system values of one stage: the addresses of the bound
  * sets the shader reads and, at MALI_V7_SETS_DYN_SSBOS, its dynamic
  * storage buffer table. */
@@ -775,6 +771,30 @@ uint64_t mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint3
  */
 void mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size);
 #endif /* PAN_ARCH < 9 */
+
+bool mali_jm_ubo_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                      const struct mali_shader *s, const struct mali_desc_state *desc,
+                      uint64_t fau_va, uint16_t dep, uint16_t *index);
+void mali_jm_ubo_finish(struct mali_device *dev);
+
+/* A meta (copy) shader kept per device, built on first use (mali_jm_ubo.c). */
+struct nir_shader;
+const struct mali_shader *mali_jm_meta_shader(struct mali_cmd_buffer *cmd,
+                                              struct mali_shader **slot,
+                                              struct nir_shader *(*build)(struct mali_device *dev),
+                                              const char *name);
+
+/* The Local Storage descriptor and the Compute job of a copy shader. */
+uint64_t mali_jm_copy_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *copy,
+                          const uint32_t groups[3]);
+bool mali_jm_add_copy_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                          const struct mali_shader *copy, const void *push, uint32_t push_size,
+                          uint32_t count, uint16_t dep, uint16_t *index);
+
+/* A dynamic buffer's address with its offset applied, and its range, from
+ * the bound sets (mali_jm_desc_v7.c). */
+bool mali_jm_desc_dyn_buf(const struct mali_desc_state *desc, uint32_t handle, uint64_t *addr,
+                          uint64_t *range);
 
 /* ---------------------------------------------------------------------- */
 /* The device and queue                                                    */
@@ -901,12 +921,14 @@ struct mali_jm_device {
    /* Atoms of the JOB_SUBMIT being built (only while building). */
    struct mali_jm_build *build;
 
+   /* The uniform buffer word copy shader (mali_jm_ubo_copy), compiled on
+    * first use under mali_device::meta_lock, unreferenced at
+    * device_finish. */
+   struct mali_shader *ubo_copy;
+
 #if PAN_ARCH < 9
-   /* The descriptor copy shader (mali_jm_desc_v7.c), compiled on first
-    * use under mali_device::meta_lock, unreferenced at device_finish. */
+   /* The descriptor copy shader (mali_jm_desc_v7.c), the same way. */
    struct mali_shader *v7_desc_copy;
-   /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
-   struct mali_shader *v7_ubo_copy;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;

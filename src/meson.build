@@ -205,7 +205,7 @@ malisx2_vk_v11 = static_library(
 # time. The draws are per arch (mali_jm_cmd_draw.c at 9,
 # mali_jm_cmd_draw_v7.c at 7).
 _vk_jm_files = files(
-  'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c',
+  'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c', 'vk/mali_jm_ubo.c',
   'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
   'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_sync.c', 'vk/mali_wsi.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):

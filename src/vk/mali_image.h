@@ -165,6 +165,10 @@ struct mali_image_plane {
 struct mali_image {
    struct vk_image vk;   /* vk.drm_format_mod holds the chosen layout */
 
+   /* A VK_KHR_display swapchain image: linear, so the display can scan it
+    * out (mali_CreateImage, choose_modifier). */
+   bool wsi_scanout;
+
    uint8_t plane_count;
    struct mali_image_plane planes[MALI_IMAGE_MAX_PLANES];
    uint64_t size;        /* bytes of memory the image needs */

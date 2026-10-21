@@ -11,6 +11,12 @@
  */
 
 #include "mali_vk.h"
+
+#ifndef __ANDROID__
+/* The WSI's image create info (WSI_IMAGE_CREATE_INFO_MESA): a VK_KHR_display
+ * swapchain image must be laid out so the display can scan it out. */
+#include "wsi_common.h"
+#endif
 #include "mali_image.h"
 #include "mali_memory.h"
 #include "mali_wsi.h"
@@ -186,6 +192,11 @@ static uint64_t
 choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
                 const VkImageCreateInfo *info)
 {
+   /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
+    * the GPU have to agree on the layout, and only linear (or a DRM
+    * modifier the display's plane lists) qualifies. */
+   if (image->wsi_scanout)
+      return DRM_FORMAT_MOD_LINEAR;
    if (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
@@ -255,10 +266,20 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                        "DRM format modifier tiling is not supported");
 
+#ifndef __ANDROID__
+   const struct wsi_image_create_info *wsi_info =
+      vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+   const bool wsi_scanout = wsi_info && wsi_info->scanout;
+#else
+   const bool wsi_scanout = false;
+#endif
+
    struct mali_image *image =
       vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
    if (!image)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   image->wsi_scanout = wsi_scanout;
 
    enum pipe_format formats[MALI_IMAGE_MAX_PLANES];
    image->plane_count = mali_format_planes(image->vk.format, formats);

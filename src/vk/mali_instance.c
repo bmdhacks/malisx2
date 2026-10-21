@@ -11,6 +11,10 @@
 
 #include "mali_vk.h"
 
+#ifndef __ANDROID__
+#include "wsi_common.h"
+#endif
+
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
 
@@ -33,6 +37,15 @@ mali_instance_set_kbase_backend(const struct mali_kbase_backend *backend)
 static const struct vk_instance_extension_table mali_instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
    .EXT_debug_utils = true,
+#ifndef __ANDROID__
+   /* Mesa's shared WSI, VK_KHR_display only for now (mali_wsi_linux.c):
+    * the SDL/kmsdrm frontend of ARMSX2 presents straight to the display
+    * with it. Android's loader owns surfaces there. */
+   .KHR_surface = true,
+   .KHR_display = true,
+   .KHR_get_display_properties2 = true,
+   .EXT_headless_surface = true,
+#endif
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -84,6 +97,10 @@ mali_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    struct vk_instance_dispatch_table dispatch;
    vk_instance_dispatch_table_from_entrypoints(&dispatch, &mali_instance_entrypoints,
                                                true);
+#ifndef __ANDROID__
+   vk_instance_dispatch_table_from_entrypoints(&dispatch, &wsi_instance_entrypoints,
+                                               false);
+#endif
 
    VkResult result = vk_instance_init(&instance->vk, &mali_instance_extensions,
                                       &dispatch, pCreateInfo, pAllocator);

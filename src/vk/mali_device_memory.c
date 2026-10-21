@@ -13,6 +13,7 @@
  */
 
 #include "mali_vk.h"
+#include "mali_image.h"
 #include "mali_memory.h"
 
 #include <errno.h>
@@ -146,10 +147,20 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
                        "AHardwareBuffer import is not implemented");
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
-   if (export_info && export_info->handleTypes)
+   const bool export_dmabuf =
+      export_info && (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+   if (export_info && export_info->handleTypes && !export_dmabuf)
       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "memory export (handle types 0x%x) is not supported",
+                       "memory export (handle types 0x%x): only dma-buf is supported",
                        export_info->handleTypes);
+   /* An exportable allocation is a swapchain image for VK_KHR_display: a
+    * scanout buffer allocated by the display's DRM node (GBM) and imported
+    * into kbase, with the dma-buf handed to the client. */
+   const VkMemoryDedicatedAllocateInfo *dedicated_info =
+      vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+   if (export_dmabuf && (!dedicated_info || dedicated_info->image == VK_NULL_HANDLE))
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "an exportable allocation must be a dedicated image allocation");
 
    if (!fd_info && pAllocateInfo->allocationSize > pdev->vk.properties.maxMemoryAllocationSize)
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -166,6 +177,44 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    VkResult result;
    if (fd_info) {
       result = import_dmabuf(dev, mem, fd_info->fd);
+   } else if (export_dmabuf) {
+#ifndef __ANDROID__
+      struct mali_image *image =
+         mali_image_from_handle(dedicated_info->image);
+      const unsigned width = image->vk.extent.width;
+      const unsigned height = image->vk.extent.height;
+      uint32_t stride = 0;
+      uint64_t size = 0;
+      int fd = -1;
+      result = mali_wsi_alloc_scanout(pdev, image->vk.format, width, height, &stride, &size, &fd);
+      if (result != VK_SUCCESS)
+         goto out;
+      /* The image was laid out when it was created, and the display and
+       * the GPU have to agree on the row pitch. */
+      if (stride != image->planes[0].layout.slices[0].row_stride || size < mem->vk.size) {
+         mesa_loge("malisx2: scanout buffer %ux%u: stride %u (image %u) or size %llu "
+                   "(image %llu) disagrees with the image layout",
+                   width, height, stride, image->planes[0].layout.slices[0].row_stride,
+                   (unsigned long long)size, (unsigned long long)mem->vk.size);
+         close(fd);
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto out;
+      }
+      const enum mali_kbase_result r =
+         mali_kbase_import_dmabuf(dev->kbase, fd, MALI_KBASE_FLAGS_IMPORT, 0, true, &mem->bo);
+      if (r != MALI_KBASE_SUCCESS) {
+         close(fd);
+         result = vk_errorf(dev, alloc_result(r), "import of the scanout dma-buf: %s",
+                            mali_kbase_result_str(r));
+         goto out;
+      }
+      mem->dmabuf_fd = fd;
+      mem->scanout = true;
+#else
+      result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                         "memory export is not supported on Android");
+      goto out;
+#endif
    } else {
       struct mali_kbase_alloc_info ai = {.size = mem->vk.size};
       mali_memory_type_kbase_flags(pdev, type, &ai.flags, &ai.mem_class);
@@ -176,6 +225,7 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
                             (unsigned long long)mem->vk.size, type,
                             mali_kbase_result_str(r));
    }
+out:
    if (result != VK_SUCCESS) {
       vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
       return result;
@@ -335,4 +385,32 @@ mali_InvalidateMappedMemoryRanges(VkDevice _device, uint32_t memoryRangeCount,
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
    return sync_ranges(dev, memoryRangeCount, pMemoryRanges, false);
+}
+
+/*
+ * VK_KHR_external_memory_fd: the dma-buf an exportable allocation was made
+ * from. Only a scanout allocation (a VK_KHR_display swapchain image, made
+ * from a GBM buffer object) has one; an ordinary kbase allocation cannot be
+ * exported on the kernels this driver runs on (there is no fd ioctl for it).
+ * wsi_common_display asks for it to turn each swapchain image into a DRM
+ * framebuffer.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_GetMemoryFdKHR(VkDevice _device, const VkMemoryGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   VK_FROM_HANDLE(mali_device_memory, mem, pGetFdInfo->memory);
+
+   if (pGetFdInfo->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "handle type 0x%x: only dma-buf can be exported",
+                       pGetFdInfo->handleType);
+   if (mem->dmabuf_fd < 0)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "memory was not allocated for export");
+   const int fd = dup(mem->dmabuf_fd);
+   if (fd < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   *pFd = fd;
+   return VK_SUCCESS;
 }

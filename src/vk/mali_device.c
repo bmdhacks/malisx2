@@ -26,6 +26,10 @@
 #include "util/hash_table.h"
 #include "mali_pipeline.h"
 
+#ifndef __ANDROID__
+#include "wsi_common.h"
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Interned keys (mali_pipeline.h), shared by every arch's pipelines      */
 
@@ -232,6 +236,10 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
                         : &mali_v11_device_entrypoints,
       true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &mali_device_entrypoints, false);
+#ifndef __ANDROID__
+   /* The swapchain and present side of the shared WSI (VK_KHR_display). */
+   vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
+#endif
 
    /* Checks the extension names and the requested features against what
     * the physical device reports (VK_ERROR_EXTENSION_NOT_PRESENT /

@@ -28,6 +28,11 @@
 #include "vk_util.h"
 
 #include "mali_version.h"
+
+#ifndef __ANDROID__
+/* The shared WSI's physical-device entry points (VK_KHR_display). */
+#include "wsi_common.h"
+#endif
 #include "mali_shader_cache_id.h"
 
 /* Arm's PCI-style vendor ID, as the blob reports it. */
@@ -319,6 +324,10 @@ static const struct vk_device_extension_table mali_device_extensions = {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* Without it the Android loader builds no swapchain. */
    .ANDROID_native_buffer = true,
+#else
+   /* The Linux window system: Mesa's WSI owns the swapchain for a
+    * VK_KHR_display surface (mali_wsi_linux.c). */
+   .KHR_swapchain = true,
 #endif
    /* ARMSX2's in-tile destination read (the blob advertises both names).
     * Without it ARMSX2 reads the destination through an input attachment
@@ -949,6 +958,10 @@ physical_device_create(struct mali_instance *instance, const char *path,
    struct vk_physical_device_dispatch_table dispatch;
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch, &mali_physical_device_entrypoints, true);
+#ifndef __ANDROID__
+   vk_physical_device_dispatch_table_from_entrypoints(
+      &dispatch, &wsi_physical_device_entrypoints, false);
+#endif
 
    VkResult result = vk_physical_device_init(&pdev->vk, &instance->vk,
                                              &extensions, &features,
@@ -968,6 +981,17 @@ physical_device_create(struct mali_instance *instance, const char *path,
    pdev->vk.pipeline_cache_import_ops = pdev->arch == 7 ? mali_v7_pipeline_cache_import_ops
                                         : pdev->arch == 9 ? mali_v9_pipeline_cache_import_ops
                                                           : mali_v11_pipeline_cache_import_ops;
+
+#ifndef __ANDROID__
+   /* Last: wsi_device_init asks the runtime what the device can export,
+    * which needs the sync types and pipeline-cache ops above. */
+   result = mali_wsi_init(pdev);
+   if (result != VK_SUCCESS) {
+      vk_physical_device_finish(&pdev->vk);
+      vk_free(&instance->vk.alloc, pdev);
+      return result;
+   }
+#endif
 
    *out = &pdev->vk;
    return VK_SUCCESS;
@@ -1004,6 +1028,9 @@ mali_physical_device_destroy(struct vk_physical_device *vk_pdev)
 {
    struct mali_physical_device *pdev =
       container_of(vk_pdev, struct mali_physical_device, vk);
+#ifndef __ANDROID__
+   mali_wsi_finish(pdev);
+#endif
    vk_physical_device_finish(&pdev->vk);
    vk_free(&pdev->vk.instance->alloc, pdev);
 }

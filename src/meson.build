@@ -156,6 +156,11 @@ _vk_per_arch_deps = [idep_vulkan_lite_runtime_headers, idep_vulkan_util_headers,
 # Everything of the front half except the per-arch files and what the waist
 # stubs do when called (mali_waist.c), which the driver and the tests pick
 # separately. The command-stream (CSF) back half here is the v11 one.
+# The display's scanout buffers come from GBM on the DRM node
+# (mali_wsi_linux.c); libdrm comes with the WSI.
+dep_gbm = with_platform_android ? dependency('', required : false) \
+                                 : dependency('gbm')
+
 malisx2_vk = static_library(
   'mali_vk',
   files('vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
@@ -174,7 +179,7 @@ malisx2_vk = static_library(
   files('vk/mali_cmd_draw.c', 'vk/mali_cmd_render.c'),
   # Sync files and the Android window system; mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
-  with_platform_android ? files('vk/mali_android.c') : [],
+  with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c'),
   # Timing and command-stream capture (MALISX2_MEASURE).
   files('measurement/config.c', 'measurement/recorder.c', 'measurement/timing.c'),
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
@@ -183,7 +188,8 @@ malisx2_vk = static_library(
   c_args : _vk_c_args,
   dependencies : [idep_vulkan_lite_runtime_headers, idep_vulkan_util_headers,
                   idep_mesautil, idep_nir_headers, idep_pan_format,
-                  idep_mali_compiler, idep_pan_packers],
+                  idep_mali_compiler, idep_pan_packers] +
+                 (with_platform_android ? [] : [idep_vulkan_wsi_headers]),
   gnu_symbol_visibility : 'hidden',
 )
 
@@ -279,7 +285,8 @@ idep_mali_vk = declare_dependency(
   include_directories : [inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
   dependencies : [idep_vulkan_runtime, idep_vulkan_util, idep_mesautil,
-                  idep_mali_compiler, idep_pan_packers],
+                  idep_mali_compiler, idep_pan_packers] +
+                 (with_platform_android ? [] : [idep_vulkan_wsi, dep_gbm]),
 )
 malisx2_waist = _waist_variants[get_option('measurement').to_string()]
 malisx2_waist_log = _waist_variants['false']

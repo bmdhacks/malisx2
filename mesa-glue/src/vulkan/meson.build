@@ -10,8 +10,18 @@ vk_api_xml = files(_vv / 'registry' / 'vk.xml')
 # Mesa builds without beta extensions by default.
 with_vulkan_beta = false
 
-idep_vulkan_wsi_defines = declare_dependency(compile_args : [])
+_wsi_defines = []
+if not with_platform_android
+  # VK_KHR_display is built for Linux (see wsi/meson.build).
+  _wsi_defines += '-DVK_USE_PLATFORM_DISPLAY_KHR'
+endif
+idep_vulkan_wsi_defines = declare_dependency(compile_args : _wsi_defines)
 vulkan_wsi_deps = [idep_vulkan_wsi_defines]
 
 subdir('util')
 subdir('runtime')
+# The shared Vulkan WSI (VK_KHR_display and headless surfaces) on Linux;
+# the Android build has its own window system in the driver.
+if not with_platform_android
+  subdir('wsi')
+endif

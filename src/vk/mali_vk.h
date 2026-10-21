@@ -56,6 +56,12 @@ VK_DEFINE_HANDLE_CASTS(mali_instance, vk.base, VkInstance, VK_OBJECT_TYPE_INSTAN
  */
 void mali_instance_set_kbase_backend(const struct mali_kbase_backend *backend);
 
+#ifndef __ANDROID__
+/* Mesa's shared Vulkan WSI device state (src/vulkan/wsi/wsi_common.h). */
+struct wsi_device;
+struct gbm_device;
+#endif
+
 struct mali_physical_device {
    struct vk_physical_device vk;
 
@@ -80,6 +86,18 @@ struct mali_physical_device {
     * at most once a second (mali_physical_device.c), and when it was read. */
    uint64_t avail_mem;
    uint64_t avail_mem_ns;
+
+#ifndef __ANDROID__
+   /* The shared Vulkan WSI (Mesa's src/vulkan/wsi): VK_KHR_display's
+    * surfaces, modes and swapchains, and the page flips themselves
+    * (mali_wsi_linux.c). Android's window system has its own path
+    * (mali_wsi.c, mali_android.c). */
+   struct wsi_device *wsi;
+   /* The display's DRM node, or -1, and the GBM device on it (opened on
+    * first use; mali_wsi_linux.c). */
+   int drm_fd;
+   struct gbm_device *gbm;
+#endif
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_physical_device, vk.base, VkPhysicalDevice,
@@ -88,6 +106,17 @@ VK_DEFINE_HANDLE_CASTS(mali_physical_device, vk.base, VkPhysicalDevice,
 /* vk_instance::physical_devices.enumerate / .destroy */
 VkResult mali_physical_devices_enumerate(struct vk_instance *instance);
 void mali_physical_device_destroy(struct vk_physical_device *pdev);
+
+#ifndef __ANDROID__
+/* The Linux window system (mali_wsi_linux.c): Mesa's shared WSI. */
+VkResult mali_wsi_init(struct mali_physical_device *pdev);
+void mali_wsi_finish(struct mali_physical_device *pdev);
+/* A scanout buffer for a WSI image (mali_wsi_linux.c): a GBM buffer object
+ * on the display's DRM node, as a dma-buf. */
+VkResult mali_wsi_alloc_scanout(struct mali_physical_device *pdev, VkFormat format,
+                                unsigned width, unsigned height, uint32_t *stride,
+                                uint64_t *size, int *fd);
+#endif
 
 /* The deviceName for a GPU, or false if it is not a GPU this driver was
  * built for. */

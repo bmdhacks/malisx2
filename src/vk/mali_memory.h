@@ -53,6 +53,9 @@ struct mali_device_memory {
     * import, so vkMapMemory maps this fd instead. */
    int dmabuf_fd;
    void *dmabuf_map;          /* mapping of dmabuf_fd, bo.size bytes */
+   /* A scanout buffer (VK_KHR_display): allocated as a GBM buffer object on
+    * the display's DRM node and imported here; dmabuf_fd is ours to close. */
+   bool scanout;
 
    /* Where the application's CPU view currently starts (vkMapMemory), NULL
     * when not mapped. */

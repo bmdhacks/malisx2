@@ -286,6 +286,19 @@ mali_compute_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *cs
 }
 #endif
 
+/* The Local Storage descriptor's TLS size field for a job using the buffer
+ * mali_cmd_tls_buffer just returned: log2 of its per-thread stride in
+ * 16-byte units. Every job that uses a buffer must give the buffer's stride
+ * here, not its own shader's need: the hardware addresses a thread's stack
+ * by that stride, so two jobs running at the same time with different
+ * strides in one buffer overwrite each other's stacks. (The command buffer
+ * is the CSF or the job-manager one; both keep tls.size.) */
+static inline uint32_t
+mali_cmd_tls_size_field(const struct mali_cmd_buffer *cmd)
+{
+   return util_logbase2_ceil(DIV_ROUND_UP(cmd->tls.size, 16));
+}
+
 /* Local Storage descriptor of a dispatch (pan_emit_tls): the command
  * buffer's TLS buffer and, for shaders with shared memory, a per-dispatch
  * WLS buffer. 0 on failure. */
@@ -340,7 +353,10 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       return 0;
    pan_cast_and_pack(p.cpu, LOCAL_STORAGE, cfg) {
       if (tls_ptr) {
-         cfg.tls_size = util_logbase2_ceil(DIV_ROUND_UP(cs->info.tls_size, 16));
+         /* The stride of the shared buffer, not this shader's own: jobs
+          * with different strides in one buffer overwrite each other's
+          * stacks when they run at the same time (mali_cmd_tls_size_field). */
+         cfg.tls_size = mali_cmd_tls_size_field(cmd);
 #if PAN_ARCH >= 9
          cfg.tls_address_mode = MALI_ADDRESS_MODE_PACKED;
          cfg.tls_base_pointer = tls_ptr >> 8;

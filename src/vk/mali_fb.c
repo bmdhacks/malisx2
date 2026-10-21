@@ -1026,7 +1026,7 @@ MALI_PER_ARCH(fb_fill_tsd)(struct mali_cmd_buffer *cmd, struct mali_render_state
    uint64_t tls = r->tls_size ? MALI_PER_ARCH(cmd_tls_buffer)(cmd, r->tls_size) : 0;
    pan_cast_and_pack(r->tsd_cpu, LOCAL_STORAGE, cfg) {
       if (tls) {
-         cfg.tls_size = util_logbase2_ceil(DIV_ROUND_UP(r->tls_size, 16));
+         cfg.tls_size = mali_cmd_tls_size_field(cmd);
 #if PAN_ARCH >= 9
          cfg.tls_address_mode = MALI_ADDRESS_MODE_PACKED;
          cfg.tls_base_pointer = tls >> 8;

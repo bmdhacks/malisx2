@@ -102,6 +102,17 @@ VkResult mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *
                                     const VkAllocationCallbacks *alloc);
 
 /*
+ * The same for a gralloc handle's fds, when it is not known which of them
+ * is the buffer: candidates are tried dma-bufs first and big enough ones
+ * first (mali_wsi.c has the order), and the first import that works is
+ * bound. On failure the log says what each fd is. fds are the caller's;
+ * at most 8 are looked at.
+ */
+VkResult mali_wsi_image_bind_gralloc_fds(struct mali_device *dev, struct mali_image *image,
+                                         const int *fds, unsigned nfds, uint32_t stride_px,
+                                         const VkAllocationCallbacks *alloc);
+
+/*
  * vkAcquireImageANDROID: the display's release fence (a sync file, or -1
  * for "already signalled") becomes the payload of the semaphore and/or
  * the fence. Consumes fd on every path, success or not.

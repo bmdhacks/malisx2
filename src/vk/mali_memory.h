@@ -84,6 +84,14 @@ void mali_memory_type_kbase_flags(const struct mali_physical_device *pdev,
                                   uint32_t type_index, uint64_t *flags,
                                   enum mali_kbase_mem_class *mem_class);
 
+/*
+ * The size of a dma-buf as its fd says it (lseek to the end, which the
+ * kernel's dma-buf files answer; the file offset is put back), or -1 when
+ * the fd cannot say. For diagnostics and for choosing among a gralloc
+ * handle's fds.
+ */
+int64_t mali_dmabuf_fd_size(int fd);
+
 struct mali_buffer {
    struct vk_buffer vk;
    /* The bound memory, or NULL before vkBindBufferMemory. The GPU address

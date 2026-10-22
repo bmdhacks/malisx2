@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/stack_array.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "vk_enum_to_str.h"
 #include "vk_fence.h"
@@ -167,9 +169,15 @@ mali_wsi_ahb_usage(struct mali_physical_device *pdev, const VkPhysicalDeviceImag
 /* ---------------------------------------------------------------------- */
 /* Swapchain image memory                                                  */
 
-VkResult
-mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *image, int dmabuf_fd,
-                           uint32_t stride_px, const VkAllocationCallbacks *alloc)
+/*
+ * The image's layout: linear with the buffer's stride. We asked gralloc for
+ * no AFBC (mali_wsi_gralloc_usage) and take the stride the loader passes
+ * from the ANativeWindowBuffer; the blob reads stride, offset and modifier
+ * from gralloc metadata instead. Linear render targets and textures need
+ * 64-byte aligned rows.
+ */
+static VkResult
+gralloc_layout(struct mali_device *dev, struct mali_image *image, uint32_t stride_px)
 {
    const struct vk_image *vi = &image->vk;
 
@@ -182,17 +190,7 @@ mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *image, in
       return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "swapchain image: only single-level, single-layer, "
                        "single-sample 2D color images");
-   if (dmabuf_fd < 0)
-      return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "gralloc buffer without a dma-buf");
 
-   /*
-    * Linear with the buffer's stride. We asked gralloc for no AFBC
-    * (mali_wsi_gralloc_usage) and take the stride the loader passes from
-    * the ANativeWindowBuffer; the blob reads stride, offset and modifier
-    * from gralloc metadata instead. Linear render targets and textures
-    * need 64-byte aligned rows.
-    */
    const enum pipe_format format = image->planes[0].format;
    const unsigned bpp = util_format_get_blocksize(format);
    const uint64_t row = (uint64_t)stride_px * bpp;
@@ -225,15 +223,25 @@ mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *image, in
    image->size = s->size;
    image->vk.tiling = VK_IMAGE_TILING_LINEAR;
    image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
+   return VK_SUCCESS;
+}
 
-   /* Imported as the blob imports native buffers: kbase MEM_IMPORT of the
-    * dma-buf, then a sticky map. The fd belongs to gralloc; the memory
-    * object owns a dup. */
+/* Imported as the blob imports native buffers: kbase MEM_IMPORT of the
+ * dma-buf, then a sticky map. The fd belongs to gralloc; the memory object
+ * owns a dup. A refusal is logged where it happens (mali_device_memory.c). */
+static VkResult
+gralloc_import(struct mali_device *dev, struct mali_image *image, int dmabuf_fd,
+               const VkAllocationCallbacks *alloc)
+{
    int fd = fcntl(dmabuf_fd, F_DUPFD_CLOEXEC, 0);
-   if (fd < 0)
-      return wsi_errorf(dev, errno == EMFILE ? VK_ERROR_TOO_MANY_OBJECTS :
-                                              VK_ERROR_OUT_OF_HOST_MEMORY,
-                       "cannot duplicate the gralloc buffer's fd: %s", strerror(errno));
+   if (fd < 0) {
+      const int err = errno;
+      return wsi_errorf(dev, err == EMFILE ? VK_ERROR_TOO_MANY_OBJECTS :
+                             err == EBADF ? VK_ERROR_INVALID_EXTERNAL_HANDLE :
+                                            VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "cannot duplicate the gralloc buffer's fd %d: %s", dmabuf_fd,
+                       strerror(err));
+   }
    const VkImportMemoryFdInfoKHR import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
       .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -258,6 +266,176 @@ mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *image, in
    image->mem_offset = 0;
    image->base = mali_device_memory_gpu_va(mem, 0);
    return VK_SUCCESS;
+}
+
+VkResult
+mali_wsi_image_bind_buffer(struct mali_device *dev, struct mali_image *image, int dmabuf_fd,
+                           uint32_t stride_px, const VkAllocationCallbacks *alloc)
+{
+   VkResult result = gralloc_layout(dev, image, stride_px);
+   if (result != VK_SUCCESS)
+      return result;
+   if (dmabuf_fd < 0)
+      return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "gralloc buffer without a dma-buf");
+   return gralloc_import(dev, image, dmabuf_fd, alloc);
+}
+
+/*
+ * A gralloc handle holds several fds and their order and kind are the
+ * gralloc's business: MediaTek's has an anonymous inode first, the dma-buf
+ * second and a metadata memfd third; Arm-derived ones (Rockchip's) can hold
+ * the buffer and a second dma-buf for the buffer's metadata. The blob asks
+ * the gralloc mapper which is the buffer. We have no mapper, so we look at
+ * what each fd is and how big it is:
+ *
+ *  - /proc/self/fd/N reads "/dmabuf:<name>" for a dma-buf, and just
+ *    "/dmabuf:" for one nobody named (fstatfs for the dma-buf filesystem's
+ *    magic is refused by SELinux on some devices);
+ *  - lseek to the end gives a dma-buf's size, so a metadata buffer is
+ *    recognised as too small for the image.
+ *
+ * Candidates are tried in this order, and the first import that works wins:
+ * dma-bufs at least as big as the image, other fds that are not known to be
+ * too small, then the fds that are too small (so a wrong size can never
+ * make this worse than trying every fd).
+ */
+#define GRALLOC_MAX_FDS 8
+
+struct gralloc_fd {
+   int fd;
+   bool named;        /* a dma-buf by its /proc link */
+   int64_t size;      /* lseek, or -1 */
+   VkResult tried;    /* the import's result, VK_NOT_READY if not tried */
+   char link[40];
+};
+
+static void
+gralloc_fd_describe(struct gralloc_fd *g, int fd)
+{
+   char path[32];
+
+   g->fd = fd;
+   g->tried = VK_NOT_READY;
+   snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+   const ssize_t n = readlink(path, g->link, sizeof(g->link) - 1);
+   g->link[n > 0 ? n : 0] = '\0';
+   g->named = n >= 8 && !strncmp(g->link, "/dmabuf:", 8);
+   g->size = mali_dmabuf_fd_size(fd);
+}
+
+static unsigned
+gralloc_fd_class(const struct gralloc_fd *g, uint64_t wanted)
+{
+   if (g->size >= 0 && (uint64_t)g->size < wanted)
+      return 2;
+   return g->named ? 0 : 1;
+}
+
+/* The dma-buf exporter (the heap) from /proc/self/fdinfo, for the log. */
+static void
+gralloc_fd_exporter(int fd, char *out, size_t n)
+{
+   char path[40], line[128];
+
+   snprintf(out, n, "?");
+   snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+   FILE *f = fopen(path, "re");
+   if (!f)
+      return;
+   while (fgets(line, sizeof(line), f)) {
+      if (strncmp(line, "exp_name:", 9))
+         continue;
+      const char *v = line + 9;
+      while (*v == ' ' || *v == '\t')
+         v++;
+      snprintf(out, n, "%.*s", (int)strcspn(v, "\r\n"), v);
+      break;
+   }
+   fclose(f);
+}
+
+static void
+gralloc_fd_log(const struct gralloc_fd *g, unsigned index, bool error)
+{
+   char exporter[40];
+   char line[256];
+
+   gralloc_fd_exporter(g->fd, exporter, sizeof(exporter));
+   snprintf(line, sizeof(line),
+            "malisx2: WSI:   handle fd %u = %d: link \"%s\", size %lld, exporter %s, import %s",
+            index, g->fd, g->link, (long long)g->size, exporter,
+            g->tried == VK_NOT_READY ? "not tried" : vk_Result_to_str(g->tried));
+   if (error)
+      mesa_loge("%s", line);
+   else
+      mesa_logi("%s", line);
+}
+
+static void
+gralloc_log_image(const struct mali_image *image, uint32_t stride_px, unsigned nfds, bool error)
+{
+   char line[256];
+
+   snprintf(line, sizeof(line),
+            "malisx2: WSI: %s a gralloc buffer for a %ux%u image of format %d: stride %u px "
+            "(%u bytes per row), %llu bytes wanted, %u fd(s), CPU page size %ld",
+            error ? "cannot bind" : "bound", image->vk.extent.width, image->vk.extent.height,
+            image->vk.format, stride_px, image->planes[0].layout.slices[0].row_stride,
+            (unsigned long long)image->size, nfds, sysconf(_SC_PAGESIZE));
+   if (error)
+      mesa_loge("%s", line);
+   else
+      mesa_logi("%s", line);
+}
+
+VkResult
+mali_wsi_image_bind_gralloc_fds(struct mali_device *dev, struct mali_image *image,
+                                const int *fds, unsigned nfds, uint32_t stride_px,
+                                const VkAllocationCallbacks *alloc)
+{
+   static int logged_first;
+
+   VkResult result = gralloc_layout(dev, image, stride_px);
+   if (result != VK_SUCCESS)
+      return result;
+   if (!nfds)
+      return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "gralloc buffer without a dma-buf");
+
+   struct gralloc_fd cand[GRALLOC_MAX_FDS];
+   const unsigned n = MIN2(nfds, GRALLOC_MAX_FDS);
+   for (unsigned i = 0; i < n; i++)
+      gralloc_fd_describe(&cand[i], fds[i]);
+
+   result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   for (unsigned pass = 0; pass < 3; pass++) {
+      for (unsigned i = 0; i < n; i++) {
+         if (gralloc_fd_class(&cand[i], image->size) != pass)
+            continue;
+         cand[i].tried = gralloc_import(dev, image, cand[i].fd, alloc);
+         if (cand[i].tried == VK_SUCCESS) {
+            /* The first buffer of the process is logged whole: what the
+             * gralloc hands out is the first thing to look at when a
+             * device's picture is wrong. */
+            if (p_atomic_cmpxchg(&logged_first, 0, 1) == 0) {
+               gralloc_log_image(image, stride_px, nfds, false);
+               gralloc_fd_log(&cand[i], i, false);
+            }
+            return VK_SUCCESS;
+         }
+         result = cand[i].tried;
+         /* A dup or host memory failure does not depend on which fd. */
+         if (result != VK_ERROR_INVALID_EXTERNAL_HANDLE)
+            goto fail;
+      }
+   }
+
+fail:
+   gralloc_log_image(image, stride_px, nfds, true);
+   for (unsigned i = 0; i < n; i++)
+      gralloc_fd_log(&cand[i], i, true);
+   return result;
 }
 
 /* ---------------------------------------------------------------------- */

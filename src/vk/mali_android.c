@@ -27,6 +27,7 @@
 #include <hardware/hwvulkan.h>
 
 #include "util/log.h"
+#include "util/u_atomic.h"
 #include "util/u_call_once.h"
 #include "vk_log.h"
 #include "vk_util.h"
@@ -137,10 +138,19 @@ mali_GetSwapchainGrallocUsage2ANDROID(VkDevice _device, VkFormat format,
    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
       return wsi_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
                        "shared presentable images are not supported");
-   return mali_wsi_gralloc_usage(mali_device_physical(dev), format, imageUsage,
-                                 mali_wsi_swapchain_no_afbc(mali_device_physical(dev)->arch),
-                                 grallocConsumerUsage,
-                                 grallocProducerUsage);
+   const VkResult result =
+      mali_wsi_gralloc_usage(mali_device_physical(dev), format, imageUsage,
+                             mali_wsi_swapchain_no_afbc(mali_device_physical(dev)->arch),
+                             grallocConsumerUsage, grallocProducerUsage);
+   /* Once per process: what gralloc is asked for decides whether a buffer
+    * comes back linear, so it belongs next to the buffers' own log line. */
+   static int logged_usage;
+   if (result == VK_SUCCESS && p_atomic_cmpxchg(&logged_usage, 0, 1) == 0)
+      mesa_logi("malisx2: WSI: gralloc usage for format %d, image usage 0x%x: consumer 0x%llx, "
+                "producer 0x%llx (no-AFBC property \"%s\")", format, imageUsage,
+                (unsigned long long)*grallocConsumerUsage,
+                (unsigned long long)*grallocProducerUsage, no_afbc_property);
+   return result;
 }
 
 /* The gralloc0 form: 32 bits, so no room for the no-AFBC bit (the blob
@@ -162,23 +172,31 @@ mali_GetSwapchainGrallocUsageANDROID(VkDevice _device, VkFormat format,
 /* Swapchain images                                                        */
 
 /*
- * The buffer's dma-buf among the handle's fds. Where it sits is gralloc's
- * business: MediaTek's gralloc puts a "gralloc_extra" anonymous inode
- * first, then the dma-buf, then a memfd of shared metadata (seen on the
- * RG 477V). The blob asks the gralloc mapper for it. We look at the
- * names: a dma-buf's is "/dmabuf:<buffer name>". (fstatfs for the
- * dma-buf filesystem's magic is refused by SELinux there.)
+ * What the loader handed over, for the log: the handle's counts and ints
+ * (gralloc keeps format, size and usage in them, and the layout of the
+ * buffer, AFBC or not), and the native buffer's own fields. Logged when a
+ * bind fails, and once for the first buffer of the process.
  */
-static int
-native_buffer_dmabuf_fd(const native_handle_t *h)
+static void
+log_native_buffer(const VkNativeBufferANDROID *nb, const struct mali_image *image, bool error)
 {
-   for (int i = 0; i < h->numFds; i++) {
-      char path[32], target[16] = {0};
-      snprintf(path, sizeof(path), "/proc/self/fd/%d", h->data[i]);
-      if (readlink(path, target, sizeof(target) - 1) > 8 && !strncmp(target, "/dmabuf:", 8))
-         return h->data[i];
-   }
-   return -1;
+   const native_handle_t *h = nb->handle;
+   char ints[24 * 9 + 1] = "";
+   char line[512];
+   const int n = h->numInts < 24 ? h->numInts : 24;
+
+   for (int i = 0; i < n; i++)
+      snprintf(ints + strlen(ints), sizeof(ints) - strlen(ints), "%x ", h->data[h->numFds + i]);
+   snprintf(line, sizeof(line),
+            "malisx2: WSI: native buffer for a %ux%u image: stride %d, gralloc format %d, usage "
+            "0x%x, usage3 0x%llx, handle version %d, %d fd(s), %d int(s) [%s%s]",
+            image->vk.extent.width, image->vk.extent.height, nb->stride, nb->format,
+            (unsigned)nb->usage, (unsigned long long)nb->usage3, h->version, h->numFds,
+            h->numInts, ints, h->numInts > n ? "..." : "");
+   if (error)
+      mesa_loge("%s", line);
+   else
+      mesa_logi("%s", line);
 }
 
 VkResult
@@ -186,23 +204,25 @@ mali_android_bind_native_buffer(struct mali_device *dev, struct mali_image *imag
                                 const VkNativeBufferANDROID *nb,
                                 const VkAllocationCallbacks *alloc)
 {
+   static int logged_first;
+
    if (!nb->handle || nb->handle->numFds < 1)
       return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "native buffer without a dma-buf fd");
-   if (nb->stride <= 0)
+   if (nb->stride <= 0) {
+      log_native_buffer(nb, image, true);
       return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "native buffer with stride %d", nb->stride);
-   const int fd = native_buffer_dmabuf_fd(nb->handle);
-   if (fd >= 0)
-      return mali_wsi_image_bind_buffer(dev, image, fd, (uint32_t)nb->stride, alloc);
+   }
 
-   /* No name to go by (/proc not readable?): the one kbase can import. */
-   mesa_logw("malisx2: WSI: no fd of the native buffer is named as a dma-buf; "
-             "trying to import each of its %d fds", nb->handle->numFds);
-   VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   for (int i = 0; i < nb->handle->numFds && result != VK_SUCCESS; i++)
-      result = mali_wsi_image_bind_buffer(dev, image, nb->handle->data[i],
-                                          (uint32_t)nb->stride, alloc);
+   /* Which fd is the buffer is decided there: see mali_wsi.c. */
+   const VkResult result =
+      mali_wsi_image_bind_gralloc_fds(dev, image, nb->handle->data, (unsigned)nb->handle->numFds,
+                                      (uint32_t)nb->stride, alloc);
+   if (result != VK_SUCCESS)
+      log_native_buffer(nb, image, true);
+   else if (p_atomic_cmpxchg(&logged_first, 0, 1) == 0)
+      log_native_buffer(nb, image, false);
    return result;
 }
 

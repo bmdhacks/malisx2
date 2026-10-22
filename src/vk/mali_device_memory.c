@@ -87,6 +87,16 @@ dmabuf_sync(struct mali_device_memory *mem, uint64_t flags)
                 (unsigned long long)s.flags, mem->dmabuf_fd, strerror(errno));
 }
 
+int64_t
+mali_dmabuf_fd_size(int fd)
+{
+   const off_t cur = lseek(fd, 0, SEEK_CUR);
+   const off_t end = lseek(fd, 0, SEEK_END);
+   if (cur >= 0)
+      lseek(fd, cur, SEEK_SET);
+   return end > 0 ? (int64_t)end : -1;
+}
+
 static VkResult
 import_dmabuf(struct mali_device *dev, struct mali_device_memory *mem, int fd)
 {
@@ -94,18 +104,32 @@ import_dmabuf(struct mali_device *dev, struct mali_device_memory *mem, int fd)
     * As the blob: MEM_IMPORT type UMM with the import flags (no memory
     * group: the kernel asks the memory group manager for imports), then a
     * sticky map so the pages are on the GPU from now on.
+    *
+    * Both refusals are logged whatever the runtime's debug settings: they
+    * reach the application as a bare VK_ERROR_INVALID_EXTERNAL_HANDLE, and
+    * which of the two it was (and the sizes involved) is what tells a bad
+    * fd from a kernel that refuses the buffer.
     */
    enum mali_kbase_result r =
       mali_kbase_import_dmabuf(dev->kbase, fd, MALI_KBASE_FLAGS_IMPORT, 0, true, &mem->bo);
-   if (r != MALI_KBASE_SUCCESS)
+   if (r != MALI_KBASE_SUCCESS) {
+      mesa_loge("malisx2: kbase refused to import dma-buf fd %d (%llu bytes wanted, the fd says "
+                "%lld): %s", fd, (unsigned long long)mem->vk.size,
+                (long long)mali_dmabuf_fd_size(fd), mali_kbase_result_str(r));
       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "cannot import dma-buf fd %d: %s", fd, mali_kbase_result_str(r));
+   }
 
    if (mem->vk.size > mem->bo.size) {
+      /* mali_kbase_free clears the region: read what the log needs first. */
+      const unsigned long long region = mem->bo.size;
       mali_kbase_free(dev->kbase, &mem->bo);
+      mesa_loge("malisx2: dma-buf fd %d is %llu bytes to kbase (%lld by the fd, CPU page size "
+                "%ld), %llu bytes were requested", fd, region,
+                (long long)mali_dmabuf_fd_size(fd), sysconf(_SC_PAGESIZE),
+                (unsigned long long)mem->vk.size);
       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "dma-buf fd %d has %llu bytes, %llu requested", fd,
-                       (unsigned long long)mem->bo.size,
+                       "dma-buf fd %d has %llu bytes, %llu requested", fd, region,
                        (unsigned long long)mem->vk.size);
    }
 

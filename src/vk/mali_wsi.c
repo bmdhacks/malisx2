@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -436,6 +437,122 @@ fail:
    for (unsigned i = 0; i < n; i++)
       gralloc_fd_log(&cand[i], i, true);
    return result;
+}
+
+/*
+ * The stride of a buffer whose gralloc does not report one.
+ *
+ * Arm's gralloc 4 (Rockchip's is built from it) sets the stride it returns
+ * from an allocation only for buffers the CPU can read or write; for a
+ * swapchain buffer, which only the GPU and the display touch, it is 0, and
+ * Android's gralloc wrapper and the Vulkan loader pass the 0 on. The
+ * buffer's real layout is in its private handle, which is what the gralloc
+ * mapper reads it from. The handle is two fds (the buffer's dma-buf and a
+ * memfd of metadata) followed by 37 ints; this is the front of it.
+ */
+#define ARM_GRALLOC_VERSION  12          /* sizeof(native_handle_t) */
+#define ARM_GRALLOC_NUM_FDS  2
+#define ARM_GRALLOC_NUM_INTS 37          /* later builds append more */
+#define ARM_GRALLOC_MAGIC    0x3141592
+
+struct arm_gralloc_handle {
+   int version, num_fds, num_ints;       /* native_handle_t */
+   int share_fd, share_attr_fd;
+   int magic;
+   int width, height, req_format;
+   uint64_t producer_usage, consumer_usage;
+   int stride;                           /* the 0 the loader passes */
+   struct {
+      uint64_t base;
+      uint32_t modifiers;                /* 0 for an uncompressed layout */
+   } alloc_format;
+   struct {
+      uint32_t offset, byte_stride, alloc_width, alloc_height;
+   } plane[3];
+   int size, layer_count;
+   uint64_t backing_store_id, attr_size, reserved_region_size;
+   int type;
+};
+
+_Static_assert(offsetof(struct arm_gralloc_handle, magic) == 0x14, "arm gralloc magic");
+_Static_assert(offsetof(struct arm_gralloc_handle, stride) == 0x38, "arm gralloc stride");
+_Static_assert(offsetof(struct arm_gralloc_handle, alloc_format) == 0x40, "arm gralloc format");
+_Static_assert(offsetof(struct arm_gralloc_handle, plane) == 0x50, "arm gralloc planes");
+_Static_assert(offsetof(struct arm_gralloc_handle, size) == 0x80, "arm gralloc size");
+_Static_assert(offsetof(struct arm_gralloc_handle, type) == 0xa0, "arm gralloc type");
+_Static_assert(sizeof(struct arm_gralloc_handle) ==
+                  3 * sizeof(int) + 4 * (ARM_GRALLOC_NUM_FDS + ARM_GRALLOC_NUM_INTS),
+               "arm gralloc handle size");
+
+/*
+ * Plane 0's row stride in pixels from an Arm gralloc handle, or 0 with a
+ * reason. A handle is taken for one only if its counts, magic and
+ * dimensions are right, and for a buffer we can use only if it is a single
+ * uncompressed layer that starts at offset 0 and holds the image: anything
+ * else would be read with the wrong layout.
+ */
+static uint32_t
+arm_gralloc_stride_px(const int *handle, const struct mali_image *image, const char **why)
+{
+   const unsigned bpp = util_format_get_blocksize(image->planes[0].format);
+   struct arm_gralloc_handle h;
+
+   if (handle[0] != ARM_GRALLOC_VERSION || handle[1] != ARM_GRALLOC_NUM_FDS ||
+       handle[2] < ARM_GRALLOC_NUM_INTS || handle[2] > 256) {
+      *why = "the handle is not an Arm gralloc 4 handle (its fd and int counts)";
+      return 0;
+   }
+   memcpy(&h, handle, sizeof(h));
+   if (h.magic != ARM_GRALLOC_MAGIC) {
+      *why = "the handle is not an Arm gralloc 4 handle (its magic)";
+      return 0;
+   }
+   if (h.width != (int)image->vk.extent.width || h.height != (int)image->vk.extent.height ||
+       h.layer_count > 1) {
+      *why = "the handle's size disagrees with the image";
+      return 0;
+   }
+   if (h.alloc_format.modifiers) {
+      *why = "gralloc allocated a compressed or tiled buffer";
+      return 0;
+   }
+   const uint32_t pitch = h.plane[0].byte_stride;
+   if (h.plane[0].offset || !pitch || pitch % bpp ||
+       pitch < (uint64_t)image->vk.extent.width * bpp ||
+       h.plane[0].alloc_height < image->vk.extent.height ||
+       (h.size > 0 && (uint64_t)pitch * image->vk.extent.height > (uint32_t)h.size)) {
+      *why = "the handle's plane 0 does not describe a linear buffer that holds the image";
+      return 0;
+   }
+   return pitch / bpp;
+}
+
+VkResult
+mali_wsi_image_bind_native_handle(struct mali_device *dev, struct mali_image *image,
+                                  const int *handle, int stride_px,
+                                  const VkAllocationCallbacks *alloc)
+{
+   static int logged_derived;
+
+   if (!handle || handle[1] < 1 || handle[1] > 64 || handle[2] < 0 || handle[2] > 1024)
+      return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "native buffer without a dma-buf fd");
+
+   if (stride_px <= 0) {
+      const char *why;
+      const uint32_t derived = arm_gralloc_stride_px(handle, image, &why);
+      if (!derived)
+         return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                          "native buffer with stride %d and no layout to take instead: %s",
+                          stride_px, why);
+      if (p_atomic_cmpxchg(&logged_derived, 0, 1) == 0)
+         mesa_logi("malisx2: WSI: gralloc reports no stride for the swapchain buffers; using "
+                   "the row stride in the Arm gralloc handle, %u pixels", derived);
+      stride_px = (int)derived;
+   }
+
+   return mali_wsi_image_bind_gralloc_fds(dev, image, handle + 3, (unsigned)handle[1],
+                                          (uint32_t)stride_px, alloc);
 }
 
 /* ---------------------------------------------------------------------- */

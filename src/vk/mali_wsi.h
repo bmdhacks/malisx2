@@ -113,6 +113,23 @@ VkResult mali_wsi_image_bind_gralloc_fds(struct mali_device *dev, struct mali_im
                                          const VkAllocationCallbacks *alloc);
 
 /*
+ * A swapchain image bound to the buffer of a native_handle_t (the fields
+ * are read as ints: version, numFds, numInts, then the fds and ints) and the
+ * row stride in pixels that the loader passes with it.
+ *
+ * Arm's gralloc 4, which Rockchip's and others' are built from, returns 0
+ * as the stride of a buffer that the CPU is not going to read or write, and
+ * the loader passes that on, so a stride of 0 is not an error: the row
+ * pitch is then read from the private handle (the plane 0 byte stride that
+ * gralloc itself keeps there), after checking that the handle is one of
+ * those and agrees with the image. Without a stride and without such a
+ * handle the buffer is refused. Otherwise as mali_wsi_image_bind_gralloc_fds.
+ */
+VkResult mali_wsi_image_bind_native_handle(struct mali_device *dev, struct mali_image *image,
+                                           const int *handle, int stride_px,
+                                           const VkAllocationCallbacks *alloc);
+
+/*
  * vkAcquireImageANDROID: the display's release fence (a sync file, or -1
  * for "already signalled") becomes the payload of the semaphore and/or
  * the fence. Consumes fd on every path, success or not.

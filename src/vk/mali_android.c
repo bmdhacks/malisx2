@@ -18,6 +18,7 @@
  * vkQueueSignalReleaseImageANDROID.
  */
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -206,19 +207,20 @@ mali_android_bind_native_buffer(struct mali_device *dev, struct mali_image *imag
 {
    static int logged_first;
 
-   if (!nb->handle || nb->handle->numFds < 1)
+   /* native_handle_t is its three counts and then the fds and ints, all
+    * ints; mali_wsi.c reads it as that. */
+   static_assert(sizeof(native_handle_t) == 3 * sizeof(int) &&
+                    offsetof(native_handle_t, data) == 3 * sizeof(int),
+                 "native_handle_t is three ints and then the data");
+
+   if (!nb->handle)
       return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "native buffer without a dma-buf fd");
-   if (nb->stride <= 0) {
-      log_native_buffer(nb, image, true);
-      return wsi_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "native buffer with stride %d", nb->stride);
-   }
 
-   /* Which fd is the buffer is decided there: see mali_wsi.c. */
+   /* Which fd is the buffer, and the stride when the gralloc does not
+    * report one, are decided there: see mali_wsi.c. */
    const VkResult result =
-      mali_wsi_image_bind_gralloc_fds(dev, image, nb->handle->data, (unsigned)nb->handle->numFds,
-                                      (uint32_t)nb->stride, alloc);
+      mali_wsi_image_bind_native_handle(dev, image, (const int *)nb->handle, nb->stride, alloc);
    if (result != VK_SUCCESS)
       log_native_buffer(nb, image, true);
    else if (p_atomic_cmpxchg(&logged_first, 0, 1) == 0)

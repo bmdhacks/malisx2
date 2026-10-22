@@ -36,13 +36,21 @@
 
 #include "uapi.h"
 
-/* The JM UK version we speak: the T820 kernel is 11.36; r44p1 is 11.39,
- * but the handshake answers min(ours, its own) for a matching major, so
- * proposing 11.36 and accepting only 11.36 back is the same "kernel at
- * this minor or newer" pin as the CSF side's 1.20, and is what the kernel
- * we have in hand actually offers. */
+/* The JM UK version we propose: 11.36 (DDK r40p0, the Unisoc T820's
+ * kernel). The kernel answers min(ours, its own) when the major matches,
+ * so a kernel at or above 11.36 shows up as 11.36 and an older one as its
+ * own minor. Proposing less would buy nothing on a newer kernel.
+ *
+ * KB_JM_UK_MIN_MINOR is the oldest minor we accept back. 11.22 is the
+ * first kernel whose JOB_SUBMIT takes the 64-byte base_jd_atom that
+ * struct kb_jm_atom is (11.19 to 11.21 take only 48 or 56 bytes and answer
+ * EINVAL to every real submit). From 11.22 to 11.36 every ioctl we use has
+ * the same number and size, so nothing inside the range branches on the
+ * minor. The MediaTek 72-byte atom layout is not a function of the minor
+ * and is found by the probe in mali_kbase_create, not by this check. */
 #define KB_JM_UK_VERSION_MAJOR 11
 #define KB_JM_UK_VERSION_MINOR 36
+#define KB_JM_UK_MIN_MINOR     22
 
 /* MEM_JIT_INIT's trim level for a job-manager context; the CSF side's
  * KB_JIT_TRIM_LEVEL (5) is unrelated. */

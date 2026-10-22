@@ -128,7 +128,9 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
       }
       long ret = kb_ioctl(kb, KB_JM_IOCTL_JOB_SUBMIT, &s);
       if (ret < 0) {
-         KB_LOG(kb, "JOB_SUBMIT of %u atoms (offset %u of %u) failed: %s", batch, off, n,
+         KB_LOG(kb, "JOB_SUBMIT of %u atoms (offset %u of %u, stride %u, kernel UK %u.%u) "
+                    "failed: %s",
+                batch, off, n, (unsigned)s.stride, kb->uk_major, kb->uk_minor,
                 strerror((int)-ret));
          return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
       }

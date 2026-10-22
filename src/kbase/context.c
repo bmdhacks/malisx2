@@ -67,14 +67,18 @@ open_device(struct mali_kbase *kb, const char *path)
  *
  * If that check fails with EPERM, the kernel is a job-manager one: it
  * reserves this ioctl number and answers it with EPERM without touching
- * the file's setup state. Only then do we try the job-manager handshake,
- * on the same fd: VERSION_CHECK ioctl 0 proposing 11.36. A CSF kernel
- * that answers with another version, or a failure other than EPERM, is
- * refused at once, as before there was a job-manager path, so a CSF
- * device sees exactly the ioctls it always did. We accept only exactly 11.36 back, the same "kernel at
- * this minor or newer" pin as the CSF side (the kernel answers
- * min(ours, its own) for a matching major). Only one of kb->uk_major/minor
- * and kb->frontend is meaningful once this returns success; the other
+ * the file's setup state (kernels that predate the reservation answer the
+ * same, because every ioctl but VERSION_CHECK and SET_FLAGS is EPERM
+ * before setup). Only then do we try the job-manager handshake, on the
+ * same fd: VERSION_CHECK ioctl 0 proposing 11.36. A CSF kernel that
+ * answers with another version, or a failure other than EPERM, is refused
+ * at once, as before there was a job-manager path, so a CSF device sees
+ * exactly the ioctls it always did. On the job-manager side we accept
+ * 11.22 (KB_JM_UK_MIN_MINOR) to 11.36 back. The kernel answers
+ * min(ours, its own) for a matching major, so there is no upper bound to
+ * check, and 11.22 is the first minor that takes the 64-byte atom (see
+ * uapi_jm.h). Only one of kb->uk_major/minor and kb->frontend is
+ * meaningful once this returns success; the other
  * frontend's fields in struct mali_kbase stay zero.
  */
 static enum mali_kbase_result
@@ -114,7 +118,7 @@ version_handshake(struct mali_kbase *kb)
    };
    long jret = kb_ioctl(kb, KB_JM_IOCTL_VERSION_CHECK, &jvc);
    if (jret >= 0 && jvc.major == KB_JM_UK_VERSION_MAJOR &&
-       jvc.minor == KB_JM_UK_VERSION_MINOR) {
+       jvc.minor >= KB_JM_UK_MIN_MINOR) {
       kb->frontend = MALI_KBASE_FRONTEND_JM;
       kb->uk_major = jvc.major;
       kb->uk_minor = jvc.minor;
@@ -124,15 +128,18 @@ version_handshake(struct mali_kbase *kb)
    if (jret < 0)
       KB_LOG(kb, "refusing device: %s (this driver speaks CSF UK %u.%u); "
                  "job-manager VERSION_CHECK (ioctl 0) failed too: %s (this driver "
-                 "speaks job-manager UK %u.%u)",
+                 "speaks job-manager UK %u.%u to %u.%u)",
              csf_detail, KB_UK_VERSION_MAJOR, KB_UK_VERSION_MINOR, strerror((int)-jret),
-             KB_JM_UK_VERSION_MAJOR, KB_JM_UK_VERSION_MINOR);
+             KB_JM_UK_VERSION_MAJOR, KB_JM_UK_MIN_MINOR, KB_JM_UK_VERSION_MAJOR,
+             KB_JM_UK_VERSION_MINOR);
    else
       KB_LOG(kb, "refusing device: %s (this driver speaks CSF UK %u.%u); "
-                 "job-manager VERSION_CHECK (ioctl 0) answered UK %u.%u (this driver "
-                 "speaks job-manager UK %u.%u)",
+                 "job-manager VERSION_CHECK (ioctl 0) answered UK %u.%u; this driver "
+                 "needs job-manager UK %u.%u to %u.%u (the 64-byte atom first appears "
+                 "in %u.%u)",
              csf_detail, KB_UK_VERSION_MAJOR, KB_UK_VERSION_MINOR, jvc.major, jvc.minor,
-             KB_JM_UK_VERSION_MAJOR, KB_JM_UK_VERSION_MINOR);
+             KB_JM_UK_VERSION_MAJOR, KB_JM_UK_MIN_MINOR, KB_JM_UK_VERSION_MAJOR,
+             KB_JM_UK_VERSION_MINOR, KB_JM_UK_VERSION_MAJOR, KB_JM_UK_MIN_MINOR);
    return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
 }
 
@@ -250,8 +257,8 @@ map_user_reg_page(struct mali_kbase *kb)
 }
 
 /*
- * BASE_MEM_MAP_TRACKING_HANDLE: on this job-manager kernel (UK 11.36, older
- * than 11.38) an allocation before this mapping exists fails with EINVAL
+ * BASE_MEM_MAP_TRACKING_HANDLE: on a job-manager kernel older than UK 11.38
+ * (every one we accept, 11.22 to 11.36) an allocation before this mapping exists fails with EINVAL
  * (kbase_mem_allow_alloc), and munmapping it again blocks allocation once
  * more. We never touch the mapping's contents (PROT_NONE); mali_kbase_destroy
  * unmaps it.

@@ -264,7 +264,7 @@ struct mali_kbase {
    const struct mali_kbase_backend *backend;
    int fd;
    enum mali_kbase_frontend frontend;
-   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.36 on JM */
+   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.22 to 11.36 on JM */
    struct mali_kbase_gpu_props props;
    struct mali_kbase_glb_iface glb;          /* CSF only; zero on JM */
    /* The GPU's user register page, mapped read-only. CSF only; NULL on JM. */
@@ -300,7 +300,8 @@ struct mali_kbase {
  *      frontend is CSF and the rest of the sequence is the blob's CSF
  *      order: SET_FLAGS, GET_GPUPROPS, CS_GET_GLB_IFACE, map the user
  *      register page, MEM_EXEC_INIT, MEM_JIT_INIT (trim level 5).
- *   2. Otherwise, VERSION_CHECK (ioctl 0) proposing 11.36 on the same fd:
+ *   2. Otherwise, VERSION_CHECK (ioctl 0) proposing 11.36 on the same fd
+ *      and accepting 11.22 to 11.36 back:
  *      each frontend's kernel answers the other's version-check ioctl
  *      with EPERM without touching setup state, so trying both on one fd
  *      is valid. On a matching answer the frontend is job-manager and the

@@ -308,7 +308,9 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->kbase->frontend == MALI_KBASE_FRONTEND_JM) {
       /* No "malisx2:" prefix: this is information, not a warning. */
       char layout[192];
-      mesa_logi("malisx2 job-manager atom layout: %s",
+      mesa_logi("malisx2 job-manager kernel UK %u.%u (proposed %u.%u); atom layout: %s",
+                dev->kbase->uk_major, dev->kbase->uk_minor, KB_JM_UK_VERSION_MAJOR,
+                KB_JM_UK_VERSION_MINOR,
                 mali_kbase_jm_atom_layout_str(dev->kbase, layout, sizeof(layout)));
       if (dev->kbase->jm_no_jit)
          mesa_logi("malisx2 job-manager context without a JIT zone: the kernel refused "

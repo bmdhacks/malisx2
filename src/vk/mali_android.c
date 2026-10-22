@@ -182,9 +182,9 @@ static void
 log_native_buffer(const VkNativeBufferANDROID *nb, const struct mali_image *image, bool error)
 {
    const native_handle_t *h = nb->handle;
-   char ints[24 * 9 + 1] = "";
-   char line[512];
-   const int n = h->numInts < 24 ? h->numInts : 24;
+   char ints[48 * 9 + 1] = "";
+   char line[768];
+   const int n = h->numInts < 48 ? h->numInts : 48;
 
    for (int i = 0; i < n; i++)
       snprintf(ints + strlen(ints), sizeof(ints) - strlen(ints), "%x ", h->data[h->numFds + i]);

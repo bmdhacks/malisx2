@@ -449,6 +449,12 @@ fail:
  * buffer's real layout is in its private handle, which is what the gralloc
  * mapper reads it from. The handle is two fds (the buffer's dma-buf and a
  * memfd of metadata) followed by 37 ints; this is the front of it.
+ *
+ * The layout is the one a handle from the RG Vita Pro (RK3576) shows: two
+ * zero ints after the stride that Rockchip's published gralloc source does
+ * not have, then the 32-bit format and modifiers at 0x44 and plane 0 at
+ * 0x4c ({0, 7680, 1920, 1080} for a 1920x1080 RGBA8888 buffer). The checks
+ * below refuse a handle laid out any other way rather than misread it.
  */
 #define ARM_GRALLOC_VERSION  12          /* sizeof(native_handle_t) */
 #define ARM_GRALLOC_NUM_FDS  2
@@ -462,8 +468,9 @@ struct arm_gralloc_handle {
    int width, height, req_format;
    uint64_t producer_usage, consumer_usage;
    int stride;                           /* the 0 the loader passes */
+   int unknown[2];                       /* 0 on the RK3576 */
    struct {
-      uint64_t base;
+      uint32_t base;
       uint32_t modifiers;                /* 0 for an uncompressed layout */
    } alloc_format;
    struct {
@@ -476,9 +483,9 @@ struct arm_gralloc_handle {
 
 _Static_assert(offsetof(struct arm_gralloc_handle, magic) == 0x14, "arm gralloc magic");
 _Static_assert(offsetof(struct arm_gralloc_handle, stride) == 0x38, "arm gralloc stride");
-_Static_assert(offsetof(struct arm_gralloc_handle, alloc_format) == 0x40, "arm gralloc format");
-_Static_assert(offsetof(struct arm_gralloc_handle, plane) == 0x50, "arm gralloc planes");
-_Static_assert(offsetof(struct arm_gralloc_handle, size) == 0x80, "arm gralloc size");
+_Static_assert(offsetof(struct arm_gralloc_handle, alloc_format) == 0x44, "arm gralloc format");
+_Static_assert(offsetof(struct arm_gralloc_handle, plane) == 0x4c, "arm gralloc planes");
+_Static_assert(offsetof(struct arm_gralloc_handle, size) == 0x7c, "arm gralloc size");
 _Static_assert(offsetof(struct arm_gralloc_handle, type) == 0xa0, "arm gralloc type");
 _Static_assert(sizeof(struct arm_gralloc_handle) ==
                   3 * sizeof(int) + 4 * (ARM_GRALLOC_NUM_FDS + ARM_GRALLOC_NUM_INTS),

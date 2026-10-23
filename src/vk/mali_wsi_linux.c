@@ -121,6 +121,12 @@ mali_wsi_init(struct mali_physical_device *pdev)
     * (mali_device_memory.c exports it as a dma-buf). */
    wsi->supports_modifiers = false;
    wsi->can_present_on_device = mali_wsi_can_present_on_device;
+   /* kbase does not put its job fences on an imported dma-buf, so the
+    * display cannot see when a frame is finished. Kernels with dma-buf
+    * sync-file import get the present's sync file attached to the buffer
+    * by wsi_common; older ones (the RK3562's 5.10) need it handed to the
+    * flip as IN_FENCE_FD, or KMS scans out a half-rendered or stale image. */
+   wsi->no_dma_buf_implicit_sync = true;
 
    pdev->wsi = wsi;
    pdev->vk.wsi_device = wsi;

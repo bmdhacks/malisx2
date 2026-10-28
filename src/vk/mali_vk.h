@@ -308,6 +308,12 @@ extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
 
+/* Each arch's sync types, binary first and then the timeline semaphore type
+ * wrapped around it (mali_sync.c); the physical device picks by arch. */
+const struct vk_sync_type *const *mali_v7_sync_types(void);
+const struct vk_sync_type *const *mali_v9_sync_types(void);
+const struct vk_sync_type *const *mali_v11_sync_types(void);
+
 static inline struct mali_physical_device *
 mali_device_physical(struct mali_device *dev)
 {

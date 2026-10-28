@@ -742,7 +742,7 @@ mali_csf_queue_finish(struct mali_device *dev, struct mali_queue *queue)
 static struct mali_sync *
 to_mali_sync(struct vk_sync *s)
 {
-   assert(s->type == &MALI_PER_ARCH(sync_type));
+   assert(s->type == &MALI_PER_ARCH(sync_type) || MALI_PER_ARCH(sync_is_timeline_point)(s));
    return container_of(s, struct mali_sync, vk);
 }
 
@@ -1055,11 +1055,13 @@ mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit)
 
    /* Signals: pending until every subqueue reaches what it will have
     * written by the end of this submit. Binary semaphore waits consume
-    * the payload. */
+    * the payload (a timeline semaphore's point sync does not: the timeline
+    * still needs it to know when that value completed). */
    pthread_mutex_lock(&dev->lock);
    for (uint32_t i = 0; i < submit->wait_count; i++) {
       struct mali_sync *s = to_mali_sync(submit->waits[i].sync);
-      if (!(s->vk.flags & VK_SYNC_IS_TIMELINE))
+      if (!(s->vk.flags & VK_SYNC_IS_TIMELINE) &&
+          !MALI_PER_ARCH(sync_is_timeline_point)(&s->vk))
          MALI_PER_ARCH(sync_clear)(s);
    }
    for (uint32_t i = 0; i < submit->signal_count; i++) {

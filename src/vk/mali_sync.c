@@ -9,8 +9,16 @@
  * host", or "pending on the done values the queue's subqueues will reach"
  * (mali_queue.c), or neither. Host waits read the done slots in GPU memory
  * and sleep on the device's condition variable, which the event thread
- * broadcasts on every kernel event. Timeline semaphores are not supported:
- * ARMSX2 does not use them and the device does not report the feature.
+ * broadcasts on every kernel event.
+ *
+ * Timeline semaphores are that binary type wrapped by Mesa's
+ * vk_sync_timeline (the bottom of this file): each signalled value is a
+ * fresh point sync of a copy of the binary type, and Mesa's queue code
+ * unwraps them before the front half's submit paths see them (vk_queue.c),
+ * so those paths only ever handle binary syncs. That also puts the device in
+ * Mesa's emulated timeline mode, whose deferred submits are flushed by every
+ * vkQueueSubmit (vk_device_flush), so submits still reach the kernel where
+ * they do today.
  *
  * A third kind of payload is an imported sync file (the Android acquire
  * fence): the sync owns a dup of the fd. Host waits poll it; GPU waits go
@@ -45,8 +53,10 @@
 
 #include "util/log.h"
 #include "util/os_time.h"
+#include "util/u_call_once.h"
 
 #include "vk_enum_to_str.h"
+#include "vk_sync_timeline.h"
 
 #include "mali_vk.h"
 
@@ -427,3 +437,61 @@ const struct vk_sync_type MALI_PER_ARCH(sync_type) = {
    .import_sync_file = sync_import_sync_file,
    .export_sync_file = sync_export_sync_file,
 };
+
+/* ---------------------------------------------------------------------- */
+/* Timeline semaphores (VK_KHR_timeline_semaphore)                         */
+
+/*
+ * The type of the syncs vk_sync_timeline makes for one signalled value. It
+ * is the binary type with GPU_MULTI_WAIT (which the timeline type requires:
+ * a point is waited on by every GPU submit that waits its value, and by the
+ * timeline's own collection and host waits), in a copy with its own address
+ * so the submit paths can tell a point from an application's binary
+ * semaphore. A point is never consumed by a wait (the timeline keeps using
+ * it to know when its value completed); a binary semaphore is (see the
+ * "Binary semaphore waits consume the payload" loops in mali_queue.c and
+ * mali_jm_queue.c, which skip points).
+ */
+static struct vk_sync_type point_sync_type;
+
+/*
+ * vk_sync_timeline wraps the binary type into a timeline one, as panvk does
+ * for the Mali parts without a kernel timeline. A timeline semaphore then
+ * hands the queue a fresh point sync per signalled value, and a point (or
+ * none, if the value is long past) to wait on for a value; Mesa's queue
+ * code does that unwrapping (vk_queue.c, vk_sync_wait_unwrap /
+ * vk_sync_signal_unwrap), so neither submit path needs to know about
+ * timeline values. The device is then in Mesa's emulated timeline mode,
+ * which defers submits only until the end of the same vkQueueSubmit
+ * (vk_device_flush, vk_queue.c).
+ */
+static struct vk_sync_timeline_type timeline_type;
+static const struct vk_sync_type *sync_types[3];
+static util_once_flag sync_types_once = UTIL_ONCE_FLAG_INIT;
+
+static void
+sync_types_init(void)
+{
+   point_sync_type = MALI_PER_ARCH(sync_type);
+   point_sync_type.features |= VK_SYNC_FEATURE_GPU_MULTI_WAIT;
+
+   timeline_type = vk_sync_timeline_get_type(&point_sync_type);
+
+   sync_types[0] = &MALI_PER_ARCH(sync_type);
+   sync_types[1] = &timeline_type.sync;
+   sync_types[2] = NULL;
+}
+
+const struct vk_sync_type *const *
+MALI_PER_ARCH(sync_types)(void)
+{
+   util_call_once(&sync_types_once, sync_types_init);
+   return sync_types;
+}
+
+bool
+MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync)
+{
+   util_call_once(&sync_types_once, sync_types_init);
+   return sync->type == &point_sync_type;
+}

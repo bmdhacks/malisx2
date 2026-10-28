@@ -87,6 +87,7 @@
 #include "util/log.h"
 #include "util/os_time.h"
 #include "vk_alloc.h"
+#include "vk_common_entrypoints.h"
 #include "vk_log.h"
 
 #include "mali_measure.h"
@@ -813,7 +814,7 @@ stage_gate(VkPipelineStageFlags2 mask)
 static struct mali_sync *
 to_sync(struct vk_sync *s)
 {
-   assert(s->type == &MALI_PER_ARCH(sync_type));
+   assert(s->type == &MALI_PER_ARCH(sync_type) || MALI_PER_ARCH(sync_is_timeline_point)(s));
    return container_of(s, struct mali_sync, vk);
 }
 
@@ -1105,10 +1106,13 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
 
       /* Binary semaphore waits consume the payload; signals are pending on
        * this submission, or on the last one with atoms if this one has
-       * none (its work is then everything before it). */
+       * none (its work is then everything before it). A timeline
+       * semaphore's point sync is not a binary semaphore: the timeline
+       * still needs it to know when that value completed. */
       for (uint32_t i = 0; i < submit->wait_count; i++) {
          struct mali_sync *s = to_sync(submit->waits[i].sync);
-         if (!(s->vk.flags & VK_SYNC_IS_TIMELINE))
+         if (!(s->vk.flags & VK_SYNC_IS_TIMELINE) &&
+             !MALI_PER_ARCH(sync_is_timeline_point)(&s->vk))
             MALI_PER_ARCH(sync_clear)(s);
       }
       for (uint32_t i = 0; i < submit->signal_count; i++) {
@@ -1130,6 +1134,74 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    if (fault)
       report_fault(dev, copy);
    return result;
+}
+
+/* ---------------------------------------------------------------------- */
+/* vkQueueSubmit: what the job manager cannot submit, refused up front    */
+
+/*
+ * A command buffer may not appear twice in one submission: one job chain
+ * cannot run it twice at once (prepare_command_buffers waits for a command
+ * buffer's *earlier submissions*, not for the earlier occurrence in the
+ * same one). The check lives here rather than in prepare_command_buffers
+ * because with a timeline semaphore type the device runs in Mesa's emulated
+ * timeline mode: vkQueueSubmit defers the submission and the queue hands it
+ * to MALI_PER_ARCH(queue_submit) on the flush at the end of the same call
+ * (vk_queue.c), where an error is fatal and sets the device lost. This one
+ * is the application's to see.
+ */
+static VkResult
+check_repeated_command_buffer(struct vk_queue *queue, uint32_t count,
+                              const VkCommandBuffer *command_buffers)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      for (uint32_t j = 0; j < i; j++) {
+         if (command_buffers[i] == command_buffers[j])
+            return vk_errorf(queue, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "a command buffer twice in one submission (SIMULTANEOUS_USE) "
+                             "is not supported on the job manager");
+      }
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+MALI_PER_ARCH(QueueSubmit)(VkQueue _queue, uint32_t submitCount,
+                           const VkSubmitInfo *pSubmits, VkFence fence)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   for (uint32_t i = 0; i < submitCount; i++) {
+      const VkResult result =
+         check_repeated_command_buffer(queue, pSubmits[i].commandBufferCount,
+                                       pSubmits[i].pCommandBuffers);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return vk_common_QueueSubmit(_queue, submitCount, pSubmits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+MALI_PER_ARCH(QueueSubmit2)(VkQueue _queue, uint32_t submitCount,
+                            const VkSubmitInfo2 *pSubmits, VkFence fence)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   VkCommandBuffer command_buffers[8];
+   for (uint32_t i = 0; i < submitCount; i++) {
+      const uint32_t count = pSubmits[i].commandBufferInfoCount;
+      if (count > ARRAY_SIZE(command_buffers)) {
+         /* The submissions we accept are a handful of buffers; a larger one
+          * goes through unchecked (the check in prepare_command_buffers
+          * still refuses the repeat, as a fatal error). */
+         continue;
+      }
+      for (uint32_t c = 0; c < count; c++)
+         command_buffers[c] = pSubmits[i].pCommandBufferInfos[c].commandBuffer;
+      const VkResult result =
+         check_repeated_command_buffer(queue, count, command_buffers);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
 }
 
 /* ---------------------------------------------------------------------- */

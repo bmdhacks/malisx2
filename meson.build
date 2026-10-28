@@ -14,7 +14,7 @@
 project(
   'malisx2',
   ['c', 'cpp'],
-  version : '0.2.3',
+  version : '0.3.0',
   license : 'MIT',
   meson_version : '>= 1.7.0',
   default_options : [

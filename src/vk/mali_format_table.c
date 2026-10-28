@@ -41,6 +41,40 @@ compressed_format_bits(const struct mali_physical_device *pdev)
                                           : pdev->props.raw_texture_features[0];
 }
 
+/*
+ * The BCn formats. The GPU's TEXTURE_FEATURES_0 can have their bits (the
+ * G57 does), but this driver reports textureCompressionBC false: its BC
+ * upload and sampling path is not implemented, and hakuX's DXT textures
+ * (uploaded as BC because the format answers claimed they were sampleable)
+ * came out as noise. Answer no for them, as Arm's blob does, so an
+ * application decodes DXT itself.
+ */
+static bool
+is_bc_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC2_SRGB_BLOCK:
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC3_SRGB_BLOCK:
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+   case VK_FORMAT_BC4_SNORM_BLOCK:
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+   case VK_FORMAT_BC5_SNORM_BLOCK:
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+   case VK_FORMAT_BC7_SRGB_BLOCK:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 pipe_format_supported(const struct mali_physical_device *pdev, enum pipe_format p)
 {
@@ -59,6 +93,9 @@ pipe_format_supported(const struct mali_physical_device *pdev, enum pipe_format 
 VkFormatFeatureFlags
 MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, VkFormat format)
 {
+   if (is_bc_format(format))
+      return 0;
+
    enum pipe_format planes[MALI_IMAGE_MAX_PLANES];
    const unsigned nplanes = mali_format_planes(format, planes);
    if (!nplanes)

@@ -394,10 +394,10 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_timeline_semaphore = true,
 
    /* Dynamic rendering, and the two extensions the Vulkan 1.1 form of it
-    * depends on. Only the recorded commands exist (vkCmdBeginRendering /
-    * vkCmdEndRendering, implemented on every arch); vkCreateRenderPass2 and
-    * vkCmdBeginRenderPass2 are waist stubs, which is honest for a driver
-    * whose renderer is dynamic rendering only. */
+    * depends on. The driver implements vkCmdBeginRendering /
+    * vkCmdEndRendering on every arch; the render pass object API
+    * (vkCreateRenderPass2, vkCmdBeginRenderPass2, ...) is Mesa's common
+    * one (vk_render_pass.c), which lowers each subpass to those two. */
    .KHR_dynamic_rendering = true,
    .KHR_depth_stencil_resolve = true,
    .KHR_create_renderpass2 = true,
@@ -541,17 +541,23 @@ get_features(struct vk_features *f, uint32_t arch)
        * Vulkan 1.2 (KHR_depth_stencil_resolve and KHR_create_renderpass2).
        * Begin and end rendering and the pipeline's dynamic rendering state
        * are what malisx2 has always used (mali_fb.c); the render pass object
-       * API behind those two extensions is not implemented and its entry
-       * points answer VK_ERROR_FEATURE_NOT_PRESENT from the waist stubs.
-       * Advertised for hakuX, whose only rendering path on a 1.1 device is
-       * vkCmdBeginRendering and which requires all three names. */
+       * API behind those two extensions is Mesa's common one, which lowers
+       * render passes to them (vk_render_pass.c). Advertised for hakuX,
+       * whose only rendering path on a 1.1 device is vkCmdBeginRendering
+       * and which requires all three names. */
       .dynamicRendering = true,
    };
 }
 
+/* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
+ * vkCmdResolveImage does nothing, so only 1 is offered. That is below the
+ * minimum Vulkan requires (1|4 for the framebuffer and sampledImage limits).
+ * Back to 1|4 when multisampled rendering and resolve exist. */
+#define MALI_SUPPORTED_SAMPLE_COUNTS VK_SAMPLE_COUNT_1_BIT
+
 /* Sample counts for a format of the given bytes per pixel: 1 and 4
  * samples when bytes x 512 fits the tile buffer, 8 at bytes x 1024, 16 at
- * bytes x 2048. */
+ * bytes x 2048, limited to MALI_SUPPORTED_SAMPLE_COUNTS. */
 static VkSampleCountFlags
 sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
 {
@@ -562,7 +568,7 @@ sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
       s |= VK_SAMPLE_COUNT_8_BIT;
    if (bytes_per_pixel * 2048 <= tilebuf_bytes)
       s |= VK_SAMPLE_COUNT_16_BIT;
-   return s;
+   return s & MALI_SUPPORTED_SAMPLE_COUNTS;
 }
 
 /*
@@ -802,8 +808,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_depth_stencil_resolve (advertised with
        * VK_KHR_dynamic_rendering, which depends on it below Vulkan 1.2).
        * Vulkan requires SAMPLE_ZERO in both sets; the arithmetic modes are
-       * not implemented, since render passes (the only place a resolve
-       * happens) are not either. */
+       * not implemented, since rendering is single-sampled
+       * (MALI_SUPPORTED_SAMPLE_COUNTS). */
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = false,

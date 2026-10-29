@@ -49,7 +49,9 @@
  *  - the FAU block's word count goes into the Shader Environment's own
  *    byte (v9 has no count in the pointer); a zero count would drop the
  *    uniforms silently;
- *  - no occlusion query (ARMSX2 records none).
+ *  - an occlusion query is the Draw descriptor's Occlusion pointer (the
+ *    counter) and Occlusion Query mode in DCD Flags 0; both stay zero
+ *    outside a query, which is every ARMSX2 draw (mali_jm_query.c);
  *
  * Layered passes. Every layer has its own Tiler Context with layer offset
  * 0 (mali_jm_cmd_render.c). A primitive's layer is 0 unless the vertex
@@ -99,6 +101,7 @@ enum {
    TW_MAX_Z = TW_DRAW + 7,
    TW_ZSD = TW_DRAW + 10,              /* 64-bit */
    TW_BLEND = TW_DRAW + 12,            /* 64-bit: address | count */
+   TW_OCCLUSION = TW_DRAW + 14,        /* 64-bit: the query's counter */
    TW_FS_ENV = TW_DRAW + 16,
    TW_POS_ENV = MV_WORD(POSITION),
    TW_VAR_ENV = MV_WORD(VARYING),
@@ -252,7 +255,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          tset64(fs_env, ENV_SHADER, dbk->fs_spd);
          spd_var = dbk->vs_var_spd;
          t->prim0 = dbk->tiler_flags;
-         w[TW_DCD0] = dbk->dcd0[0];
+         w[TW_DCD0] = mali_gfx_dcd0(d, dbk);
          w[TW_DCD1] = dbk->dcd1;
          lines = u_reduced_prim(dbk->prim) == MESA_PRIM_LINES;
       } else {
@@ -260,7 +263,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          tset64(fs_env, ENV_SHADER, bd->spd[2]);
          spd_var = bd->spd[1];
          t->prim0 = bd->tiler_flags;
-         w[TW_DCD0] = bd->dcd0;
+         w[TW_DCD0] = mali_gfx_dcd0(d, NULL);
          w[TW_DCD1] = bd->dcd1;
          lines = bd->lines;
       }
@@ -278,6 +281,13 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       else
          w[TW_PSIZE] = fui(lines ? dyn->rs.line.width : 1.0f);
       tset64(&w[TW_VAR_ENV], ENV_SHADER, t->secondary ? spd_var : 0);
+   }
+   if (d->dirty & MALI_GFX_DIRTY_OQ) {
+      /* The pipeline group wrote the DCD word for the current query state
+       * when it ran; otherwise only the query changed. */
+      if (!(d->dirty & MALI_GFX_DIRTY_PIPELINE))
+         w[TW_DCD0] = mali_gfx_dcd0(d, dbk);
+      tset64(w, TW_OCCLUSION, d->oq_addr);
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       const VkViewport *vp = &dyn->vp.viewports[0];

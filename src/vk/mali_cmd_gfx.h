@@ -254,12 +254,20 @@ enum mali_gfx_dirty {
    MALI_GFX_DIRTY_VIEWPORT = 1u << 7,   /* scissor box, depth clamps */
    MALI_GFX_DIRTY_INDEX    = 1u << 8,
    MALI_GFX_DIRTY_PASS     = 1u << 9,   /* TILER_CTX, TSD */
-   MALI_GFX_DIRTY_ALL      = (1u << 10) - 1,
+   MALI_GFX_DIRTY_OQ       = 1u << 10,  /* the occlusion query the draws count into */
+   MALI_GFX_DIRTY_ALL      = (1u << 11) - 1,
 };
 
 struct mali_gfx_draw_state {
    struct mali_graphics_pipeline *pipeline;
    uint32_t dirty;
+
+   /* The occlusion query active (vkCmdBeginQuery) and not ended yet: the
+    * GPU address of its counter, 0 when there is none, and whether it
+    * counts samples (VK_QUERY_CONTROL_PRECISE_BIT) or only whether any
+    * passed. Draws recorded meanwhile carry them (MALI_GFX_DIRTY_OQ). */
+   uint64_t oq_addr;
+   bool oq_precise;
 
    struct {
       uint64_t addr;

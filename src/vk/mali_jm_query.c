@@ -5,8 +5,8 @@
 
 /*
  * Query commands on the job manager (v7 and v9): vkCmdResetQueryPool,
- * vkCmdWriteTimestamp. The pool object and the host reads are in
- * mali_query.c. ARMSX2 turns GPU timing on for any device whose name is
+ * vkCmdWriteTimestamp, and the occlusion queries' vkCmdBeginQuery and
+ * vkCmdEndQuery. The pool object and the host reads are in mali_query.c. ARMSX2 turns GPU timing on for any device whose name is
  * not "Mali-G615", so the G57 and G52 builds need the timestamp commands;
  * the G615 build has its own (mali_cmd_query.c).
  *
@@ -116,4 +116,102 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
       return;
    mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64,
                            mali_query_avail_va(pool, query), 1, true);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Occlusion queries                                                       */
+
+/*
+ * The hardware counts. A draw's Draw descriptor names a counter (the
+ * Occlusion pointer) and a mode (DCD Flags 0); the fragment job adds the
+ * samples that passed to it, tile by tile, so the count is only final when
+ * the fragment jobs of every pass that drew into the query have finished.
+ *
+ *  - Begin: a Write Value job zeroes the counter, in the open batch's vtc
+ *    chain. The batch's fragment atom starts after its vtc atom, so the
+ *    counter is zero before any fragment job can add to it. The draws that
+ *    follow carry the counter (MALI_GFX_DIRTY_OQ).
+ *  - End: the draws stop carrying it, and the availability word is set by
+ *    a Write Value job with the Barrier bit on the fragment chain, behind
+ *    the fragment jobs recorded so far: the barrier makes it start when
+ *    they are done, and it is in the same atom as they are or in a later
+ *    one of the fragment slot, which runs after them. The count and the
+ *    availability word are in one 16-byte slot (one cache line), so the
+ *    cache clean at the end of the atom publishes both together.
+ *
+ *    When the query ends inside a render pass, the pass's fragment jobs
+ *    do not exist yet (the pass writes them when it ends), so the word is
+ *    set at the end of the pass (cmd_oq_pass_end), after them. A query
+ *    that ends outside a pass is set at once, behind the fragment jobs of
+ *    the passes it spanned.
+ */
+
+void
+MALI_PER_ARCH(cmd_oq_pass_end)(struct mali_cmd_buffer *cmd)
+{
+   if (likely(!util_dynarray_num_elements(&cmd->jm.oq_done, uint64_t)))
+      return;
+   struct mali_jm_chain *c = mali_jm_cmd_frag(cmd, false);
+   if (c) {
+      util_dynarray_foreach(&cmd->jm.oq_done, uint64_t, addr) {
+         if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, *addr, 1, true))
+            break;
+      }
+   }
+   util_dynarray_clear(&cmd->jm.oq_done);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query,
+                             VkQueryControlFlags flags)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+
+   if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
+      return;
+
+   /* The pass's vtc chain once it tiles (the batch may not close inside
+    * it), else the open batch's. */
+   const uint64_t counter = mali_query_val_va(pool, query);
+   struct mali_jm_chain *c = cmd->gfx.render.active && cmd->gfx.render.tiler
+                                ? mali_jm_cmd_pass_vtc(cmd)
+                                : mali_jm_cmd_vtc(cmd);
+   /* No Barrier bit: nothing in the chain reads or writes the counter, and
+    * a barrier here would hold the pass's tiling back until every draw
+    * before it was done. */
+   if (!c || !mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, counter, 0, false))
+      return;
+
+   d->oq_addr = counter;
+   d->oq_precise = flags & VK_QUERY_CONTROL_PRECISE_BIT;
+   d->dirty |= MALI_GFX_DIRTY_OQ;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdEndQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, uint32_t query)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+
+   if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
+      return;
+
+   d->oq_addr = 0;
+   d->dirty |= MALI_GFX_DIRTY_OQ;
+
+   const uint64_t avail = mali_query_avail_va(pool, query);
+   if (cmd->gfx.render.active) {
+      uint64_t *slot = util_dynarray_grow(&cmd->jm.oq_done, uint64_t, 1);
+      if (slot)
+         *slot = avail;
+      else
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   struct mali_jm_chain *c = mali_jm_cmd_frag(cmd, false);
+   if (c)
+      mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, avail, 1, true);
 }

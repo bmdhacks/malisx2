@@ -911,6 +911,7 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.frags);
    util_dynarray_clear(&cmd->jm.resets);
    util_dynarray_clear(&cmd->jm.reset_data);
+   util_dynarray_clear(&cmd->jm.oq_done);
    cmd->jm.open = false;
 #if PAN_ARCH < 9
    cmd->jm.pend_tilers = 0;
@@ -960,6 +961,7 @@ cmd_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
    util_dynarray_init(&cmd->jm.frags, NULL);
    util_dynarray_init(&cmd->jm.resets, NULL);
    util_dynarray_init(&cmd->jm.reset_data, NULL);
+   util_dynarray_init(&cmd->jm.oq_done, NULL);
 #if PAN_ARCH < 9
    util_dynarray_init(&cmd->jm.buf_writes, NULL);
 #endif
@@ -991,6 +993,7 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
    util_dynarray_fini(&cmd->jm.frags);
    util_dynarray_fini(&cmd->jm.resets);
    util_dynarray_fini(&cmd->jm.reset_data);
+   util_dynarray_fini(&cmd->jm.oq_done);
 #if PAN_ARCH < 9
    util_dynarray_fini(&cmd->jm.buf_writes);
 #endif

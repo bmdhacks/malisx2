@@ -1182,6 +1182,33 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
 }
 
 #if PAN_ARCH >= 9
+/*
+ * MALI_GFX_DIRTY_PIPELINE and MALI_GFX_DIRTY_OQ: the DCD Flags 0 word of the
+ * next draw. The pipeline bakes one variant for draws outside an occlusion
+ * query and one for draws inside (mali_pipeline_state.c: the pixel kill and
+ * ZS update operations are chosen as if the draw wrote depth, and the mode
+ * is Counter); a query that was not asked to be precise (no
+ * VK_QUERY_CONTROL_PRECISE_BIT) takes the second with the mode changed to
+ * Predicate, "did any sample pass".
+ */
+static inline uint32_t
+mali_gfx_dcd0(const struct mali_gfx_draw_state *d, const struct mali_gfx_baked *dbk)
+{
+   const bool oq = d->oq_addr != 0;
+   const struct mali_gfx_bind *bd = &d->pipeline->bind;
+   const uint32_t w = dbk ? dbk->dcd0[oq] : oq ? bd->dcd0_oq : bd->dcd0;
+   if (likely(!oq || d->oq_precise))
+      return w;
+   struct mali_dcd_flags_0_packed counter, predicate;
+   pan_pack(&counter, DCD_FLAGS_0, cfg) {
+      cfg.occlusion_query = MALI_OCCLUSION_MODE_COUNTER;
+   }
+   pan_pack(&predicate, DCD_FLAGS_0, cfg) {
+      cfg.occlusion_query = MALI_OCCLUSION_MODE_PREDICATE;
+   }
+   return w ^ counter.opaque[0] ^ predicate.opaque[0];
+}
+
 /* MALI_GFX_DIRTY_BLEND: *out = the Blend descriptors' address | their
  * count (v11 BLEND_DESC register, v9 Draw descriptor Blend word). Marks
  * the FS FAU dirty. */

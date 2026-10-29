@@ -477,6 +477,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->spd[2] = bk->fs_spd;
    bd->tiler_flags = bk->tiler_flags;
    bd->dcd0 = bk->dcd0[0];
+   bd->dcd0_oq = bk->dcd0[1];
    bd->dcd1 = bk->dcd1;
    bd->dcd2 = bk->dcd2;
    bd->vary_size = p->fs ? p->vs->info.varyings.formats.generic_size_B : 0;

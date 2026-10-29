@@ -104,6 +104,13 @@ mali_query_val_cpu(const struct mali_query_pool *pool, uint32_t q)
 MALI_PER_ARCH_DECL(void, cmd_query_fence, (struct mali_cmd_buffer *cmd, bool before));
 
 /*
+ * The end of a render pass, after its fragment jobs: sets the availability
+ * words of the occlusion queries that ended inside it (mali_jm_query.c,
+ * mali_cmd_query.c). Called whether or not the pass had fragment work.
+ */
+MALI_PER_ARCH_DECL(void, cmd_oq_pass_end, (struct mali_cmd_buffer *cmd));
+
+/*
  * Fills size bytes at the GPU address addr with the 32-bit word `value`,
  * with the internal fill shader (mali_cmd_copy.c). addr and size are
  * multiples of 4.

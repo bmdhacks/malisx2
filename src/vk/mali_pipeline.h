@@ -156,6 +156,7 @@ struct mali_gfx_bind {
                                    * on v7 */
    uint32_t tiler_flags;
    uint32_t dcd0, dcd1, dcd2;
+   uint32_t dcd0_oq;              /* dcd0 for draws inside an occlusion query */
    uint32_t vary_size;            /* VARY_SIZE */
    uint32_t tls_size;
    uint32_t noperspective;        /* the fragment shader's noperspective mask */

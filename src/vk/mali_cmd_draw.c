@@ -352,7 +352,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          batch_move64(e, IDVS(SPD_1), dbk->vs_var_spd);
          batch_move64(e, IDVS(SPD_2), dbk->fs_spd);
          batch_move32(e, IDVS(TILER_FLAGS), dbk->tiler_flags);
-         batch_move32(e, IDVS(DCD0), dbk->dcd0[0]);
+         batch_move32(e, IDVS(DCD0), mali_gfx_dcd0(d, dbk));
          batch_move32(e, IDVS(DCD1), dbk->dcd1);
          batch_move32(e, IDVS(DCD2), dbk->dcd2);
          lines = u_reduced_prim(dbk->prim) == MESA_PRIM_LINES;
@@ -361,7 +361,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          batch_move64(e, IDVS(SPD_1), bd->spd[1]);
          batch_move64(e, IDVS(SPD_2), bd->spd[2]);
          batch_move32(e, IDVS(TILER_FLAGS), bd->tiler_flags);
-         batch_move32(e, IDVS(DCD0), bd->dcd0);
+         batch_move32(e, IDVS(DCD0), mali_gfx_dcd0(d, NULL));
          batch_move32(e, IDVS(DCD1), bd->dcd1);
          batch_move32(e, IDVS(DCD2), bd->dcd2);
          lines = bd->lines;
@@ -371,7 +371,11 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       /* Point size 1.0 unless the shader writes it; line width. */
       batch_move32(e, IDVS(PRIMITIVE_SIZE), fui(lines ? dyn->rs.line.width : 1.0f));
       batch_move32(e, IDVS(GLOBAL_ATTRIBUTE_OFFSET), 0);
-      batch_move64(e, IDVS(OQ), 0);
+      batch_move64(e, IDVS(OQ), d->oq_addr);
+   } else if (d->dirty & MALI_GFX_DIRTY_OQ) {
+      /* Only the query changed. */
+      batch_move32(e, IDVS(DCD0), mali_gfx_dcd0(d, dbk));
+      batch_move64(e, IDVS(OQ), d->oq_addr);
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       const VkViewport *vp = &dyn->vp.viewports[0];

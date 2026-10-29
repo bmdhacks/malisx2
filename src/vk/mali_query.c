@@ -112,6 +112,13 @@ MALI_PER_ARCH(CreateQueryPool)(VkDevice _device, const VkQueryPoolCreateInfo *pC
        pCreateInfo->queryType != VK_QUERY_TYPE_OCCLUSION)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "only timestamp and occlusion query pools are supported");
+#if PAN_ARCH == 7
+   /* Bifrost's counter is one per shader core and its Draw descriptor is
+    * laid out differently; not done. */
+   if (pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "occlusion queries are not supported on this GPU");
+#endif
 
    struct mali_query_pool *pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));

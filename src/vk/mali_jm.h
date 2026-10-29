@@ -317,6 +317,11 @@ struct mali_jm_cmd {
    /* Timing regions (measurement/timing_jm.c); NULL unless
     * MALISX2_MEASURE's "timing" mode is on. */
    struct mali_measure_cmd *measure;
+
+   /* Occlusion queries that ended inside the open render pass: the GPU
+    * addresses (uint64_t) of their availability words, set by Write Value
+    * jobs behind the pass's fragment jobs (mali_jm_query.c). */
+   struct util_dynarray oq_done;
 #if PAN_ARCH < 9
    /* Tiler jobs written and waiting to be linked into the open batch's
     * vtc chain (mali_v7_link_tilers). Each goes in behind the Vertex job

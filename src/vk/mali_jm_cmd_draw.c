@@ -291,7 +291,12 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
       const VkViewport *vp = &dyn->vp.viewports[0];
-      tset64(w, TW_SCISSOR, mali_gfx_scissor_box(cmd));
+      int bx0, by0, bx1, by1;
+      mali_gfx_scissor_rect(cmd, &bx0, &by0, &bx1, &by1);
+      tset64(w, TW_SCISSOR, mali_gfx_pack_scissor(bx0, by0, bx1, by1));
+#if MALI_PRELOAD_ZS_EARLY
+      mali_cover_add(&r->cover, bx0, by0, bx1, by1);
+#endif
       w[TW_MIN_Z] = fui(MIN2(vp->minDepth, vp->maxDepth));
       w[TW_MAX_Z] = fui(MAX2(vp->minDepth, vp->maxDepth));
    }
@@ -420,6 +425,9 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
                                 (t->packet_stride + 16));
    cmd->jm.cur.draws++;
    r->draws++;
+#if MALI_PRELOAD_ZS_EARLY
+   r->verts += (uint64_t)di->count * di->instance_count;
+#endif
    cmd->draws++;
 }
 

@@ -488,6 +488,10 @@ struct earlyzs {
    enum mali_pixel_kill update, kill;
 };
 
+/* Arches that take the weak-early kill below. v9 only so far: measured on
+ * the Mali-G57, and not on the arches ARMSX2's output was checked on. */
+#define MALI_WEAK_KILL_WITH_LATE_UPDATE (PAN_ARCH == 9)
+
 /*
  * When depth/stencil testing and the pixel kill happen relative to the
  * shader (pan_earlyzs.c: from arch 11 the update can never be weak-early;
@@ -521,11 +525,33 @@ earlyzs_get(const struct pan_shader_info *s, bool writes_zs_or_oq,
 #define EARLY(force) \
    ((zs_always_passes && !(force)) ? MALI_PIXEL_KILL_WEAK_EARLY \
                                    : MALI_PIXEL_KILL_FORCE_EARLY)
-   return (struct earlyzs){
+   struct earlyzs ezs = {
       .update = late_update ? MALI_PIXEL_KILL_FORCE_LATE : EARLY(force_early_update),
       .kill = late_kill ? MALI_PIXEL_KILL_FORCE_LATE : EARLY(force_early_kill),
    };
 #undef EARLY
+
+#if MALI_WEAK_KILL_WITH_LATE_UPDATE
+   /*
+    * A force-early kill tests against the depth and stencil values of every
+    * older fragment of the pixel. When the update is late, those values are
+    * not final until the older fragments' shaders have run, so the early
+    * test waits for them. Weak early lets the hardware test early only when
+    * that costs no wait. Arm's driver picks it for every draw without
+    * early_fragment_tests; on a shader that discards and writes depth it
+    * is 1.1 to 1.4 times as fast as force early here.
+    *
+    * The Vulkan rules allow it: when the kill is not already late, the
+    * shader has no side effects and does not export depth or stencil, so
+    * running it for a fragment that fails the test changes nothing; the
+    * update, which does change the images, is still late. A shader with
+    * early_fragment_tests has no late update, and one that reads the
+    * depth/stencil tile buffer keeps its mode.
+    */
+   if (late_update && !late_kill && !force_early_kill && zs_read == ZS_NOT_READ)
+      ezs.kill = MALI_PIXEL_KILL_WEAK_EARLY;
+#endif
+   return ezs;
 }
 
 /* ---------------------------------------------------------------------- */

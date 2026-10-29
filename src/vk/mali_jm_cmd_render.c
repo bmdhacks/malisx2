@@ -77,6 +77,7 @@
 #include "vk_log.h"
 
 #include "mali_measure.h"
+#include "mali_query.h"
 
 #if PAN_ARCH != 7 && PAN_ARCH != 9
 #error "mali_jm_cmd_render.c is the job manager back half (PAN_ARCH 7 or 9)"
@@ -549,6 +550,8 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
          cmd->jm.cur.passes++;
       }
    }
+   if (!vk_command_buffer_has_error(&cmd->vk))
+      MALI_PER_ARCH(cmd_oq_pass_end)(cmd);
 
    if (unlikely(cmd->jm.measure)) {
       const uint32_t w = r->desc.width, h = r->desc.height;

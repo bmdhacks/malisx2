@@ -27,6 +27,7 @@
 #include <stdint.h>
 
 #include "util/list.h"
+#include "util/u_dynarray.h"
 #include "vk_command_buffer.h"
 
 #include "kbase/kbase.h"
@@ -162,6 +163,11 @@ struct mali_cmd_buffer {
 
    /* Timing regions (src/measurement/); NULL unless timing is on. */
    struct mali_measure_cmd *measure;
+
+   /* Occlusion queries that ended inside the open render pass: the GPU
+    * addresses (uint64_t) of their availability words, set behind the
+    * pass's fragment jobs (mali_cmd_query.c). */
+   struct util_dynarray oq_done;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_cmd_buffer, vk.base, VkCommandBuffer,

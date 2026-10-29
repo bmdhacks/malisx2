@@ -38,6 +38,7 @@
 
 #include "mali_cmd_state.h"
 #include "mali_measure.h"
+#include "mali_query.h"
 
 #include "mali_arch.h"
 #include "mali_image.h"
@@ -459,6 +460,8 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
          issue_fragment_jobs(cmd, r, fbds, fbd_sz);
       }
    }
+   if (!vk_command_buffer_has_error(&cmd->vk))
+      MALI_PER_ARCH(cmd_oq_pass_end)(cmd);
    if (unlikely(cmd->measure)) {
       const uint32_t w = r->desc.width, h = r->desc.height;
       mali_measure_info(cmd, r->measure_vt, w, h, r->desc.rt_count, r->draws);

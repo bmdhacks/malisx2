@@ -280,6 +280,7 @@ cmd_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
    cmd->vk.dynamic_graphics_state.vi = &cmd->dyn_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->dyn_sl;
    list_inithead(&cmd->slabs);
+   util_dynarray_init(&cmd->oq_done, NULL);
    init_streams(cmd);
    cmd_reset_state(cmd);
    mali_measure_cmd_create(cmd);
@@ -294,6 +295,7 @@ cmd_reset(struct vk_command_buffer *vk_cmd, VkCommandBufferResetFlags flags)
    vk_command_buffer_reset(&cmd->vk);
    /* Timestamps live in command memory: read them before it goes. */
    mali_measure_cmd_reset(cmd);
+   util_dynarray_clear(&cmd->oq_done);
    fini_streams(cmd);
    cmd_release_memory(cmd);
    init_streams(cmd);
@@ -305,6 +307,7 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
 {
    struct mali_cmd_buffer *cmd = container_of(vk_cmd, struct mali_cmd_buffer, vk);
    mali_measure_cmd_destroy(cmd);
+   util_dynarray_fini(&cmd->oq_done);
    fini_streams(cmd);
    cmd_release_memory(cmd);
    mali_push_shadows_fini(&cmd->push_shadow, &cmd->vk.pool->alloc);

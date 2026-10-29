@@ -174,6 +174,8 @@ malisx2_vk = static_library(
   # Command buffers, the CSF queue, submit and sync.
   files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_queue.c',
         'vk/mali_sync.c'),
+  # Query pools: the pool and its host reads, and the v11 commands.
+  files('vk/mali_cmd_query.c', 'vk/mali_query.c'),
   # Render passes and draws (the CSF side; the shared builders and the
   # image transfers are per-arch files).
   files('vk/mali_cmd_draw.c', 'vk/mali_cmd_render.c'),
@@ -213,7 +215,8 @@ malisx2_vk_v11 = static_library(
 _vk_jm_files = files(
   'vk/mali_jm_cmd_buffer.c', 'vk/mali_jm_cmd_dispatch.c',
   'vk/mali_jm_cmd_render.c', 'vk/mali_jm_heap.c', 'vk/mali_jm_query.c',
-  'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_sync.c', 'vk/mali_wsi.c',
+  'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_query.c', 'vk/mali_sync.c',
+  'vk/mali_wsi.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):
   # their own implementation of what touches struct mali_cmd_buffer
   # directly, because that struct (mali_jm.h) differs from the CSF one

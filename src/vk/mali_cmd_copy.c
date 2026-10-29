@@ -4,7 +4,8 @@
  */
 
 /*
- * vkCmdCopyBuffer, vkCmdFillBuffer and vkCmdUpdateBuffer, as compute
+ * vkCmdCopyBuffer, vkCmdFillBuffer and vkCmdUpdateBuffer (and the query
+ * pools' reset fill and result copy, below), as compute
  * dispatches of small internal shaders: on the compute subqueue (CSF, v11)
  * or as Compute jobs in the open batch's vtc chain (job manager, v7 and v9).
  * Built once per arch.
@@ -39,6 +40,7 @@
 
 #include "mali_arch.h"
 #include "mali_memory.h"
+#include "mali_query.h"
 #include "mali_vk.h"
 
 #define META_WG_SIZE 64
@@ -56,6 +58,21 @@ struct meta_fill_push {
    uint64_t dst;
    uint32_t count;
    uint32_t value;
+};
+
+/* vkCmdCopyQueryPoolResults: one invocation per query. The pointers are
+ * the first query's value, availability word and destination; the strides
+ * step them per query. */
+struct meta_query_push {
+   uint64_t val;
+   uint64_t avail;
+   uint64_t dst;
+   uint32_t val_stride;
+   uint32_t avail_stride;
+   uint32_t dst_stride;
+   uint32_t count;
+   uint32_t flags;   /* VkQueryResultFlags */
+   uint32_t pad;
 };
 
 static unsigned
@@ -130,6 +147,72 @@ build_meta_nir(struct mali_device *dev, enum mali_meta_shader m)
    return b.shader;
 }
 
+#define QPUSH(b, field, bits)                                                  \
+   nir_load_push_constant(b, 1, bits, nir_imm_int(b, offsetof(struct meta_query_push, field)), \
+                          .base = 0, .range = sizeof(struct meta_query_push))
+
+/*
+ * What vkCmdCopyQueryPoolResults says: for each query, the value if the
+ * query is available or VK_QUERY_RESULT_PARTIAL_BIT is set (a 32-bit
+ * result that does not fit is clamped), then the availability, as a 32 or
+ * 64-bit word each. Waiting for the queries is not the shader's: the
+ * dispatch is ordered after the work that sets them (cmd_query_fence).
+ */
+static nir_shader *
+build_query_copy_nir(struct mali_device *dev)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_query_copy");
+   b.shader->info.workgroup_size[0] = META_WG_SIZE;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_push_if(&b, nir_ult(&b, id, QPUSH(&b, count, 32)));
+   {
+      nir_def *id64 = nir_u2u64(&b, id);
+      nir_def *val_addr =
+         nir_iadd(&b, QPUSH(&b, val, 64), nir_imul(&b, id64, nir_u2u64(&b, QPUSH(&b, val_stride, 32))));
+      nir_def *avail_addr =
+         nir_iadd(&b, QPUSH(&b, avail, 64),
+                  nir_imul(&b, id64, nir_u2u64(&b, QPUSH(&b, avail_stride, 32))));
+      nir_def *dst_addr =
+         nir_iadd(&b, QPUSH(&b, dst, 64), nir_imul(&b, id64, nir_u2u64(&b, QPUSH(&b, dst_stride, 32))));
+      nir_def *flags = QPUSH(&b, flags, 32);
+
+      nir_def *avail = nir_ine_imm(&b, nir_load_global(&b, 1, 64, avail_addr, .align_mul = 8), 0);
+      nir_def *wide = nir_ine_imm(&b, nir_iand_imm(&b, flags, VK_QUERY_RESULT_64_BIT), 0);
+      nir_def *partial = nir_ine_imm(&b, nir_iand_imm(&b, flags, VK_QUERY_RESULT_PARTIAL_BIT), 0);
+
+      nir_push_if(&b, nir_ior(&b, avail, partial));
+      {
+         nir_def *v = nir_load_global(&b, 1, 64, val_addr, .align_mul = 8);
+         nir_push_if(&b, wide);
+         nir_store_global(&b, v, dst_addr, .write_mask = 1, .align_mul = 8);
+         nir_push_else(&b, NULL);
+         nir_store_global(&b, nir_u2u32(&b, nir_umin(&b, v, nir_imm_int64(&b, UINT32_MAX))),
+                          dst_addr, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+
+      nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, flags, VK_QUERY_RESULT_WITH_AVAILABILITY_BIT), 0));
+      {
+         nir_push_if(&b, wide);
+         nir_store_global(&b, nir_b2i64(&b, avail), nir_iadd_imm(&b, dst_addr, 8),
+                          .write_mask = 1, .align_mul = 8);
+         nir_push_else(&b, NULL);
+         nir_store_global(&b, nir_b2i32(&b, avail), nir_iadd_imm(&b, dst_addr, 4),
+                          .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
 static const struct mali_shader *
 get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
 {
@@ -138,7 +221,8 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
    simple_mtx_lock(&dev->meta_lock);
    struct mali_shader *s = dev->meta[m];
    if (!s) {
-      nir_shader *nir = build_meta_nir(dev, m);
+      nir_shader *nir = m == MALI_META_QUERY_COPY ? build_query_copy_nir(dev)
+                                                  : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 
       const struct vk_pipeline_robustness_state rs = {
@@ -280,4 +364,73 @@ MALI_PER_ARCH(CmdUpdateBuffer)(VkCommandBuffer commandBuffer, VkBuffer dstBuffer
       return;
    memcpy(p.cpu, pData, dataSize);
    record_copy(cmd, p.gpu, vk_buffer_address(dst, dstOffset), dataSize);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Query pools                                                             */
+
+void
+MALI_PER_ARCH(cmd_fill_addr)(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size,
+                             uint32_t value)
+{
+   if (!size)
+      return;
+   const enum mali_meta_shader m =
+      !((addr | size) & 15) ? MALI_META_FILL_16 : MALI_META_FILL_4;
+   struct meta_fill_push push = {.dst = addr, .value = value};
+   dispatch_elems(cmd, m, &push, sizeof(push), &push.count, size / meta_elem_size(m), NULL,
+                  &push.dst);
+}
+
+/* vkCmdCopyQueryPoolResults reaches here through the runtime's
+ * vk_common_CmdCopyQueryPoolResults. */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdCopyQueryPoolResultsToMemoryKHR)(VkCommandBuffer commandBuffer,
+                                                  VkQueryPool _pool, uint32_t firstQuery,
+                                                  uint32_t queryCount,
+                                                  const VkStridedDeviceAddressRangeKHR *pDstRange,
+                                                  VkAddressCommandFlagsKHR dstFlags,
+                                                  VkQueryResultFlags flags)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+
+   if (!queryCount)
+      return;
+   const struct mali_shader *s = get_meta(cmd, MALI_META_QUERY_COPY);
+   if (!s)
+      return;
+
+   /* A copy that waits is after every query operation recorded so far. */
+   if (flags & VK_QUERY_RESULT_WAIT_BIT)
+      MALI_PER_ARCH(cmd_query_fence)(cmd, true);
+
+#if PAN_ARCH < 9
+   const uint64_t result_size = flags & VK_QUERY_RESULT_64_BIT ? 8 : 4;
+   const uint64_t per_query = result_size * (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT ? 2 : 1);
+   mali_v7_note_buffer_write(cmd, pDstRange->address,
+                             (queryCount - 1) * pDstRange->stride + per_query);
+#endif
+
+   struct meta_query_push push = {
+      .val = mali_query_val_va(pool, firstQuery),
+      .avail = mali_query_avail_va(pool, firstQuery),
+      .dst = pDstRange->address,
+      .val_stride = pool->val_stride,
+      .avail_stride = pool->avail_stride,
+      .dst_stride = (uint32_t)pDstRange->stride,
+      .flags = flags,
+   };
+   uint32_t done = 0;
+   while (done < queryCount) {
+      const uint32_t n = MIN2(queryCount - done, META_MAX_ELEMS);
+      push.count = n;
+      const uint32_t base[3] = {0, 0, 0};
+      const uint32_t groups[3] = {DIV_ROUND_UP(n, META_WG_SIZE), 1, 1};
+      MALI_PER_ARCH(cmd_dispatch_shader)(cmd, s, NULL, &push, sizeof(push), base, groups);
+      push.val += (uint64_t)n * pool->val_stride;
+      push.avail += (uint64_t)n * pool->avail_stride;
+      push.dst += (uint64_t)n * pDstRange->stride;
+      done += n;
+   }
 }

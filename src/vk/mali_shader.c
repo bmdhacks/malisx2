@@ -1472,15 +1472,17 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
    nir_src_rewrite(&intr->src[2], nir_imm_int(b, conv.opaque[0]));
    return true;
 }
+#endif /* PAN_ARCH < 9 */
 
+#if PAN_ARCH != 9
 /* ---------------------------------------------------------------------- */
 /* Clip distances                                                          */
 
 /*
- * Bifrost has no clip distance hardware. As Mesa's gallium driver does for
+ * No Mali arch has clip distance hardware. As Mesa's gallium driver does for
  * user clip planes (nir_lower_clip_fs), the distances are varyings, and the
  * fragment shader discards a fragment whose interpolated distance is
- * negative.
+ * negative. Built for v7 and v11; v9 does not offer shaderClipDistance.
  *
  * The vertex shader keeps gl_ClipDistance as vk_spirv_to_nir leaves it: a
  * compact float array, whatever its name (a gl_PerVertex member is
@@ -1498,10 +1500,54 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
  *  - the distance is interpolated at the pixel centre, so under
  *    multisampling the clipped edge is not antialiased;
  *  - the discard makes the depth/stencil update late
- *    (mali_pipeline_state.c earlyzs_get), but with a fragment shader that
- *    forces early fragment tests, depth and stencil are written before the
- *    shader runs, so clipped fragments still write them.
+ *    (mali_pipeline_state.c earlyzs_get), so a clipped fragment writes no
+ *    depth or stencil, unless the fragment shader forces early fragment
+ *    tests: those are done before the shader runs, and the clipped
+ *    fragment would have written depth and stencil by then. On v7 the
+ *    flag stays and clipped fragments of such a shader still write depth
+ *    and stencil. On v11 the flag is dropped from the shader when nothing
+ *    but speed depends on it (early_tests_observable); when something
+ *    does, it stays, with the same result as on v7.
  */
+
+#if PAN_ARCH >= 10
+
+/*
+ * Whether the shader's early_fragment_tests changes anything but speed
+ * once a discard is added to it:
+ *  - a discard of its own: with early tests the fragment it kills has
+ *    already updated depth and stencil, and the shader may rely on that
+ *    (Dolphin forces early tests for the GameCube's early Z compare and
+ *    keeps Z written when its alpha test kills the pixel);
+ *  - a write to memory: with early tests only the fragments that pass
+ *    the depth and stencil tests run the shader, without them all of
+ *    them do;
+ *  - a depth, stencil or sample mask output: panfrost drops those writes
+ *    when early tests are forced (pan_nir_lower_fs_outputs), so removing
+ *    the flag would start applying them;
+ *  - post-depth coverage, defined only with early tests.
+ */
+static bool
+early_tests_observable(nir_shader *nir)
+{
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   if (nir->info.writes_memory || nir->info.fs.post_depth_coverage)
+      return true;
+   if (nir->info.outputs_written & (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+                                    BITFIELD64_BIT(FRAG_RESULT_STENCIL) |
+                                    BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)))
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (is_demote(instr))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+#endif /* PAN_ARCH >= 10 */
 
 /*
  * The fragment shader's gl_ClipDistance input, a compact float array at
@@ -1556,6 +1602,12 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    if (!slots[0] && !slots[1])
       return;
 
+#if PAN_ARCH >= 10
+   /* Asked before the discard below is in the shader. */
+   const bool drop_early_tests =
+      nir->info.fs.early_fragment_tests && !early_tests_observable(nir);
+#endif
+
    nir_variable *in = clip_distance_input(nir, slots[1] ? 4 + slots[1]->ncomps
                                                         : slots[0]->ncomps);
 
@@ -1570,9 +1622,13 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    }
    nir_discard_if(&b, clip);
    nir->info.fs.uses_discard = true;
+#if PAN_ARCH >= 10
+   if (drop_early_tests)
+      nir->info.fs.early_fragment_tests = false;
+#endif
    nir_progress(true, impl, nir_metadata_control_flow);
 }
-#endif
+#endif /* PAN_ARCH != 9 */
 
 /* ---------------------------------------------------------------------- */
 /* Backend compile                                                         */
@@ -2127,6 +2183,8 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 #if PAN_ARCH < 9
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_stencil_tile_conv,
                nir_metadata_control_flow, NULL);
+#endif
+#if PAN_ARCH != 9
       lower_clip_distance_fs(nir, info->vs_varying_layout);
 #endif
       /* Input slots first: their count sizes the front of the driver

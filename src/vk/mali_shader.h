@@ -342,6 +342,8 @@ enum mali_v7_desc_table {
  * each of VARYING_SLOT_CLIP_DIST0 and 1 (mali_shader.c, "Clip
  * distances"). */
 #define MALI_V7_MAX_CLIP_DISTANCES 8
+/* The same on v11 (mali_shader.c, "Clip distances"). */
+#define MALI_V11_MAX_CLIP_DISTANCES 8
 
 struct mali_v7_shader_desc {
    /* Entries of each table copied from sets (the dynamic uniform buffers

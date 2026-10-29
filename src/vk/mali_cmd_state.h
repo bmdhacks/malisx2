@@ -967,13 +967,10 @@ mali_gfx_scissor_rect(const struct mali_cmd_buffer *cmd, int *minx_out, int *min
 
 #if PAN_ARCH >= 9
 
-/* The packed Scissor (64 bits) of the scissor box (mali_gfx_scissor_rect). */
+/* The packed Scissor (64 bits) of a scissor box (mali_gfx_scissor_rect). */
 static inline uint64_t
-mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
+mali_gfx_pack_scissor(int minx, int miny, int maxx, int maxy)
 {
-   int minx, miny, maxx, maxy;
-   mali_gfx_scissor_rect(cmd, &minx, &miny, &maxx, &maxy);
-
    struct mali_scissor_packed s;
    pan_pack(&s, SCISSOR, cfg) {
       cfg.scissor_minimum_x = CLAMP(minx, 0, UINT16_MAX);
@@ -982,6 +979,14 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
       cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
    }
    return s.opaque[0] | (uint64_t)s.opaque[1] << 32;
+}
+
+static inline uint64_t
+mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
+{
+   int minx, miny, maxx, maxy;
+   mali_gfx_scissor_rect(cmd, &minx, &miny, &maxx, &maxy);
+   return mali_gfx_pack_scissor(minx, miny, maxx, maxy);
 }
 
 #endif

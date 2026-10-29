@@ -32,7 +32,9 @@
 #include "mali_image.h"
 
 /* Frame shader DCD slots (panvk: colour preload 0, depth/stencil 1). On v7
- * every layer has its own three (mali_cmd_gfx.h). */
+ * every layer has its own three (mali_cmd_gfx.h). Where MALI_PRELOAD_ZS_EARLY,
+ * a pass that gets the Early ZS Always depth/stencil preload (below) has it in
+ * slot 0 and colour in slot 1, as Arm's driver lays them out. */
 #define FS_DCD_COLOR 0
 #define FS_DCD_ZS    1
 #define FS_DCD_COUNT MALI_FRAME_SHADER_DCDS
@@ -364,6 +366,10 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
       r->maxy = MIN2(ALIGN_POT(r->maxy + 1, AFBC_BLOCK), desc->height) - 1;
    }
 
+#if MALI_PRELOAD_ZS_EARLY
+   mali_cover_init(&r->cover, r->minx, r->miny, r->maxx, r->maxy);
+#endif
+
    bool any_preload = false;
    for (unsigned i = 0; i < n; i++) {
       struct mali_fb_target *t = targets[i];
@@ -549,9 +555,47 @@ sample_positions(struct mali_cmd_buffer *cmd)
    return p.gpu;
 }
 
+/* Does the depth/stencil frame shader clear inside the render area (so every
+ * tile has to be reached)? */
+static bool
+zs_preload_clears(const struct mali_fb_target *zt, const struct mali_fb_target *st)
+{
+   return (zt->image && zt->preload && zt->load == MALI_ATT_LOAD_CLEAR) ||
+          (st->image && st->preload && st->load == MALI_ATT_LOAD_CLEAR);
+}
+
+#if MALI_PRELOAD_ZS_EARLY
+/* Does the pass get the Early ZS Always depth/stencil preload (below)? */
+static bool
+zs_preload_early(const struct mali_render_state *r)
+{
+   const struct mali_fb_target *zt = &r->desc.z, *st = &r->desc.s;
+   /* Only an app load: a depth target that is preloaded just for the border
+    * of a partly covered render area stays Intersect. */
+   const bool loads = (zt->image && zt->load == MALI_ATT_LOAD_LOAD) ||
+                      (st->image && st->load == MALI_ATT_LOAD_LOAD);
+   return loads && !zs_preload_clears(zt, st) && r->verts >= MALI_PRELOAD_EARLY_MIN_VERTICES &&
+          mali_cover_most(&r->cover);
+}
+#endif
+
 /* The frame shaders of the pass: colour preload in DCD slot 0 (Intersect,
  * or Always when a clear inside the area is done by the shader), depth and
- * stencil in slot 1 (Early ZS Always), as panvk v9+. */
+ * stencil in slot 1 (Intersect, or Always for a clear inside the area).
+ *
+ * Where MALI_PRELOAD_ZS_EARLY a pass that loads depth or stencil may get
+ * Arm's layout instead: depth and stencil in slot 0 with mode Early ZS
+ * Always, colour in slot 1. A load pass over a whole 2560x2112 target takes
+ * 1.7 ms that way and 3.7 ms with the colour-first layout and Intersect, but
+ * Early ZS Always runs the preload on every tile, so a pass with a few small
+ * draws takes 0.97 ms at that size instead of 0.22 ms. It is chosen only for
+ * a pass that draws enough vertices to pay for that
+ * (MALI_PRELOAD_EARLY_MIN_VERTICES) and whose draws' scissor boxes reach at
+ * least half of the area (mali_cover_most). ARMSX2 records hundreds of
+ * passes per frame with scissor boxes over the whole target around geometry
+ * that covers a few tiles, and a scene with a few dozen draws of a few
+ * thousand vertices that does too; the scissor boxes alone cannot tell those
+ * from a scene, the amount of geometry tells them apart better. */
 static bool
 build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
                     uint64_t *dcds, enum mali_pre_post_frame_shader_mode modes[3])
@@ -561,6 +605,7 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    unsigned nctex = 0, nztex = 0;
    bool color = false, zs = false, color_always = false;
    const bool layered = r->desc.layer_count > 1;
+   unsigned color_slot = FS_DCD_COLOR, zs_slot = FS_DCD_ZS;
 
    struct mali_meta_fs_push push = {
       .area = {(int32_t)r->desc.area.offset.x, (int32_t)r->desc.area.offset.y,
@@ -620,6 +665,14 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    if (!color && !zs && !r->desc.blit)
       return true;
 
+#if MALI_PRELOAD_ZS_EARLY
+   const bool zs_early = zs && !r->desc.blit && zs_preload_early(r);
+   if (zs_early) {
+      zs_slot = 0;
+      color_slot = 1;
+   }
+#endif
+
 #if PAN_ARCH < 9
    /* v7: one triple per layer, as panvk_vX_cmd_frame_shaders.c
     * alloc_pre_post_dcds allocates before v9; each layer's FBD points at
@@ -661,26 +714,29 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
       const struct mali_shader *fs = MALI_PER_ARCH(meta_fs_get)(cmd, &ckey);
       if (!fs || !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, &ckey, &push, (const uint32_t(*)[8])ctex,
                                              nctex, NULL, true,
-                                             (uint8_t *)p.cpu + FS_DCD_COLOR * pan_size(DRAW)))
+                                             (uint8_t *)p.cpu + color_slot * pan_size(DRAW)))
          return false;
-      modes[FS_DCD_COLOR] = color_always ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
-                                         : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
+      modes[color_slot] = color_always ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
+                                       : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
    }
    if (zs) {
       const struct mali_shader *fs = MALI_PER_ARCH(meta_fs_get)(cmd, &zkey);
       if (!fs || !MALI_PER_ARCH(meta_fs_dcd)(cmd, fs, &zkey, &push, (const uint32_t(*)[8])ztex,
                                              nztex, NULL, true,
-                                             (uint8_t *)p.cpu + FS_DCD_ZS * pan_size(DRAW)))
+                                             (uint8_t *)p.cpu + zs_slot * pan_size(DRAW)))
          return false;
       /* Intersect: tiles without geometry keep their memory and need no
        * reload. panvk uses Early ZS Always (the reload runs a tile or more
        * ahead) without having measured it; on ARMSX2's many small passes it
        * reloads and writes back every tile of the render area in every
        * pass. A clear inside the area has to reach every tile. */
-      const bool zs_clears = (zt->image && zt->preload && zt->load == MALI_ATT_LOAD_CLEAR) ||
-                             (st->image && st->preload && st->load == MALI_ATT_LOAD_CLEAR);
-      modes[FS_DCD_ZS] = zs_clears ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
-                                   : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
+      const bool zs_clears = zs_preload_clears(zt, st);
+      modes[zs_slot] = zs_clears ? MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS
+                                 : MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT;
+#if MALI_PRELOAD_ZS_EARLY
+      if (zs_early)
+         modes[zs_slot] = MALI_PRE_POST_FRAME_SHADER_MODE_EARLY_ZS_ALWAYS;
+#endif
    }
    *dcds = p.gpu;
    return true;

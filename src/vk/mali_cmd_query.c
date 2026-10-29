@@ -14,8 +14,11 @@
  * the availability word to 1 once the store is done (mali_query.h for the
  * layout). The
  * store waits for the stream's earlier jobs (every iterator scoreboard
- * entry) except for a top-of-pipe stamp, and for the previous timestamp's
- * set, so stamps written by one stream never go backwards.
+ * entry) except for a top-of-pipe stamp. It does not wait for the previous
+ * timestamp's availability write (MALI_SB_DEFERRED_SYNC): on the G615 a
+ * chain of such waits behind a fragment job that has not finished stopped
+ * the queue group. Stamps of one stream still go in the order they were
+ * recorded, as its deferred instructions start in order.
  *
  * The subqueue is picked by the stage: the vertex/tiler stream for the
  * vertex-side stages and top of pipe, the compute stream for the compute
@@ -129,8 +132,7 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer,
 
    cs_move64_to(b, addr, mali_query_val_va(pool, query));
    cs_store_state(b, addr, 0, MALI_CS_STATE_TIMESTAMP,
-                  cs_defer((top ? 0 : csf->sb.all_iters_mask) | MALI_SB_MASK(MALI_SB_DEFERRED_SYNC),
-                           MALI_SB_DEFERRED_FLUSH));
+                  cs_defer(top ? 0 : csf->sb.all_iters_mask, MALI_SB_DEFERRED_FLUSH));
    cs_move64_to(b, addr, mali_query_avail_va(pool, query));
    cs_move64_to(b, one, 1);
    cs_sync64_set(b, false, MALI_CS_SYNC_SCOPE_SYSTEM, one, addr,

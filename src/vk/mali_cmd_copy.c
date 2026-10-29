@@ -157,10 +157,16 @@ build_meta_nir(struct mali_device *dev, enum mali_meta_shader m)
  * result that does not fit is clamped), then the availability, as a 32 or
  * 64-bit word each. Waiting for the queries is not the shader's: the
  * dispatch is ordered after the work that sets them (cmd_query_fence).
+ *
+ * `reports` is the number of 64-bit counters a query's value is the sum of
+ * (mali_query.h): 1 is the shader every pool had before occlusion queries
+ * on v7, which sums the entries of one shader core ID each. The count is a
+ * property of the device, so it is part of the shader, not a push constant.
  */
-static nir_shader *
-build_query_copy_nir(struct mali_device *dev)
+nir_shader *
+MALI_PER_ARCH(build_query_copy_nir)(struct mali_device *dev, unsigned reports)
 {
+   assert(reports >= 1);
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
       "mali_meta_query_copy");
@@ -188,6 +194,10 @@ build_query_copy_nir(struct mali_device *dev)
       nir_push_if(&b, nir_ior(&b, avail, partial));
       {
          nir_def *v = nir_load_global(&b, 1, 64, val_addr, .align_mul = 8);
+         for (unsigned i = 1; i < reports; i++) {
+            v = nir_iadd(&b, v, nir_load_global(&b, 1, 64, nir_iadd_imm(&b, val_addr, i * 8),
+                                                .align_mul = 8));
+         }
          nir_push_if(&b, wide);
          nir_store_global(&b, v, dst_addr, .write_mask = 1, .align_mul = 8);
          nir_push_else(&b, NULL);
@@ -213,6 +223,14 @@ build_query_copy_nir(struct mali_device *dev)
    return b.shader;
 }
 
+/* The counters per query of the device's occlusion pools that have more than
+ * one (v7: one per shader core ID, mali_query.c query_pool_alloc). */
+static unsigned
+query_copy_reports(const struct mali_device *dev)
+{
+   return MAX2(1, util_last_bit64(dev->kbase->props.shader_present));
+}
+
 static const struct mali_shader *
 get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
 {
@@ -221,8 +239,10 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
    simple_mtx_lock(&dev->meta_lock);
    struct mali_shader *s = dev->meta[m];
    if (!s) {
-      nir_shader *nir = m == MALI_META_QUERY_COPY ? build_query_copy_nir(dev)
-                                                  : build_meta_nir(dev, m);
+      const unsigned reports = m == MALI_META_QUERY_COPY_SUM ? query_copy_reports(dev) : 1;
+      nir_shader *nir = m == MALI_META_QUERY_COPY || m == MALI_META_QUERY_COPY_SUM
+                           ? MALI_PER_ARCH(build_query_copy_nir)(dev, reports)
+                           : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 
       const struct vk_pipeline_robustness_state rs = {
@@ -240,6 +260,8 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
       _mesa_blake3_init(&h);
       _mesa_blake3_update(&h, "mali-meta", 9);
       _mesa_blake3_update(&h, &m, sizeof(m));
+      if (m == MALI_META_QUERY_COPY_SUM)
+         _mesa_blake3_update(&h, &reports, sizeof(reports));
       _mesa_blake3_final(&h, key);
 
       VkResult r = MALI_PER_ARCH(shader_compile)(dev, &info, key, &s);
@@ -397,9 +419,11 @@ MALI_PER_ARCH(CmdCopyQueryPoolResultsToMemoryKHR)(VkCommandBuffer commandBuffer,
 
    if (!queryCount)
       return;
-   const struct mali_shader *s = get_meta(cmd, MALI_META_QUERY_COPY);
+   const struct mali_shader *s =
+      get_meta(cmd, pool->val_count > 1 ? MALI_META_QUERY_COPY_SUM : MALI_META_QUERY_COPY);
    if (!s)
       return;
+   assert(pool->val_count == 1 || pool->val_count == query_copy_reports(cmd->dev));
 
    /* A copy that waits is after every query operation recorded so far. */
    if (flags & VK_QUERY_RESULT_WAIT_BIT)

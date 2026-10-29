@@ -6,13 +6,16 @@
 /*
  * Query commands on the job manager (v7 and v9): vkCmdResetQueryPool,
  * vkCmdWriteTimestamp, and the occlusion queries' vkCmdBeginQuery and
- * vkCmdEndQuery. The pool object and the host reads are in mali_query.c. ARMSX2 turns GPU timing on for any device whose name is
- * not "Mali-G615", so the G57 and G52 builds need the timestamp commands;
- * the G615 build has its own (mali_cmd_query.c).
+ * vkCmdEndQuery. The pool object and the host reads are in mali_query.c.
+ * ARMSX2 turns GPU timing on for any device whose name is not
+ * "Mali-G615", so the G57 and G52 builds need the timestamp commands; the
+ * G615 build has its own (mali_cmd_query.c).
  *
  * A query is 16 bytes of host-visible, uncached device memory: the value
  * System Timestamp writes at +0, an Immediate 64 availability flag at +8
  * (our own layout; nothing reads it but our own vkGetQueryPoolResults).
+ * An occlusion query on v7 has one counter per shader core ID before its
+ * availability flag (mali_query.h).
  * Both words are Write Value jobs with the header Barrier bit (the blob's
  * own query and timestamp jobs are the same two types, same bit).
  * mali_jm_measure_begin/end (timing_jm.c) use the identical pair for
@@ -53,25 +56,30 @@ MALI_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool _poo
    if (!queryCount)
       return;
 
-   /* A few queries (ARMSX2 resets two at a time): Write Value jobs. */
-   if (queryCount <= MALI_QUERY_RESET_JOBS_MAX) {
+   /* A few queries (ARMSX2 resets two at a time): Write Value jobs, one per
+    * counter and one for the availability word. */
+   if ((uint64_t)queryCount * (pool->val_count + 1) <= 2 * MALI_QUERY_RESET_JOBS_MAX) {
       /* Not valid inside a render pass instance (Vulkan). */
       struct mali_jm_chain *c = mali_jm_cmd_vtc(cmd);
       if (!c)
          return;
       for (uint32_t i = 0; i < queryCount; i++) {
-         const uint64_t addr = mali_query_val_va(pool, firstQuery + i);
-         if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, addr, 0, true) ||
-             !mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO,
+         for (uint32_t k = 0; k < pool->val_count; k++) {
+            const uint64_t addr = mali_query_val_va(pool, firstQuery + i) + (uint64_t)k * 8;
+            if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, addr, 0, true))
+               return;
+         }
+         if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO,
                                       mali_query_avail_va(pool, firstQuery + i), 0, true))
             return;
       }
       return;
    }
 
-   /* Many (a pool of thousands is reset whole): one fill over the slots,
-    * after whatever earlier work wrote them and before whatever uses them
-    * next. */
+   /* Many (a pool of thousands is reset whole): one fill over the slots
+    * (counters, availability word and padding alike: val_stride is the
+    * slot), after whatever earlier work wrote them and before whatever uses
+    * them next. */
    MALI_PER_ARCH(cmd_query_fence)(cmd, true);
    MALI_PER_ARCH(cmd_fill_addr)(cmd, mali_query_val_va(pool, firstQuery),
                                 (uint64_t)queryCount * pool->val_stride, 0);
@@ -123,21 +131,25 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
 
 /*
  * The hardware counts. A draw's Draw descriptor names a counter (the
- * Occlusion pointer) and a mode (DCD Flags 0); the fragment job adds the
- * samples that passed to it, tile by tile, so the count is only final when
- * the fragment jobs of every pass that drew into the query have finished.
+ * Occlusion pointer) and a mode (DCD Flags 0 on v9, the Draw descriptor's
+ * Occlusion Query field on v7); the fragment job adds the samples that
+ * passed to it, tile by tile, so the count is only final when the fragment
+ * jobs of every pass that drew into the query have finished. On v7 the
+ * hardware adds into the entry of the shader core that shaded the tile, so
+ * a query has one counter per core ID and its result is their sum.
  *
- *  - Begin: a Write Value job zeroes the counter, in the open batch's vtc
- *    chain. The batch's fragment atom starts after its vtc atom, so the
- *    counter is zero before any fragment job can add to it. The draws that
- *    follow carry the counter (MALI_GFX_DIRTY_OQ).
- *  - End: the draws stop carrying it, and the availability word is set by
+ *  - Begin: Write Value jobs zero the counters (one job each), in the open
+ *    batch's vtc chain. The batch's fragment atom starts after its vtc
+ *    atom, so the counters are zero before any fragment job can add to
+ *    them. The draws that follow carry the counters (MALI_GFX_DIRTY_OQ).
+ *  - End: the draws stop carrying them, and the availability word is set by
  *    a Write Value job with the Barrier bit on the fragment chain, behind
  *    the fragment jobs recorded so far: the barrier makes it start when
  *    they are done, and it is in the same atom as they are or in a later
- *    one of the fragment slot, which runs after them. The count and the
- *    availability word are in one 16-byte slot (one cache line), so the
- *    cache clean at the end of the atom publishes both together.
+ *    one of the fragment slot, which runs after them. The counters and the
+ *    availability word are in one slot (one cache line with one counter,
+ *    mali_query.h), and the cache clean at the end of the atom publishes
+ *    them all together.
  *
  *    When the query ends inside a render pass, the pass's fragment jobs
  *    do not exist yet (the pass writes them when it ends), so the word is
@@ -178,11 +190,17 @@ MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, u
    struct mali_jm_chain *c = cmd->gfx.render.active && cmd->gfx.render.tiler
                                 ? mali_jm_cmd_pass_vtc(cmd)
                                 : mali_jm_cmd_vtc(cmd);
+   if (!c)
+      return;
    /* No Barrier bit: nothing in the chain reads or writes the counter, and
     * a barrier here would hold the pass's tiling back until every draw
-    * before it was done. */
-   if (!c || !mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, counter, 0, false))
-      return;
+    * before it was done. One job per counter (one on v9, one per shader
+    * core ID on v7). */
+   for (uint32_t k = 0; k < pool->val_count; k++) {
+      if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_ZERO, counter + (uint64_t)k * 8, 0,
+                                   false))
+         return;
+   }
 
    d->oq_addr = counter;
    d->oq_precise = flags & VK_QUERY_CONTROL_PRECISE_BIT;

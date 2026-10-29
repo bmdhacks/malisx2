@@ -159,6 +159,8 @@ enum mali_meta_shader {
    MALI_META_FILL_16,
    MALI_META_FILL_4,
    MALI_META_QUERY_COPY,  /* vkCmdCopyQueryPoolResults, one invocation per query */
+   MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
+                              * counters (v7 occlusion: one per shader core) */
    MALI_META_COUNT,
 };
 

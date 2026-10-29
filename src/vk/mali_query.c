@@ -23,6 +23,8 @@
 
 #include <string.h>
 
+#include "util/bitscan.h"
+#include "util/macros.h"
 #include "util/os_time.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
@@ -42,21 +44,33 @@ query_pool_alloc(struct mali_device *dev, struct mali_query_pool *pool, VkQueryT
    const uint32_t count = pool->vk.query_count;
 
 #if PAN_ARCH < 10
-   /* One buffer, value and availability in 16-byte slots. */
+   /* One buffer, a query's counters then its availability word in a slot
+    * of a multiple of 16 bytes: 16 for one counter. */
+   uint32_t counters = 1;
+#if PAN_ARCH == 7
+   /* Bifrost's fragment hardware counts into one 64-bit entry per shader
+    * core ID, up to the highest core present (mali_query.h). Mesa's
+    * pan_query_core_id_range. */
+   if (type == VK_QUERY_TYPE_OCCLUSION)
+      counters = MAX2(1, util_last_bit64(dev->kbase->props.shader_present));
+#endif
+   const uint32_t slot = ALIGN_POT(counters * 8 + 8, 16);
    const struct mali_kbase_alloc_info ai = {
-      .size = (uint64_t)count * 16,
+      .size = (uint64_t)count * slot,
       .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
       .mem_class = MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL,
    };
    if (mali_kbase_alloc(dev->kbase, &ai, &pool->bo) != MALI_KBASE_SUCCESS)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    memset(pool->bo.cpu, 0, ai.size);
-   pool->val_stride = pool->avail_stride = 16;
+   pool->val_stride = pool->avail_stride = slot;
+   pool->val_count = counters;
    pool->val_va = pool->bo.gpu_va;
    pool->val_cpu = pool->bo.cpu;
-   pool->avail_va = pool->bo.gpu_va + 8;
-   pool->avail_cpu = (volatile uint64_t *)((uint8_t *)pool->bo.cpu + 8);
+   pool->avail_va = pool->bo.gpu_va + counters * 8;
+   pool->avail_cpu = (volatile uint64_t *)((uint8_t *)pool->bo.cpu + counters * 8);
 #else
+   pool->val_count = 1;
    if (type == VK_QUERY_TYPE_TIMESTAMP) {
       /* Ordinary device memory, not CSF event memory (mali_query.h). A
        * 64-bit sync object is 16 bytes at a 16-byte aligned address (the
@@ -117,13 +131,6 @@ MALI_PER_ARCH(CreateQueryPool)(VkDevice _device, const VkQueryPoolCreateInfo *pC
        pCreateInfo->queryType != VK_QUERY_TYPE_OCCLUSION)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "only timestamp and occlusion query pools are supported");
-#if PAN_ARCH == 7
-   /* Bifrost's counter is one per shader core and its Draw descriptor is
-    * laid out differently; not done. */
-   if (pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION)
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "occlusion queries are not supported on this GPU");
-#endif
 
    struct mali_query_pool *pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));

@@ -803,6 +803,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxPerSetDescriptors = UINT16_MAX,
       .maxMemoryAllocationSize = max_alloc,
 
+      /* VK_KHR_timeline_semaphore: Mesa's emulated timelines
+       * (vk_sync_timeline) keep 64-bit values with no limit on the gap. */
+      .maxTimelineSemaphoreValueDifference = UINT64_MAX,
+
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,
       .conformanceVersion = { 0, 0, 0, 0 },

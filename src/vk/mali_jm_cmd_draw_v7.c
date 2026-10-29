@@ -39,8 +39,14 @@
  *    go behind its vertex attributes, the fragment shader's in the Tiler
  *    job's Attribute pointers; the set addresses and the dynamic storage
  *    buffer table go through the stage's FAU block;
- *  - no occlusion queries, no multiview, layered passes draw into layer 0
- *    (as on v9: mali_jm_cmd_draw.c's file comment).
+ *  - an occlusion query is the Tiler job's Draw descriptor: its Occlusion
+ *    pointer (the query's counters, one per shader core, mali_query.h) and
+ *    the Occlusion Query mode. A draw outside a query carries neither
+ *    (mali_jm_query.c). The query also changes the fragment RSD, whose pixel
+ *    kill and ZS update operations are chosen as if the draw wrote depth
+ *    (build_fs_rsd, mali_pipeline_state.c rsd_earlyzs);
+ *  - no multiview, layered passes draw into layer 0 (as on v9:
+ *    mali_jm_cmd_draw.c's file comment).
  *
  * Job dependencies (Mesa pan_jc.h rules): a stage whose tables were
  * rebuilt gets a descriptor copy job (a Compute job) in front of the
@@ -772,6 +778,11 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
    }
    STATIC_ASSERT(sizeof(bk->zsd) == MALI_V7_RSD_STATE_WORDS * sizeof(uint32_t));
    memcpy(&rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST], bk->zsd, sizeof(bk->zsd));
+   /* Inside an occlusion query: the properties word with the early-ZS
+    * choice made for a draw that counts samples (it is zsd[0] when the
+    * query changes nothing). */
+   if (unlikely(cmd->gfx.draw.oq_addr))
+      rsd.opaque[MALI_V7_RSD_STATE_WORD_FIRST] = bk->rsd_props_oq;
    if (per_sample_blend) {
       struct mali_multisample_misc_packed ms;
       pan_pack_nodefaults(&ms, MULTISAMPLE_MISC, cfg) {
@@ -831,7 +842,10 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       t->fs_code = bd->spd[2];
       assert(t->vs_rsd);
    }
-   if (d->dirty & (MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_BLEND | MALI_GFX_DIRTY_ZSD)) {
+   /* A query that begins or ends changes the RSD only for a shader whose
+    * early-ZS choice it changes. */
+   if ((d->dirty & (MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_BLEND | MALI_GFX_DIRTY_ZSD)) ||
+       ((d->dirty & MALI_GFX_DIRTY_OQ) && bk->rsd_props_oq != bk->zsd[0])) {
       if (!build_fs_rsd(cmd, p, bk, t))
          return false;
    }
@@ -1334,7 +1348,16 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          cfg.uniform_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_UBO];
          cfg.textures = t->fs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
          cfg.samplers = t->fs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
-         cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+         /* The counters of the query the draw is inside of (panvk:
+          * counter mode for a precise query, "did any sample pass" for the
+          * others). */
+         if (unlikely(d->oq_addr)) {
+            cfg.occlusion_query =
+               d->oq_precise ? MALI_OCCLUSION_MODE_COUNTER : MALI_OCCLUSION_MODE_PREDICATE;
+            cfg.occlusion = d->oq_addr;
+         } else {
+            cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+         }
       }
       dcd.opaque[0] |= t->dcd0;
       memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));

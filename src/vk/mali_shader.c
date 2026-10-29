@@ -1503,14 +1503,11 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
  *    (mali_pipeline_state.c earlyzs_get), so a clipped fragment writes no
  *    depth or stencil, unless the fragment shader forces early fragment
  *    tests: those are done before the shader runs, and the clipped
- *    fragment would have written depth and stencil by then. On v7 the
- *    flag stays and clipped fragments of such a shader still write depth
- *    and stencil. On v11 the flag is dropped from the shader when nothing
- *    but speed depends on it (early_tests_observable); when something
- *    does, it stays, with the same result as on v7.
+ *    fragment would have written depth and stencil by then. The flag is
+ *    dropped from the shader when nothing but speed depends on it
+ *    (early_tests_observable); when something does, it stays and clipped
+ *    fragments of such a shader still write depth and stencil.
  */
-
-#if PAN_ARCH >= 10
 
 /*
  * Whether the shader's early_fragment_tests changes anything but speed
@@ -1547,7 +1544,6 @@ early_tests_observable(nir_shader *nir)
    }
    return false;
 }
-#endif /* PAN_ARCH >= 10 */
 
 /*
  * The fragment shader's gl_ClipDistance input, a compact float array at
@@ -1602,11 +1598,9 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    if (!slots[0] && !slots[1])
       return;
 
-#if PAN_ARCH >= 10
    /* Asked before the discard below is in the shader. */
    const bool drop_early_tests =
       nir->info.fs.early_fragment_tests && !early_tests_observable(nir);
-#endif
 
    nir_variable *in = clip_distance_input(nir, slots[1] ? 4 + slots[1]->ncomps
                                                         : slots[0]->ncomps);
@@ -1622,10 +1616,8 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    }
    nir_discard_if(&b, clip);
    nir->info.fs.uses_discard = true;
-#if PAN_ARCH >= 10
    if (drop_early_tests)
       nir->info.fs.early_fragment_tests = false;
-#endif
    nir_progress(true, impl, nir_metadata_control_flow);
 }
 #endif /* PAN_ARCH != 9 */

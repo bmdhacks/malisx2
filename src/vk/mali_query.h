@@ -12,12 +12,20 @@
  * The two arrays are addressed separately (a base and a stride each)
  * because where they live differs:
  *
- *  - job manager (v7, v9): one buffer, 16-byte slots, value at +0 and
- *    availability at +8. The GPU writes both from Write Value jobs (a
- *    System Timestamp, an Immediate 64) and, for occlusion, the fragment
- *    hardware accumulates into the value word. The kernel cleans the GPU
- *    caches when an atom ends, so the host sees both once the atom has
- *    completed;
+ *  - job manager (v7, v9): one buffer, value at +0 and availability right
+ *    behind it. The GPU writes both from Write Value jobs (a System
+ *    Timestamp, an Immediate 64) and, for occlusion, the fragment hardware
+ *    accumulates into the value word. The kernel cleans the GPU caches when
+ *    an atom ends, so the host sees both once the atom has completed.
+ *    Slots are 16 bytes, value at +0 and availability at +8, except on v7
+ *    occlusion pools (below);
+ *  - v7 occlusion pools: Bifrost's fragment hardware keeps one counter per
+ *    shader core, in the entry its core ID names, so the value is val_count
+ *    counters (one for every core ID up to the highest present one:
+ *    util_last_bit64(shader_present), as Mesa's pan_query_core_id_range)
+ *    whose sum is the result. A slot is the counters at +0, the
+ *    availability word at +8 * val_count, padded to 16 bytes. With one core
+ *    this is the 16-byte slot above;
  *  - command-stream frontend (v11), timestamp pools: one buffer, 32-byte
  *    slots: the value at +0, the availability word at +16. A STORE_STATE
  *    writes the value, a SYNC_SET64 (system scope) the availability word;
@@ -68,6 +76,9 @@ struct mali_query_pool {
    uint8_t *val_cpu;
    volatile uint64_t *avail_cpu;
    uint32_t val_stride, avail_stride;
+   /* 64-bit counters at a query's value address whose sum is its result:
+    * 1, except on v7 occlusion pools (one per shader core ID). */
+   uint32_t val_count;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_query_pool, vk.base, VkQueryPool, VK_OBJECT_TYPE_QUERY_POOL)
@@ -91,10 +102,16 @@ mali_query_avail_cpu(const struct mali_query_pool *pool, uint32_t q)
                                 (uint64_t)q * pool->avail_stride);
 }
 
+/* The result of query q: the sum of its counters. */
 static inline uint64_t
 mali_query_val_cpu(const struct mali_query_pool *pool, uint32_t q)
 {
-   return *(const volatile uint64_t *)(pool->val_cpu + (uint64_t)q * pool->val_stride);
+   const volatile uint64_t *v =
+      (const volatile uint64_t *)(pool->val_cpu + (uint64_t)q * pool->val_stride);
+   uint64_t sum = 0;
+   for (uint32_t i = 0; i < pool->val_count; i++)
+      sum += v[i];
+   return sum;
 }
 
 /* vkCmdResetQueryPool zeroes at most this many queries with Write Value
@@ -120,6 +137,15 @@ MALI_PER_ARCH_DECL(void, cmd_query_fence, (struct mali_cmd_buffer *cmd, bool bef
  * mali_cmd_query.c). Called whether or not the pass had fragment work.
  */
 MALI_PER_ARCH_DECL(void, cmd_oq_pass_end, (struct mali_cmd_buffer *cmd));
+
+/*
+ * The NIR of vkCmdCopyQueryPoolResults' shader (mali_cmd_copy.c), for a pool
+ * whose queries are each the sum of `reports` counters; exported for the
+ * host tests, which run it.
+ */
+struct nir_shader;
+MALI_PER_ARCH_DECL(struct nir_shader *, build_query_copy_nir,
+                   (struct mali_device *dev, unsigned reports));
 
 /*
  * Fills size bytes at the GPU address addr with the 32-bit word `value`,

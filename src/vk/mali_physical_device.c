@@ -466,9 +466,9 @@ get_features(struct vk_features *f, uint32_t arch)
        * shader tests and discards on (mali_shader.c, "Clip distances").
        * The test is per pixel, at the pixel centre, so under
        * multisampling the clipped edge is not antialiased; and with a
-       * fragment shader that forces early fragment tests (on v11, one that
-       * also discards or writes memory, depth or stencil), clipped
-       * fragments still write depth and stencil. Cull distances are not
+       * fragment shader that forces early fragment tests and also
+       * discards or writes memory, depth or stencil, clipped fragments
+       * still write depth and stencil. Cull distances are not
        * supported. */
       .shaderClipDistance = arch == 7 || arch == 11,
       .fillModeNonSolid = false,

@@ -19,16 +19,22 @@
  *    caches when an atom ends, so the host sees both once the atom has
  *    completed;
  *  - command-stream frontend (v11), timestamp pools: one buffer of CSF
- *    event memory, same 16-byte slots. Event memory is mapped uncached
- *    for the GPU where the platform is not coherent, so a STORE_STATE or a
- *    SYNC_SET64 into it is visible to the host at once, with no cache
- *    maintenance in the stream;
+ *    event memory, 32-byte slots: the value at +0, the availability word
+ *    at +16. Event memory is mapped uncached for the GPU where the
+ *    platform is not coherent, so a STORE_STATE or a SYNC_SET64 into it is
+ *    visible to the host at once, with no cache maintenance in the stream;
  *  - v11 occlusion pools: the counters in ordinary GPU-cached memory (the
  *    fragment hardware adds to them from every shader core, which wants
  *    the L2 cache to do the atomics), 8 bytes each, and the availability
- *    words in a second buffer of event memory, 8 bytes each. The stream
+ *    words in a second buffer of event memory, 16 bytes each. The stream
  *    cleans the caches before it sets an availability word, so a host
  *    that sees availability sees the counter.
+ *
+ * On v11 the availability word is a 64-bit sync object, the target of a
+ * SYNC_SET64: 16 bytes at a 16-byte aligned address (the value, then an
+ * error word the driver leaves alone). A SYNC_SET64 anywhere else stops the
+ * queue group with CS_INVALID_INSTRUCTION, which is why the strides are not
+ * 8 and the availability word is not at +8.
  */
 
 #ifndef MALI_QUERY_H

@@ -11,8 +11,8 @@
  *
  * A timestamp is two deferred instructions on one subqueue's stream:
  * STORE_STATE{Timestamp} into the query's value word, then SYNC_SET64 of
- * the availability word to 1 once the store is done. Both words are in CSF
- * event memory (mali_query.h), so the host sees them as they land. The
+ * the availability word to 1 once the store is done (mali_query.h for the
+ * layout). The
  * store waits for the stream's earlier jobs (every iterator scoreboard
  * entry) except for a top-of-pipe stamp, and for the previous timestamp's
  * set, so stamps written by one stream never go backwards.
@@ -146,8 +146,8 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer,
  * the fragment job adds the samples that passed to the counter, tile by
  * tile, so the count is only final when the fragment job of every pass that
  * drew into the query has finished. The counters are in ordinary GPU-cached
- * memory (the adds are atomic in L2), the availability words in event memory
- * (mali_query.h).
+ * memory (the adds are atomic in L2), the availability words in a buffer of
+ * their own (mali_query.h).
  *
  *  - Begin: the fragment stream stores a zero into the counter and waits for
  *    the store. The pass's RUN_FRAGMENT comes later in that stream, so it

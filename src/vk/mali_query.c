@@ -58,15 +58,14 @@ query_pool_alloc(struct mali_device *dev, struct mali_query_pool *pool, VkQueryT
    pool->avail_cpu = (volatile uint64_t *)((uint8_t *)pool->bo.cpu + 8);
 #else
    if (type == VK_QUERY_TYPE_TIMESTAMP) {
-      /* Event memory: a STORE_STATE and a SYNC_SET64 land where the host
-       * reads them, whatever the platform's coherency (mali_query.h). A
+      /* Ordinary device memory, not CSF event memory (mali_query.h). A
        * 64-bit sync object is 16 bytes at a 16-byte aligned address (the
        * stream faults with CS_INVALID_INSTRUCTION on any other), so the
        * slot is 32 bytes: the value, then the availability object. */
       const struct mali_kbase_alloc_info ai = {
          .size = (uint64_t)count * 32,
-         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_INTERNAL_CSF_EVENT),
-         .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL,
+         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
+         .mem_class = MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL,
       };
       if (mali_kbase_alloc(dev->kbase, &ai, &pool->bo) != MALI_KBASE_SUCCESS)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -86,8 +85,8 @@ query_pool_alloc(struct mali_device *dev, struct mali_query_pool *pool, VkQueryT
        * above. */
       const struct mali_kbase_alloc_info ai = {
          .size = (uint64_t)count * 16,
-         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_INTERNAL_CSF_EVENT),
-         .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL,
+         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
+         .mem_class = MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL,
       };
       if (mali_kbase_alloc(dev->kbase, &vi, &pool->bo) != MALI_KBASE_SUCCESS)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;

@@ -18,17 +18,22 @@
  *    hardware accumulates into the value word. The kernel cleans the GPU
  *    caches when an atom ends, so the host sees both once the atom has
  *    completed;
- *  - command-stream frontend (v11), timestamp pools: one buffer of CSF
- *    event memory, 32-byte slots: the value at +0, the availability word
- *    at +16. Event memory is mapped uncached for the GPU where the
- *    platform is not coherent, so a STORE_STATE or a SYNC_SET64 into it is
- *    visible to the host at once, with no cache maintenance in the stream;
- *  - v11 occlusion pools: the counters in ordinary GPU-cached memory (the
+ *  - command-stream frontend (v11), timestamp pools: one buffer, 32-byte
+ *    slots: the value at +0, the availability word at +16. A STORE_STATE
+ *    writes the value, a SYNC_SET64 (system scope) the availability word;
+ *    the host sees the value once it sees the availability word;
+ *  - v11 occlusion pools: the counters in one buffer, 8 bytes each (the
  *    fragment hardware adds to them from every shader core, which wants
- *    the L2 cache to do the atomics), 8 bytes each, and the availability
- *    words in a second buffer of event memory, 16 bytes each. The stream
- *    cleans the caches before it sets an availability word, so a host
- *    that sees availability sees the counter.
+ *    the L2 cache to do the atomics), and the availability words in a
+ *    second buffer, 16 bytes each. The stream cleans the caches before it
+ *    sets an availability word, so a host that sees availability sees the
+ *    counter.
+ *
+ * All of it is ordinary device memory. CSF event memory (the flag the
+ * queue's own sync objects use) would let the stream's writes reach the
+ * host without going through the GPU caches, but a shader reads zeros from
+ * it on the G615: vkCmdCopyQueryPoolResults, which reads the availability
+ * words in a shader, saw every query as unavailable.
  *
  * On v11 the availability word is a 64-bit sync object, the target of a
  * SYNC_SET64: 16 bytes at a 16-byte aligned address (the value, then an

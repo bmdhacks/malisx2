@@ -195,6 +195,8 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
       vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    mali_device_keys_finish(dev);
    if (dev->kbase) {
+      if (!mali_arch_is_jm(mali_device_physical(dev)->arch))
+         mali_event_pool_finish(dev);
       mali_bo_pool_finish(&dev->desc_pool);
       mali_bo_pool_finish(&dev->exec_pool);
    }
@@ -323,6 +325,8 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
     * identical shaders through the device's own in-memory cache. */
    mali_bo_pool_init_exec(&dev->exec_pool, dev->kbase);
    mali_bo_pool_init_desc(&dev->desc_pool, dev->kbase);
+   if (!mali_arch_is_jm(pdev->arch))
+      mali_event_pool_init(dev);
    mali_device_keys_init(dev);
    /* Frontend-neutral device state: every path below this point that can
     * fail calls device_destroy, which tears this down again, so it must

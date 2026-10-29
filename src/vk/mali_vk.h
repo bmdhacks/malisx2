@@ -281,9 +281,19 @@ struct mali_device {
       uint32_t shaders_compiled;
       uint32_t shader_cache_hits;
    } pipeline_stats;
+
+   /* VkEvent words (mali_event.h), host-visible. Command-stream frontend
+    * (v11) only; set up by mali_event_pool_init. */
+   struct mali_bo_pool event_pool;
 };
 
 VK_DEFINE_HANDLE_CASTS(mali_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+/* The event pool (mali_event.c, v11 only): set up after the kbase context
+ * exists, torn down before it goes. Slabs are allocated by the first
+ * event. */
+void mali_event_pool_init(struct mali_device *dev);
+void mali_event_pool_finish(struct mali_device *dev);
 
 /*
  * The job-manager back half (v7 and v9), as code built once (mali_device.c,

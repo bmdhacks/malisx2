@@ -172,8 +172,11 @@ malisx2_vk = static_library(
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
         'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
   # Command buffers, the CSF queue, submit and sync.
-  files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_queue.c',
-        'vk/mali_sync.c'),
+  files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
+        'vk/mali_queue.c', 'vk/mali_sync.c'),
+  # VkEvent (v11): the host side and the object; the vkCmd* commands are
+  # mali_cmd_event.c above.
+  files('vk/mali_event.c'),
   # Render passes and draws (the CSF side; the shared builders and the
   # image transfers are per-arch files).
   files('vk/mali_cmd_draw.c', 'vk/mali_cmd_render.c'),

@@ -878,6 +878,22 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          cfg.multisample_enable = msaa;
          cfg.occlusion_query = oq ? MALI_OCCLUSION_MODE_COUNTER : MALI_OCCLUSION_MODE_DISABLED;
          cfg.alpha_to_coverage = a2c;
+         /* Allow primitive reorder: the tiler may then sort a draw's own
+          * primitives by depth, which saves shading where a draw overdraws
+          * itself. Arm's driver sets exactly this bit on its depth-tested,
+          * depth-writing draws whose destination it does not read (captured
+          * v9 draw state, 2026-10-29); the decompilation of the same choice
+          * on the G615 adds a Less/Lequal/Greater/Gequal depth function, no
+          * stencil test and no occlusion query. Nothing observes the order
+          * when no target blends against the destination and the depth test
+          * picks the winner. */
+         cfg.allow_primitive_reorder =
+            has_depth(in->rp) && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable &&
+            (dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS_OR_EQUAL ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER ||
+             dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL) &&
+            !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read;
          cfg.scissor_to_bounding_box = true;
 #if PAN_ARCH >= 10
          cfg.conservative_rast_mode =

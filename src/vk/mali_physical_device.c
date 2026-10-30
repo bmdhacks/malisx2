@@ -1029,7 +1029,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
                 "one this driver was built for (arch %u, arch 9, or the "
-                "Mali-G52 of arch 7)", path,
+                "Mali-G52 or Mali-G76 of arch 7)", path,
                 pdev->props.product_id, pdev->props.arch_major, MALI_PAN_ARCH);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;

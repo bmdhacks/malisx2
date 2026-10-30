@@ -162,19 +162,27 @@ v9_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 }
 
 /*
- * Arch 7 (Bifrost, job manager): product major 2 is the Mali-G52, accepted
- * at any arch minor and revision. Mesa's model table names arch minor 2
- * "G52" and 4 "G52 r1"; the two differ in tile buffer size
- * (tilebuf_budget). The other arch 7 parts (G51, G76, G31) are not
- * supported, and physical_device_create skips them.
+ * Arch 7 (Bifrost, job manager): the accepted parts are keyed by the
+ * (arch major, arch minor, product major) fields of the kbase product id.
+ * The Mali-G52 is product major 2, accepted at any arch minor and revision;
+ * Mesa's model table names arch minor 2 "G52" and 4 "G52 r1"; the two differ
+ * in tile buffer size (tilebuf_budget). The Mali-G76 measures as product id
+ * 0x7211, matching Mesa's PAN_PROD_ID(7, 2, 1), and is accepted at any
+ * revision. The other arch 7 parts (G51, G31) are not supported, and
+ * physical_device_create skips them.
  */
 static bool
 v7_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
-   if ((p->product_id & 0xf00f) != 0x7002)
-      return false;
-   snprintf(buf, size, "Mali-G52");
-   return true;
+   if ((p->product_id & 0xf00f) == 0x7002) {
+      snprintf(buf, size, "Mali-G52");
+      return true;
+   }
+   if ((p->product_id & 0xff0f) == 0x7201) {
+      snprintf(buf, size, "Mali-G76");
+      return true;
+   }
+   return false;
 }
 
 bool

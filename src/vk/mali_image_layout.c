@@ -64,6 +64,13 @@ mali_afbc_mode(enum pipe_format format)
    case PIPE_FORMAT_R8G8B8A8_UINT:
    case PIPE_FORMAT_R8G8B8A8_SINT:
    case PIPE_FORMAT_Z32_FLOAT:
+   /* The channel order of a BGRA target is the render target's and the texture's
+    * swizzle, not the compression's (pan_afbc_unswizzled_format: "We handle
+    * swizzling orthogonally to AFBC"). A 24-bit depth plane is 32 bits with 8
+    * unused (pan_afbc_format: Z24X8 is R8G8B8A8). */
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_Z24X8_UNORM:
       return MALI_AFBC_R8G8B8A8;
    case PIPE_FORMAT_R10G10B10A2_UNORM:
    case PIPE_FORMAT_R10G10B10A2_UINT:

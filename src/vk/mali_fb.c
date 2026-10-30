@@ -32,9 +32,11 @@
 #include "mali_image.h"
 
 /* Frame shader DCD slots (panvk: colour preload 0, depth/stencil 1). On v7
- * every layer has its own three (mali_cmd_gfx.h). Where MALI_PRELOAD_ZS_EARLY,
- * a pass that gets the Early ZS Always depth/stencil preload (below) has it in
- * slot 0 and colour in slot 1, as Arm's driver lays them out. */
+ * every layer has its own three (mali_cmd_gfx.h). From v10 a pass that loads
+ * both colour and depth/stencil has them the other way round, depth/stencil
+ * in slot 0 and colour in slot 1, as Arm's driver lays them out on the G615;
+ * so does, where MALI_PRELOAD_ZS_EARLY, a pass that gets the Early ZS Always
+ * depth/stencil preload (both below). */
 #define FS_DCD_COLOR 0
 #define FS_DCD_ZS    1
 #define FS_DCD_COUNT MALI_FRAME_SHADER_DCDS
@@ -582,6 +584,8 @@ zs_preload_early(const struct mali_render_state *r)
 /* The frame shaders of the pass: colour preload in DCD slot 0 (Intersect,
  * or Always when a clear inside the area is done by the shader), depth and
  * stencil in slot 1 (Intersect, or Always for a clear inside the area).
+ * From v10 a pass that loads both has depth and stencil in slot 0 and colour
+ * in slot 1 (below).
  *
  * Where MALI_PRELOAD_ZS_EARLY a pass that loads depth or stencil may get
  * Arm's layout instead: depth and stencil in slot 0 with mode Early ZS
@@ -665,11 +669,27 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    if (!color && !zs && !r->desc.blit)
       return true;
 
+#if PAN_ARCH >= 10
+   /* A pass that loads colour and depth/stencil: Arm's driver on the G615 puts
+    * the depth/stencil preload in slot 0 and the colour preload in slot 1
+    * (the framebuffer descriptors of its command streams); panvk has them the
+    * other way round. hakuX's two loading passes a frame were 1.05 to 1.15
+    * times as long with panvk's order. Arm's slot 0 is in mode Early ZS
+    * Intersect; that is not done here: the same mode made ARMSX2's Dirge of
+    * Cerberus dump 1.21 times slower at 2x. A pass that loads only colour,
+    * and the blit pass, keep panvk's slots (Arm puts its colour shader in
+    * slot 1 there too; not measured). */
+   if (!r->desc.blit && color && zs) {
+      zs_slot = FS_DCD_COLOR;
+      color_slot = FS_DCD_ZS;
+   }
+#endif
+
 #if MALI_PRELOAD_ZS_EARLY
    const bool zs_early = zs && !r->desc.blit && zs_preload_early(r);
    if (zs_early) {
-      zs_slot = 0;
-      color_slot = 1;
+      zs_slot = FS_DCD_COLOR;
+      color_slot = FS_DCD_ZS;
    }
 #endif
 

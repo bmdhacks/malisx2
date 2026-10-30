@@ -27,9 +27,11 @@
  * "stage" is the runtime's hash of the stage create info (SPIR-V, entry
  * point, specialization, flags, robustness). The fragment shader is
  * compiled against the vertex shader's varying layout, so its key includes
- * the vertex stage. The vertex shader is not specialized on the fragment
- * shader: it reads the noperspective mask from a system value, so one
- * compiled vertex shader serves every pipeline that uses it.
+ * the vertex stage. The vertex shader is specialized on which generic
+ * varyings the fragment shader reads (strip_unused_outputs), so its key
+ * includes that mask; it reads the noperspective mask from a system value, so
+ * one compiled vertex shader serves every pipeline whose fragment shader reads
+ * the same varyings.
  */
 
 #ifndef PAN_ARCH
@@ -146,6 +148,9 @@ struct stage {
    struct mali_shader *shader;
    bool cache_hit;
    int64_t duration_ns;
+   /* Vertex stage: the generic varying slots the fragment stage reads (~0: all, for a
+    * pipeline whose fragment stage is unknown). */
+   uint64_t keep_outputs;
 };
 
 static struct vk_pipeline_cache *
@@ -161,6 +166,7 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
            struct stage *st)
 {
    memset(st, 0, sizeof(*st));
+   st->keep_outputs = ~0ull;
    st->info = info;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &st->rs,
                                      pipeline_pNext, info->pNext);
@@ -284,6 +290,65 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
    simple_mtx_unlock(&lock);
 }
 
+/* The varying slots a fragment shader reads, from its input variables and any lowered loads. */
+static uint64_t
+fs_input_mask(nir_shader *nir)
+{
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   uint64_t m = nir->info.inputs_read;
+   nir_foreach_shader_in_variable(var, nir)
+      m |= BITFIELD64_RANGE(var->data.location,
+                            MAX2(glsl_count_vec4_slots(var->type, true, false), 1));
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
+            if (i->intrinsic == nir_intrinsic_load_input ||
+                i->intrinsic == nir_intrinsic_load_interpolated_input ||
+                i->intrinsic == nir_intrinsic_load_per_vertex_input) {
+               const nir_io_semantics sem = nir_intrinsic_io_semantics(i);
+               m |= BITFIELD64_RANGE(sem.location, MAX2(sem.num_slots, 1));
+            }
+         }
+      }
+   }
+   return m;
+}
+
+/*
+ * The cross-stage dead-varying elimination panvk lacks: the generic vertex outputs
+ * (VARYING_SLOT_VAR0..31) that the fragment shader does not read become temporaries and
+ * their stores go, so the vertex shader writes, and the varying buffer holds, only what the
+ * fragment shader reads. Arm's driver does the same: hakuX's vertex shader writes nine
+ * outputs (144 bytes a vertex) and its fragment shaders read one or two; with all nine in
+ * the buffer a 224k-vertex pass took 0.25 ms longer a frame
+ * (docs/bringup/hakux-g615-gpu-2026-10-29.md).
+ */
+static void
+strip_unused_outputs(nir_shader *nir, uint64_t keep)
+{
+   bool progress = false;
+   nir_foreach_shader_out_variable_safe(var, nir) {
+      const int loc = var->data.location;
+      if (loc < VARYING_SLOT_VAR0 || loc > VARYING_SLOT_VAR31)
+         continue;
+      const unsigned slots = glsl_count_vec4_slots(var->type, false, false);
+      if (BITFIELD64_RANGE(loc, MAX2(slots, 1)) & keep)
+         continue;
+      var->data.mode = nir_var_shader_temp;
+      exec_node_remove(&var->node);
+      exec_list_push_tail(&nir->variables, &var->node);
+      progress = true;
+   }
+   if (!progress)
+      return;
+   nir_fixup_deref_modes(nir);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
 static VkResult
 stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
               VkPipelineCreateFlags2KHR flags, struct stage *st,
@@ -296,6 +361,8 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    VkResult result = stage_to_nir(dev, flags, st);
    if (result != VK_SUCCESS)
       return result;
+   if (st->keep_outputs != ~0ull && st->nir->info.stage == MESA_SHADER_VERTEX)
+      strip_unused_outputs(st->nir, st->keep_outputs);
 
    const struct mali_shader_compile_info info = {
       .nir = st->nir,
@@ -709,6 +776,19 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    if (result != VK_SUCCESS)
       return result;
 
+   /* The vertex shader is specialized on which generic varyings the fragment shader reads (a
+    * vertex shader without a fragment stage writes none). The fragment stage's NIR is kept
+    * for its own compile. */
+   if (fs) {
+      result = stage_to_nir(dev, flags, fs);
+      if (result != VK_SUCCESS)
+         goto out;
+      const uint64_t reads = fs_input_mask(fs->nir);
+      vs->keep_outputs = reads ? reads : ~0ull;   /* found none: keep every output */
+   } else {
+      vs->keep_outputs = 0;
+   }
+
    /* Keys. */
    struct mesa_blake3 h;
    const uint32_t view_mask = state.mv ? state.mv->view_mask : 0;
@@ -718,6 +798,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
    hash_layout(&h, layout);
    _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+   _mesa_blake3_update(&h, &vs->keep_outputs, sizeof(vs->keep_outputs));
    _mesa_blake3_final(&h, vs->key);
 
    if (fs) {

@@ -686,11 +686,13 @@ build_frame_shaders(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
 #endif
 
 #if MALI_PRELOAD_ZS_EARLY
+   /* EARLY_ZS_ALWAYS keeps panvk's slots: the depth/stencil preload stays
+    * in DCD slot 1. Swapping it into colour slot 0 (which Arm's v10+ streams
+    * do for Early ZS Intersect) corrupts the depth target on v9: hakuX's
+    * 128x128 shadow map came out as binary noise, and the projected shadow
+    * was a solid 0/255 block over the character. With panvk's slots the
+    * same frame has no noise, and the depth target reads back correctly. */
    const bool zs_early = zs && !r->desc.blit && zs_preload_early(r);
-   if (zs_early) {
-      zs_slot = FS_DCD_COLOR;
-      color_slot = FS_DCD_ZS;
-   }
 #endif
 
 #if PAN_ARCH < 9

@@ -415,10 +415,41 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_create_renderpass2 = true,
 };
 
+/*
+ * v7 (Bifrost) offers, as extensions of its Vulkan 1.1 device, what it
+ * has of what 1.2 and 1.3 made core: synchronization2 (the driver's
+ * barrier and submit are the 2 forms; the runtime has the 1.0 ones), the
+ * dynamic states of VK_EXT_extended_dynamic_state and _2 and vertex input
+ * dynamic state (pipelines with dynamic state repack their words at the
+ * draw, mali_cmd_state.h mali_gfx_update_dirty), descriptor indexing,
+ * private data (runtime) and demote to helper invocation (Mesa's Bifrost
+ * backend). The device stays 1.1: 1.2 and 1.3 also require host query
+ * reset, buffer device address, maintenance4, inline uniform blocks and
+ * subgroup size control, which v7 does not have. Other arches are as
+ * before.
+ */
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+   if (arch == 7) {
+      /* Reads of the bound colour and depth attachments inside a dynamic
+       * rendering pass: input attachments are tile reads already
+       * (mali_nir_lower_input_attachments.c, panvk's scheme, with the
+       * input attachment map from the runtime's
+       * vkCmdSetRenderingInputAttachmentIndices), and a by-region
+       * barrier inside a pass is a draw with a primitive barrier
+       * (mali_jm_cmd_buffer.c). */
+      ext.KHR_dynamic_rendering_local_read = true;
+      ext.KHR_synchronization2 = true;
+      ext.EXT_extended_dynamic_state = true;
+      ext.EXT_extended_dynamic_state2 = true;
+      ext.EXT_vertex_input_dynamic_state = true;
+      ext.EXT_shader_demote_to_helper_invocation = true;
+      ext.EXT_descriptor_indexing = true;
+      ext.KHR_maintenance3 = true;
+      ext.EXT_private_data = true;
+   }
    return ext;
 }
 
@@ -561,6 +592,34 @@ get_features(struct vk_features *f, uint32_t arch)
        * and which requires all three names. */
       .dynamicRendering = true,
    };
+
+   if (arch == 7) {
+      /* The extensions of device_extensions_for_arch on v7. */
+      f->synchronization2 = true;
+      f->privateData = true;
+      f->shaderDemoteToHelperInvocation = true;
+      f->dynamicRenderingLocalRead = true;
+      /* VK_EXT_extended_dynamic_state, _2 and vertex input dynamic
+       * state: the runtime keeps the state; a pipeline with dynamic
+       * state repacks its words from it at the draw. No logic op and no
+       * patch control points (no logicOp, no tessellation). */
+      f->extendedDynamicState = true;
+      f->extendedDynamicState2 = true;
+      f->extendedDynamicState2LogicOp = false;
+      f->extendedDynamicState2PatchControlPoints = false;
+      f->vertexInputDynamicState = true;
+      /* Descriptor indexing (VK_EXT_descriptor_indexing), the part hakuX uses.
+       * v7 copies a stage's descriptors from the sets into its tables by
+       * a copy job when the draw runs, so writes after the bind are what
+       * it copies; unwritten descriptors are copied but not read; non-
+       * uniform indices are lowered to loops (mali_shader.c). The update-
+       * after-bind limits are the ordinary ones (get_properties), which
+       * on v7 are far below a bindless table. */
+      f->runtimeDescriptorArray = true;
+      f->descriptorBindingPartiallyBound = true;
+      f->descriptorBindingSampledImageUpdateAfterBind = true;
+      f->shaderSampledImageArrayNonUniformIndexing = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -877,6 +936,40 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetSampledImages = UINT16_MAX;
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
+
+      /* Descriptor indexing (get_features): update-after-bind limits are
+       * the ordinary ones. */
+      props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
+      props->shaderSampledImageArrayNonUniformIndexingNative = false;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
+      props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+         props->maxPerStageDescriptorUniformBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+         props->maxPerStageDescriptorStorageBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages =
+         props->maxPerStageDescriptorSampledImages;
+      props->maxPerStageDescriptorUpdateAfterBindStorageImages =
+         props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageDescriptorUpdateAfterBindInputAttachments =
+         props->maxPerStageDescriptorInputAttachments;
+      props->maxPerStageUpdateAfterBindResources = props->maxPerStageResources;
+      props->maxDescriptorSetUpdateAfterBindSamplers = props->maxDescriptorSetSamplers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffers = props->maxDescriptorSetUniformBuffers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+         props->maxDescriptorSetUniformBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffers = props->maxDescriptorSetStorageBuffers;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+         props->maxDescriptorSetStorageBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindSampledImages = props->maxDescriptorSetSampledImages;
+      props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
+      props->maxDescriptorSetUpdateAfterBindInputAttachments =
+         props->maxDescriptorSetInputAttachments;
+
+      /* VK_EXT_extended_dynamic_state3 is not offered; local read's two
+       * dynamic attachment maps are the runtime's. VK_EXT_vertex_input
+       * dynamic state has no properties. */
+      props->dynamicRenderingLocalReadDepthStencilAttachments = true;
+      props->dynamicRenderingLocalReadMultisampledAttachments = false;
    }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);

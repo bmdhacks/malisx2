@@ -1124,6 +1124,8 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
       }
       dev->stats.submits++;
       pthread_cond_broadcast(&dev->cond);
+      if (dev->stats.submits % MALI_JM_HEAP_CHECK_PERIOD == 1)
+         mali_jm_heap_check(jd, q->seq);
    }
 
    char copy[sizeof(jd->fault_msg)];

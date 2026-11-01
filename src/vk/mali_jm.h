@@ -619,6 +619,9 @@ void mali_jm_heap_finish(struct mali_jm_device *jd);
  * b->heap_desc). False on failure, with the command buffer's error set. */
 bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 
+/* Log the heap regions that grew since the last call. */
+void mali_jm_heap_check(struct mali_jm_device *jd, uint64_t seq);
+
 #if PAN_ARCH < 9
 /* ---------------------------------------------------------------------- */
 /* Bifrost descriptor tables (mali_jm_desc_v7.c)                           */
@@ -844,16 +847,29 @@ struct mali_jm_atom_info {
  * commit the gaps between them): GPU read/write, no CPU access,
  * TILER_ALIGN_TOP, 2 MiB committed, 2 MiB growth steps, 256 MiB of VA (the
  * T820 blob's big JIT heaps are 360 MiB).
+ *
+ * v7 has MALI_JM_HEAP_SLOTS_V7 slots: an application that ends each render
+ * pass with a barrier (hakuX's render-to-texture passes) makes each pass a
+ * batch of its own, so the ring's depth is how many passes the tiling can
+ * run ahead of the fragment work, and hakuX's frames are 30 to 40 passes,
+ * most of them small. With 4 the vtc slot waited for the fragment work
+ * three passes back about as often as it ran ahead.
  */
 #define MALI_JM_HEAP_SLOTS_MAX 32
 #define MALI_JM_HEAP_SLOTS 4
+#define MALI_JM_HEAP_SLOTS_V7 16
 #define MALI_JM_HEAP_CHUNK (2ull << 20)
 #define MALI_JM_HEAP_SLOT_SIZE (256ull << 20)
+/* Backed when a region is allocated (mali_jm_heap.c); the debug switch
+ * "heapgrow" leaves only the first chunk backed. */
+#define MALI_JM_HEAP_PRECOMMIT (8ull << 20)
+#define MALI_JM_HEAP_CHECK_PERIOD 64
 
 struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
-   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS];
+   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS_MAX];
+   uint64_t committed[MALI_JM_HEAP_SLOTS_MAX]; /* backed bytes when last checked */
 };
 
 #define MALI_JM_EVENTS_PER_READ 32

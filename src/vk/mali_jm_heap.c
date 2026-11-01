@@ -5,12 +5,12 @@
 
 /*
  * The tiler heap ring of the job-manager (v7 and v9) back half:
- * MALI_JM_HEAP_SLOTS growable GPU regions the tiler allocates polygon lists
- * from, and on v9 vertex packets too (mali_jm.h has the scheme). The
- * driver owns the memory and writes the Tiler Heap descriptor itself when
- * it records, as Mesa's gallium driver does; there is no JIT allocation
- * and no GPU job that sets the heap up. What the heap must look like to
- * the GPU:
+ * HEAP_SLOTS growable GPU regions (4, 16 on v7) the tiler allocates
+ * polygon lists from, and on v9 vertex packets too (mali_jm.h has the
+ * scheme). The driver owns the memory and writes the Tiler Heap descriptor
+ * itself when it records, as Mesa's gallium driver does; there is no JIT
+ * allocation and no GPU job that sets the heap up. What the heap must look
+ * like to the GPU:
  *
  *  - Size: the region's size; Base and Bottom: its start;
  *  - Top: the end of the first 2 MiB chunk, not the end of the region. The
@@ -40,6 +40,13 @@
 #include "util/log.h"
 #include "vk_log.h"
 
+/* The ring's size on this arch (mali_jm.h). */
+#if PAN_ARCH < 9
+#define HEAP_SLOTS MALI_JM_HEAP_SLOTS_V7
+#else
+#define HEAP_SLOTS MALI_JM_HEAP_SLOTS
+#endif
+
 void
 mali_jm_heap_init(struct mali_jm_device *jd)
 {
@@ -50,7 +57,7 @@ mali_jm_heap_init(struct mali_jm_device *jd)
 void
 mali_jm_heap_finish(struct mali_jm_device *jd)
 {
-   for (unsigned i = 0; i < MALI_JM_HEAP_SLOTS; i++) {
+   for (unsigned i = 0; i < HEAP_SLOTS; i++) {
       if (jd->heap.bo[i].size)
          mali_kbase_free(jd->kb, &jd->heap.bo[i]);
    }
@@ -59,11 +66,11 @@ mali_jm_heap_finish(struct mali_jm_device *jd)
 
 /* A slot's memory: GPU-only and growable. On a 64-bit job-manager context
  * the kernel makes it SAME_VA, so mali_kbase_alloc maps it whole with no CPU
- * access (PROT_NONE) to get its address; 4 slots take 1 GiB of the
- * process's address space and commit 2 MiB each until the tiler grows
- * them. */
+ * access (PROT_NONE) to get its address; each slot takes 256 MiB of the
+ * process's address space and commits 2 MiB until the tiler grows it (or
+ * MALI_JM_HEAP_PRECOMMIT, below). */
 static bool
-slot_alloc(struct mali_jm_device *jd, struct mali_kbase_bo *bo)
+slot_alloc(struct mali_jm_device *jd, unsigned slot, struct mali_kbase_bo *bo)
 {
    const struct mali_kbase_alloc_info ai = {
       .size = MALI_JM_HEAP_SLOT_SIZE,
@@ -83,7 +90,46 @@ slot_alloc(struct mali_jm_device *jd, struct mali_kbase_bo *bo)
                 (unsigned long long)(MALI_JM_HEAP_SLOT_SIZE >> 20));
       return false;
    }
+   /* Back the first MALI_JM_HEAP_PRECOMMIT now (the kernel takes at most
+    * one growth step as the initial commit of a TILER_ALIGN_TOP region),
+    * so that ordinary frames never fault on the heap. A GROW_ON_GPF fault
+    * stalls the GPU while the kernel finds the pages, which with the
+    * system short of memory can take long. Not fatal if the kernel
+    * refuses: the tiler then grows the region as before. */
+   /* The first MALI_JM_HEAP_SLOTS only: v7's further slots (mali_jm.h)
+    * mostly take small passes and grow if a big one needs more. */
+   if (MALI_JM_HEAP_PRECOMMIT > MALI_JM_HEAP_CHUNK && slot < MALI_JM_HEAP_SLOTS &&
+       !mali_debug_flag("heapgrow") &&
+       mali_kbase_mem_commit(jd->kb, bo, MALI_JM_HEAP_PRECOMMIT / KB_PAGE_SIZE) !=
+          MALI_KBASE_SUCCESS)
+      mesa_logw("malisx2: the tiler heap region could not be backed up front; it grows on use");
    return true;
+}
+
+/* Log the heap regions whose backed size grew since the last look: the
+ * tiler grows a region by faulting on it, and each fault stalls the GPU.
+ * The queue calls this every MALI_JM_HEAP_CHECK_PERIOD submissions. */
+void
+mali_jm_heap_check(struct mali_jm_device *jd, uint64_t seq)
+{
+   struct mali_jm_heap *h = &jd->heap;
+   simple_mtx_lock(&h->lock);
+   for (unsigned i = 0; i < HEAP_SLOTS; i++) {
+      uint64_t pages = 0;
+      if (!h->bo[i].size ||
+          mali_kbase_mem_query(jd->kb, h->bo[i].gpu_va, KB_MEM_QUERY_COMMIT_SIZE, &pages) !=
+             MALI_KBASE_SUCCESS)
+         continue;
+      /* The kernel answers in pages. */
+      const uint64_t bytes = pages * KB_PAGE_SIZE;
+      if (bytes <= h->committed[i])
+         continue;
+      mesa_logi("malisx2: tiler heap region %u backs %llu KiB (was %llu) by submission %llu",
+                i, (unsigned long long)(bytes >> 10),
+                (unsigned long long)(h->committed[i] >> 10), (unsigned long long)seq);
+      h->committed[i] = bytes;
+   }
+   simple_mtx_unlock(&h->lock);
 }
 
 bool
@@ -94,9 +140,9 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
 
    simple_mtx_lock(&h->lock);
    const uint32_t slot = h->next;
-   bool ok = h->bo[slot].size || slot_alloc(jd, &h->bo[slot]);
+   bool ok = h->bo[slot].size || slot_alloc(jd, slot, &h->bo[slot]);
    if (ok)
-      h->next = (slot + 1) % MALI_JM_HEAP_SLOTS;
+      h->next = (slot + 1) % HEAP_SLOTS;
    const uint64_t base = h->bo[slot].gpu_va;
    const uint64_t size = h->bo[slot].size;
    simple_mtx_unlock(&h->lock);
@@ -119,7 +165,7 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    /* The GPU advances Bottom and Top. */
    mali_jm_cmd_note_reset(cmd, p.cpu, &desc, sizeof(desc));
 
-   STATIC_ASSERT(MALI_JM_HEAP_SLOTS <= MALI_JM_HEAP_SLOTS_MAX);
+   STATIC_ASSERT(HEAP_SLOTS <= MALI_JM_HEAP_SLOTS_MAX);
    STATIC_ASSERT(MALI_JM_HEAP_SLOT_SIZE <= UINT32_MAX);
    b->heap_slot = (int16_t)slot;
    b->heap_desc = p.gpu;

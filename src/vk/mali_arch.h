@@ -57,6 +57,7 @@
 #define mali_jm_cmd_write_value MALI_PER_ARCH(jm_cmd_write_value)
 #define mali_jm_drain_locked MALI_PER_ARCH(jm_drain_locked)
 #define mali_jm_draw_tmpl_init MALI_PER_ARCH(jm_draw_tmpl_init)
+#define mali_jm_heap_check MALI_PER_ARCH(jm_heap_check)
 #define mali_jm_heap_finish MALI_PER_ARCH(jm_heap_finish)
 #define mali_jm_heap_init MALI_PER_ARCH(jm_heap_init)
 #define mali_jm_heap_take MALI_PER_ARCH(jm_heap_take)

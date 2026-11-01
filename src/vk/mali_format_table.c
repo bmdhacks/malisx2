@@ -93,7 +93,18 @@ pipe_format_supported(const struct mali_physical_device *pdev, enum pipe_format 
 VkFormatFeatureFlags
 MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, VkFormat format)
 {
-   if (is_bc_format(format))
+   /*
+    * v7: the BCn formats the GPU's TEXTURE_FEATURES_0 has (all of BC1-7 on
+    * the T618's Mali-G52, 0xf7fffffe), as sampled images with linear
+    * filtering, transfer source and destination: the layout (u-interleaved
+    * tiles of 4x4 blocks) and the block copies are the ones the other
+    * compressed formats use. textureCompressionBC stays false; hakuX asks
+    * per format (BC1-3) and then uploads its DXT textures as they are, a
+    * quarter to an eighth of the BGRA8 it decodes them to otherwise. Not
+    * on v9/v11, where the earlier noise was seen. The debug switch nobc
+    * answers no again.
+    */
+   if (is_bc_format(format) && (PAN_ARCH != 7 || mali_debug_flag("nobc")))
       return 0;
 
    enum pipe_format planes[MALI_IMAGE_MAX_PLANES];

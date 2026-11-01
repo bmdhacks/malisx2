@@ -1046,6 +1046,12 @@ physical_device_create(struct mali_instance *instance, const char *path,
     * as warnings. */
    mesa_logi("malisx2 build %s, driverInfo %s", MALI_GIT_SHA,
             driver_info_for_arch(pdev->arch));
+   /* One bit per compressed texture format the GPU samples (BCn, ETC2,
+    * ASTC; pan_format texfeat_bit), to tell which a device can take. */
+   mesa_logi("malisx2 texture features 0x%08x 0x%08x 0x%08x 0x%08x (raw 0x%08x)",
+            pdev->props.texture_features[0], pdev->props.texture_features[1],
+            pdev->props.texture_features[2], pdev->props.texture_features[3],
+            pdev->props.raw_texture_features[0]);
 
    struct vk_features features;
    struct vk_properties props;

@@ -1187,8 +1187,33 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
        * of recording (index_range says what that needs); a draw whose
        * indices cannot be read here is skipped. */
       uint32_t min, max;
-      bool empty;
-      if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty) || empty)
+      bool empty = false, ok = true;
+      const bool hinted = cmd->jm.idx_hint.set && cmd->jm.idx_hint.ib == d->ib.addr &&
+                          cmd->jm.idx_hint.first == di->first_index &&
+                          cmd->jm.idx_hint.count == di->count;
+      cmd->jm.idx_hint.set = false;
+      if (hinted) {
+         /* vkCmdSetIndexRangeMALISX2: the application's range. */
+         min = cmd->jm.idx_hint.min;
+         max = cmd->jm.idx_hint.max;
+         /* Debug switch idxcheck: the indices scanned anyway, a range the
+          * hint does not cover logged (the first 16). */
+         static int check = -1;
+         if (unlikely(check < 0))
+            check = mali_debug_flag("idxcheck");
+         if (unlikely(check)) {
+            uint32_t smin, smax;
+            bool sempty = false;
+            static unsigned logged;
+            if (index_range(cmd, di, st->ia.primitive_restart_enable, &smin, &smax, &sempty) &&
+                !sempty && (smin < min || smax > max) && logged++ < 16)
+               mesa_logw("malisx2 idxcheck: draw of %u indices from %u: indices %u..%u, "
+                         "hint %u..%u", di->count, di->first_index, smin, smax, min, max);
+         }
+      } else {
+         ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
+      }
+      if (!ok || empty)
          return;
       dd.vertex_range = max - min + 1;
       dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
@@ -1411,4 +1436,27 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
       .indexed = true,
    };
    draw(cmd, &di);
+}
+
+/*
+ * vkCmdSetIndexRangeMALISX2 (malisx2's own, from vkGetDeviceProcAddr):
+ * the application gives the index range of its next indexed draw, which
+ * it knows from building the indices, and the draw skips reading them
+ * back (index_range). The hint names the draw by the index buffer bound
+ * now, the first index and the count, so a draw recorded in between (a
+ * layer's own) is not taken for it. Every index of that draw must be in
+ * [minIndex, maxIndex]; a wider range only shades more vertices.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetIndexRangeMALISX2)(VkCommandBuffer commandBuffer, uint32_t firstIndex,
+                                       uint32_t indexCount, uint32_t minIndex,
+                                       uint32_t maxIndex)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   cmd->jm.idx_hint.set = minIndex <= maxIndex;
+   cmd->jm.idx_hint.ib = cmd->gfx.draw.ib.addr;
+   cmd->jm.idx_hint.first = firstIndex;
+   cmd->jm.idx_hint.count = indexCount;
+   cmd->jm.idx_hint.min = minIndex;
+   cmd->jm.idx_hint.max = maxIndex;
 }

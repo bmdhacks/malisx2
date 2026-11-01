@@ -334,6 +334,14 @@ struct mali_jm_cmd {
    uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER];
    uint8_t pend_tilers;          /* pending, oldest first */
    bool tiler_defer;
+   /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
+    * next indexed draw, if it is the one named (index buffer, first index,
+    * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */
+   struct {
+      bool set;
+      uint64_t ib;
+      uint32_t first, count, min, max;
+   } idx_hint;
    /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
     * copy_tsd), 0 until the first one. */
    uint64_t copy_tsd;

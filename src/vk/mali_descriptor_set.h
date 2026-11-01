@@ -110,6 +110,14 @@ struct mali_descriptor_pool {
    uint32_t live_sets;
    BITSET_WORD *free_sets;      /* bit i: sets[i] is free */
    struct mali_descriptor_set *sets;
+
+   /* Created without FREE_DESCRIPTOR_SET_BIT: its sets go only with a
+    * reset, so they are taken in order (sets[next], memory at bump) and
+    * the heap is not used. hakuX allocates a set for most of its draws
+    * (~30k a second on the Mali-G52) from such pools. */
+   bool linear;
+   uint32_t next;
+   uint64_t bump;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_descriptor_pool, base, VkDescriptorPool,

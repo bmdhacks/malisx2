@@ -500,7 +500,8 @@ static void
 pool_free_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
               struct mali_descriptor_set *set)
 {
-   pool_release_set(dev, pool, set, true);
+   /* A linear pool's set memory is not the heap's: back at the reset. */
+   pool_release_set(dev, pool, set, !pool->linear);
 }
 
 /* Every set freed; the set memory heap starts over whole instead of taking
@@ -508,6 +509,15 @@ pool_free_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
 static void
 pool_reset(struct mali_device *dev, struct mali_descriptor_pool *pool)
 {
+   if (pool->linear) {
+      /* Only sets[0, next) were ever taken. */
+      for (uint32_t i = 0; i < pool->next && pool->live_sets; i++)
+         pool_release_set(dev, pool, &pool->sets[i], false);
+      assert(pool->live_sets == 0);
+      pool->next = 0;
+      pool->bump = 0;
+      return;
+   }
    if (!pool->live_sets)
       return;
    for (uint32_t i = 0; i < pool->max_sets && pool->live_sets; i++)
@@ -553,6 +563,7 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
    pool->sets = sets;
    pool->free_sets = free_sets;
    BITSET_SET_COUNT(free_sets, 0, max_sets);
+   pool->linear = !(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT);
 
    /* Slots: one per descriptor, two per combined image/sampler; an inline
     * uniform block's bytes plus one Buffer slot per block. Dynamic buffers
@@ -668,7 +679,17 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
 
    const uint64_t size = (uint64_t)layout->desc_count * MALI_DESCRIPTOR_SIZE;
    uint64_t gpu = 0;
-   if (size) {
+   if (pool->linear) {
+      /* In order: no heap, no search (mali_descriptor_pool::linear). */
+      if (pool->next >= pool->max_sets)
+         return VK_ERROR_OUT_OF_POOL_MEMORY;
+      if (size) {
+         if (!pool->bo.gpu_va || pool->bump + size > pool->heap_size)
+            return VK_ERROR_OUT_OF_POOL_MEMORY;
+         gpu = pool->bo.gpu_va + pool->bump;
+         pool->bump += size;
+      }
+   } else if (size) {
       if (!pool->bo.gpu_va || pool->heap.free_size < size)
          return VK_ERROR_OUT_OF_POOL_MEMORY;
       gpu = util_vma_heap_alloc(&pool->heap, size, MALI_DESCRIPTOR_SIZE);
@@ -676,7 +697,8 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
          return VK_ERROR_FRAGMENTED_POOL;
    }
 
-   const uint32_t i = __bitset_ffs(pool->free_sets, BITSET_WORDS(pool->max_sets)) - 1;
+   const uint32_t i = pool->linear ? pool->next++
+                                   : __bitset_ffs(pool->free_sets, BITSET_WORDS(pool->max_sets)) - 1;
    assert(i < pool->max_sets);
    struct mali_descriptor_set *set = &pool->sets[i];
    BITSET_CLEAR(pool->free_sets, i);

@@ -1720,6 +1720,11 @@ v7_fixup_info(struct mali_device *dev, const nir_shader *nir, struct mali_shader
    s->info.ubo_count = s->v7.count[MALI_V7_DESC_TABLE_UBO] + s->v7.dyn_ubo_count;
    s->info.texture_count = s->v7.count[MALI_V7_DESC_TABLE_TEXTURE];
    s->info.sampler_count = s->v7.count[MALI_V7_DESC_TABLE_SAMPLER];
+   if (s->v7.direct_set >= 0) {
+      /* The tables are the direct set's slots (mali_jm_desc_v7.c). */
+      s->info.texture_count = s->v7.direct_slots;
+      s->info.sampler_count = s->v7.direct_slots - s->v7.direct_sampler_base;
+   }
    if (s->info.texture_count && !s->info.sampler_count)
       s->info.sampler_count = 1;
 
@@ -2319,6 +2324,10 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    blob_write_bytes(blob, s->v7.count, sizeof(s->v7.count));
    blob_write_uint32(blob, s->v7.dyn_ubo_count);
    blob_write_uint32(blob, s->v7.needs_set_addrs);
+   blob_write_uint32(blob, (uint32_t)s->v7.direct_set);
+   blob_write_uint32(blob, s->v7.direct_slots);
+   blob_write_uint32(blob, s->v7.direct_sampler_base);
+   blob_write_uint32(blob, s->v7.direct_exclusive);
    blob_write_uint32(blob, s->v7.map_count);
    blob_write_bytes(blob, s->v7.map, s->v7.map_count * sizeof(uint32_t));
    blob_write_uint32(blob, s->v7.data_size);
@@ -2386,6 +2395,10 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    blob_copy_bytes(blob, s->v7.count, sizeof(s->v7.count));
    s->v7.dyn_ubo_count = blob_read_uint32(blob);
    s->v7.needs_set_addrs = blob_read_uint32(blob);
+   s->v7.direct_set = (int32_t)blob_read_uint32(blob);
+   s->v7.direct_slots = blob_read_uint32(blob);
+   s->v7.direct_sampler_base = blob_read_uint32(blob);
+   s->v7.direct_exclusive = blob_read_uint32(blob);
    s->v7.map_count = blob_read_uint32(blob);
    const void *map = blob_read_bytes(blob, s->v7.map_count * sizeof(uint32_t));
    s->v7.data_size = blob_read_uint32(blob);

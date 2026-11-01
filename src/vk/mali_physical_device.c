@@ -927,6 +927,21 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
       props->maxDescriptorSetUpdateAfterBindInputAttachments =
          props->maxDescriptorSetInputAttachments;
+      /* A stage whose textures and samplers all come from one update-after-
+       * bind set reads that set as its tables (mali_nir_lower_descriptors_v7.c
+       * direct sets): bindless arrays cost nothing per draw. Tables have
+       * 16-bit counts: a set of up to 16384 images and 1024 samplers (hakuX
+       * asks 3 x 4096 and 256, and then drops its per-draw sets: about a
+       * third of the driver's time per draw on the Mali-G52). Debug switch
+       * nobindless: the ordinary limits. */
+      if (!mali_debug_flag("nobindless")) {
+         props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
+         props->maxDescriptorSetUpdateAfterBindSampledImages = 16384;
+         props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+         props->maxDescriptorSetUpdateAfterBindSamplers = 1024;
+         props->maxPerStageUpdateAfterBindResources =
+            MAX2(props->maxPerStageUpdateAfterBindResources, 16384 + 1024 + 256);
+      }
    }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);

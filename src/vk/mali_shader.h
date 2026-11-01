@@ -359,6 +359,18 @@ struct mali_v7_shader_desc {
    /* The shader reads v7_desc.sets: storage buffers, texture or image size
     * queries. */
    bool needs_set_addrs;
+   /* The direct set (mali_nir_lower_descriptors_v7.c): every texture and
+    * sampler of the stage comes from this set, laid out for update after
+    * bind, by its slot in it. The stage's Texture and Sampler tables are
+    * the set's own memory (direct_slots slots), nothing is copied. -1:
+    * none. direct_exclusive: no other table copies from that set. The
+    * Sampler table starts at the set's first sampler, slot
+    * direct_sampler_base: a texel fetch names sampler 0 (pan_nir_lower_tex),
+    * which must be a sampler. */
+   int32_t direct_set;
+   uint32_t direct_slots;
+   uint32_t direct_sampler_base;
+   bool direct_exclusive;
    /* The lowering could not allocate its map (mali_shader.c lower_nir). */
    bool failed;
    /* The shader's constant data (host copy, for serialization) and its GPU

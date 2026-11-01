@@ -316,6 +316,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    vk_device_dispatch_table_from_entrypoints(&dev->vk.dispatch_table,
                                              &mali_waist_device_entrypoints, false);
+   mali_cpuprof_install(&dev->vk.dispatch_table);
 
    /* The queue requests are checked before the kernel is touched. One
     * family, MALI_QUEUE_COUNT queues, no protected queues. */

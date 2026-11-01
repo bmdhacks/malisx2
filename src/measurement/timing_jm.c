@@ -114,7 +114,7 @@ mali_jm_measure_begin(struct mali_cmd_buffer *cmd, enum mali_measure_kind kind,
       memset(p.cpu, 0, SLOT_BLOCK);
       mc->slots = p.cpu;
       mc->slots_va = p.gpu;
-      mc->slots_left = SLOT_BLOCK / 16;
+      mc->slots_left = SLOT_BLOCK / 32;
    }
 
    struct mali_measure_region r = {
@@ -123,13 +123,18 @@ mali_jm_measure_begin(struct mali_cmd_buffer *cmd, enum mali_measure_kind kind,
       .index = index,
       .slot = mc->slots,
       .slot_va = mc->slots_va,
+      .cycles = true,
    };
-   mc->slots += 2;
-   mc->slots_va += 16;
+   mc->slots += 4;
+   mc->slots_va += 32;
    mc->slots_left--;
 
    util_dynarray_append_typed(&mc->regions, struct mali_measure_region, r);
    mali_jm_cmd_write_value(cmd, chain, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP, r.slot_va, 0,
+                           true);
+   /* The GPU's cycle counter too (running: every atom asks for the
+    * performance counters), for costs that do not move with its clock. */
+   mali_jm_cmd_write_value(cmd, chain, MALI_WRITE_VALUE_TYPE_CYCLE_COUNTER, r.slot_va + 16, 0,
                            true);
    return util_dynarray_num_elements(&mc->regions, struct mali_measure_region);
 }
@@ -148,9 +153,12 @@ void
 mali_jm_measure_end(struct mali_cmd_buffer *cmd, uint32_t handle, struct mali_jm_chain *chain)
 {
    struct mali_measure_region *r = region(cmd, handle);
-   if (r)
+   if (r) {
+      mali_jm_cmd_write_value(cmd, chain, MALI_WRITE_VALUE_TYPE_CYCLE_COUNTER,
+                              r->slot_va + 24, 0, true);
       mali_jm_cmd_write_value(cmd, chain, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
                               r->slot_va + 8, 0, true);
+   }
 }
 
 void

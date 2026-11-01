@@ -434,6 +434,13 @@ mali_measure_row(struct mali_measure *m, const struct mali_measure_cmd *mc,
       break;
    }
 
+   /* GPU cycles the region took (job manager): its cost whatever the
+    * clock, and with dur_ns the clock it ran at. */
+   if (r->cycles && r->slot[2] && r->slot[3] >= r->slot[2]) {
+      const size_t n = strlen(info);
+      snprintf(info + n, sizeof(info) - n, " cycles=%" PRIu64, r->slot[3] - r->slot[2]);
+   }
+
    const char *sq_name = m->dev->jm ? jm_sq_names[r->sq] : sq_names[r->sq];
 
    if (b && e) {

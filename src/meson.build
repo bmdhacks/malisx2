@@ -163,7 +163,7 @@ dep_gbm = with_platform_android ? dependency('', required : false) \
 
 malisx2_vk = static_library(
   'mali_vk',
-  files('vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
+  files('vk/mali_cpuprof.c', 'vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
         'vk/mali_physical_device.c'),
   # Memory, buffers, images, formats.
   files('vk/mali_buffer.c', 'vk/mali_device_memory.c', 'vk/mali_formats.c',

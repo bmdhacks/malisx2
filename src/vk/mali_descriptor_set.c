@@ -172,11 +172,31 @@ slot_ptr(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
    return (uint8_t *)set->cpu + (size_t)idx * MALI_DESCRIPTOR_SIZE;
 }
 
+/* Store size bytes at dst, a pointer into set->cpu, and the same bytes
+ * into the host copy. */
+static void
+set_store(const struct mali_descriptor_set *set, void *dst, const void *src, size_t size)
+{
+   if (set->host && set->host != set->cpu)
+      memmove((uint8_t *)set->host + ((uint8_t *)dst - (uint8_t *)set->cpu), src, size);
+   memmove(dst, src, size);
+}
+
+/* Where bytes at p, a pointer into set->cpu, are best read: the host
+ * copy when there is one (set memory is CPU-uncached). */
+static const void *
+set_load_ptr(const struct mali_descriptor_set *set, const void *p)
+{
+   if (set->host)
+      return (const uint8_t *)set->host + ((const uint8_t *)p - (const uint8_t *)set->cpu);
+   return p;
+}
+
 static void
 write_slot(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
            enum mali_subdesc sub, const void *desc)
 {
-   memcpy(slot_ptr(set, binding, elem, sub), desc, MALI_DESCRIPTOR_SIZE);
+   set_store(set, slot_ptr(set, binding, elem, sub), desc, MALI_DESCRIPTOR_SIZE);
 }
 
 static void
@@ -372,8 +392,8 @@ write_descriptors(struct mali_descriptor_set *set, const VkWriteDescriptorSet *w
       const VkWriteDescriptorSetInlineUniformBlock *iub =
          vk_find_struct_const(w->pNext, WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
       if (iub)
-         memcpy(iub_data(set, w->dstBinding) + w->dstArrayElement, iub->pData,
-                w->descriptorCount);
+         set_store(set, iub_data(set, w->dstBinding) + w->dstArrayElement, iub->pData,
+                   w->descriptorCount);
       return;
    }
 
@@ -428,8 +448,9 @@ copy_descriptors(const VkCopyDescriptorSet *c)
               c->descriptorCount * sizeof(dst->dyn_bufs[0]));
       break;
    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
-      memmove(iub_data(dst, c->dstBinding) + c->dstArrayElement,
-              iub_data(src, c->srcBinding) + c->srcArrayElement, c->descriptorCount);
+      set_store(dst, iub_data(dst, c->dstBinding) + c->dstArrayElement,
+                set_load_ptr(src, iub_data(src, c->srcBinding) + c->srcArrayElement),
+                c->descriptorCount);
       break;
    default: {
       /* Whole elements (both halves of a combined image/sampler). A
@@ -445,7 +466,7 @@ copy_descriptors(const VkCopyDescriptorSet *c)
             n = dbl->textures_per_desc;
          else if (dbl->immutable_samplers)
             n = 0;
-         memmove(d, s, (size_t)n * MALI_DESCRIPTOR_SIZE);
+         set_store(dst, d, set_load_ptr(src, s), (size_t)n * MALI_DESCRIPTOR_SIZE);
       }
       break;
    }
@@ -541,6 +562,7 @@ pool_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc,
       util_vma_heap_finish(&pool->heap);
       mali_kbase_free(dev->kbase, &pool->bo);
    }
+   vk_free2(&dev->vk.alloc, alloc, pool->host);
    vk_object_free(&dev->vk, alloc, pool);
 }
 
@@ -611,6 +633,12 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
       }
       pool->heap_size = slots * MALI_DESCRIPTOR_SIZE;
       util_vma_heap_init(&pool->heap, pool->bo.gpu_va, pool->heap_size);
+      pool->host = vk_alloc2(&dev->vk.alloc, pAllocator, pool->heap_size, 8,
+                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!pool->host) {
+         pool_destroy(dev, pAllocator, pool);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
    }
 
    *pDescriptorPool = mali_descriptor_pool_to_handle(pool);
@@ -714,6 +742,7 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    set->layout = layout;
    set->gpu = gpu;
    set->cpu = gpu ? (uint8_t *)pool->bo.cpu + (gpu - pool->bo.gpu_va) : NULL;
+   set->host = gpu ? pool->host + (gpu - pool->bo.gpu_va) : NULL;
    init_fixed_slots(set);
 
    *out = set;

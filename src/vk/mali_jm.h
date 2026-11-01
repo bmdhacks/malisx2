@@ -233,6 +233,12 @@ struct mali_v7_desc_tables {
    uint64_t dyn_ssbos;                        /* the dynamic storage buffer table */
    uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
    uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
+   /* Filling the copied entries on the CPU (mali_v7_desc_copy): the
+    * tables' mappings, the bound sets' host copies, and whether every
+    * bound set has one and none was laid out for update after bind. */
+   void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
+   const void *set_host[MALI_MAX_SETS];
+   bool cpu_fill;
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
    /* The dynamic buffers they were built with, one per entry of the
@@ -942,6 +948,9 @@ struct mali_jm_device {
    struct mali_shader *v7_desc_copy;
    /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
    struct mali_shader *v7_ubo_copy;
+   /* The debug switch "gpudesccopy": every descriptor table entry copied
+    * by a copy job, none on the CPU (mali_v7_desc_copy). */
+   bool v7_gpu_desc_copy;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;

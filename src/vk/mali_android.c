@@ -22,8 +22,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+
+#include <android/hardware_buffer.h>
 
 #include <hardware/hwvulkan.h>
 
@@ -34,6 +38,7 @@
 #include "vk_util.h"
 
 #include "mali_image.h"
+#include "mali_memory.h"
 #include "mali_vk.h"
 #include "mali_wsi.h"
 
@@ -246,4 +251,121 @@ mali_QueueSignalReleaseImageANDROID(VkQueue _queue, uint32_t waitSemaphoreCount,
 {
    VK_FROM_HANDLE(mali_queue, queue, _queue);
    return mali_wsi_release(queue, waitSemaphoreCount, pWaitSemaphores, pNativeFenceFd);
+}
+
+/* ---------------------------------------------------------------------- */
+/* AHardwareBuffer import (VK_ANDROID_external_memory_android_hardware_buffer) */
+
+/*
+ * Buffers only: a BLOB hardware buffer's dma-buf, imported as any dma-buf
+ * (mali_device_memory.c). An emulator's guest RAM is one (hakuX makes its
+ * 64 MiB an AHB and reads vertices and textures from it in place; without
+ * the import it copied every draw's vertices, ~70,000 a second). No image
+ * is importable from one (mali_formats.c) and no memory is exportable as
+ * one. libnativewindow's two functions are looked up, not linked: the
+ * driver links nothing of Android's beyond libc and liblog.
+ */
+typedef void (*mali_ahb_describe_fn)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
+typedef const native_handle_t *(*mali_ahb_handle_fn)(const AHardwareBuffer *);
+static mali_ahb_describe_fn ahb_describe;
+static mali_ahb_handle_fn ahb_handle;
+
+static void
+ahb_lookup(void)
+{
+   void *lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
+   if (!lib)
+      return;
+   ahb_describe = (mali_ahb_describe_fn)dlsym(lib, "AHardwareBuffer_describe");
+   ahb_handle = (mali_ahb_handle_fn)dlsym(lib, "AHardwareBuffer_getNativeHandle");
+}
+
+/* The dma-buf fd of BLOB buffer ahb (owned by it) and its size. */
+static VkResult
+ahb_blob(struct mali_device *dev, const struct AHardwareBuffer *ahb, int *fd, uint64_t *size)
+{
+   static util_once_flag once = UTIL_ONCE_FLAG_INIT;
+   util_call_once(&once, ahb_lookup);
+   if (!ahb_describe || !ahb_handle)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "libnativewindow's AHardwareBuffer functions not found");
+   AHardwareBuffer_Desc d = {0};
+   ahb_describe((const AHardwareBuffer *)ahb, &d);
+   if (d.format != AHARDWAREBUFFER_FORMAT_BLOB)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "hardware buffer of format %u: only BLOB buffers are importable",
+                       d.format);
+   const native_handle_t *h = ahb_handle((const AHardwareBuffer *)ahb);
+   if (!h || h->numFds < 1 || h->data[0] < 0)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "hardware buffer without a dma-buf fd");
+   *fd = h->data[0];
+   const int64_t fd_size = mali_dmabuf_fd_size(*fd);
+   *size = fd_size > 0 ? (uint64_t)fd_size : d.width;   /* a BLOB's width is its bytes */
+   return VK_SUCCESS;
+}
+
+VkResult
+mali_android_import_ahb(struct mali_device *dev, const struct AHardwareBuffer *ahb, int *fd)
+{
+   int owned;
+   uint64_t size;
+   VkResult result = ahb_blob(dev, ahb, &owned, &size);
+   if (result != VK_SUCCESS)
+      return result;
+   *fd = fcntl(owned, F_DUPFD_CLOEXEC, 0);
+   return *fd >= 0 ? VK_SUCCESS :
+                     vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                               "cannot duplicate the hardware buffer's fd");
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_GetAndroidHardwareBufferPropertiesANDROID(VkDevice _device,
+                                               const struct AHardwareBuffer *buffer,
+                                               VkAndroidHardwareBufferPropertiesANDROID *pProperties)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   int fd;
+   uint64_t size;
+   VkResult result = ahb_blob(dev, buffer, &fd, &size);
+   if (result != VK_SUCCESS)
+      return result;
+   pProperties->allocationSize = size;
+   pProperties->memoryTypeBits = MALI_MEMORY_TYPES_HOST_VISIBLE;
+   vk_foreach_struct(stype, ext, pProperties->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID: {
+         VkAndroidHardwareBufferFormatPropertiesANDROID *f = (void *)ext;
+         void *next = f->pNext;
+         memset(f, 0, sizeof(*f));       /* a BLOB has no image format */
+         f->sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+         f->pNext = next;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID: {
+         VkAndroidHardwareBufferFormatProperties2ANDROID *f = (void *)ext;
+         void *next = f->pNext;
+         memset(f, 0, sizeof(*f));
+         f->sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID;
+         f->pNext = next;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+   return VK_SUCCESS;
+}
+
+/* Nothing is exportable as a hardware buffer (no memory type says so). */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_GetMemoryAndroidHardwareBufferANDROID(VkDevice _device,
+                                           const VkMemoryGetAndroidHardwareBufferInfoANDROID *pInfo,
+                                           struct AHardwareBuffer **pBuffer)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   *pBuffer = NULL;
+   return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "memory is not exportable as a hardware buffer");
 }

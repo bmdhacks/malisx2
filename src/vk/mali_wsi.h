@@ -154,6 +154,10 @@ VkResult mali_wsi_release(struct mali_queue *queue, uint32_t count,
 VkResult mali_android_bind_native_buffer(struct mali_device *dev, struct mali_image *image,
                                          const VkNativeBufferANDROID *nb,
                                          const VkAllocationCallbacks *alloc);
+/* A BLOB AHardwareBuffer's dma-buf, duplicated into *fd (mali_android.c):
+ * its memory is imported as a dma-buf's. */
+VkResult mali_android_import_ahb(struct mali_device *dev, const struct AHardwareBuffer *ahb,
+                                 int *fd);
 #endif
 
 #endif

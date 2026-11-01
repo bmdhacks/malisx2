@@ -361,6 +361,14 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
    return i < 8 || (i + 1) % 100 == 0;
 }
 
+/*
+ * Switches for trying a change both ways on the device: MALISX2_DEBUG (on
+ * Android the property debug.malisx2.debug), a comma-separated list of
+ * names, read once per process. mali_debug_flag says whether name is in
+ * it.
+ */
+bool mali_debug_flag(const char *name);
+
 #if defined(PAN_ARCH) && PAN_ARCH == 7
 #include "util/log.h"
 

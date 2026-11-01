@@ -424,7 +424,11 @@ mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
 #define REQ_FRAG_FLUSH          (1u << 6)
 /* The VTC_AFTER_FRAG requirements of barriers whose vtc-slot destination
  * stages are only transfer stages: only the next transfer job on the vtc
- * chain (mali_jm_cmd_vtc_transfer) waits for them. */
+ * chain (mali_jm_cmd_vtc_transfer) waits for them. On v7 also those of
+ * image-only barriers (MALI_JM_IMAGE_BARRIER_NARROW), which every vtc job
+ * that can touch an image waits for: transfers, dispatches and the other
+ * jobs of mali_jm_cmd_vtc, and draws whose vertex shader reads textures or
+ * images or writes memory (mali_jm_cmd_pass_images). */
 #define REQ_XVTC_AFTER_FRAG      (1u << 7)
 #define REQ_XVTC_AFTER_FRAG_XFER (1u << 8)
 
@@ -509,6 +513,14 @@ static struct mali_jm_chain *
 vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
 {
    struct mali_jm_batch *b = mali_jm_cmd_batch(cmd);
+   /* A copy into a fresh image (mali_image::fresh): no earlier work read
+    * or wrote the image or its memory, so of the transfer-only
+    * requirements it needs only those of buffer and global barriers (its
+    * source buffer). Image barriers' requirements stay for the next job
+    * that can touch their image. */
+   const bool fresh = xfer && cmd->jm.xfer_fresh && !cmd->jm.xvtc_buf;
+   if (fresh)
+      xfer = false;
    const uint16_t req = vtc_req(cmd->jm.req, xfer);
 
    /* Outside a render pass, a full batch closes before the next job. */
@@ -544,16 +556,56 @@ vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
       else if (req & REQ_VTC_AFTER_FRAG_XFER)
          met |= REQ_XVTC_AFTER_FRAG_XFER;
       cmd->jm.req &= ~met;
+      if (!(cmd->jm.req & REQ_XVTC_ALL))
+         cmd->jm.xvtc_buf = false;
    }
    if (xfer)
       b->vtc_xfer = true;
+   if (fresh)
+      b->vtc_fresh = true;
    return &b->vtc;
 }
 
 struct mali_jm_chain *
 mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd)
 {
+#if PAN_ARCH < 9
+   /* Dispatches: they may read an image an image-only barrier ordered
+    * (MALI_JM_IMAGE_BARRIER_NARROW). Write Value jobs take
+    * mali_jm_cmd_vtc_value. */
+   if (cmd->dev->jm->v7_image_barrier_narrow)
+      return vtc_chain(cmd, true);
+#endif
    return vtc_chain(cmd, false);
+}
+
+struct mali_jm_chain *
+mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd)
+{
+   return vtc_chain(cmd, false);
+}
+
+struct mali_jm_chain *
+mali_jm_cmd_vtc_value(struct mali_cmd_buffer *cmd)
+{
+   return vtc_chain(cmd, false);
+}
+
+void
+mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd)
+{
+#if PAN_ARCH < 9
+   if (!cmd->dev->jm->v7_image_barrier_narrow)
+      return;
+   const uint16_t req = vtc_req(cmd->jm.req, true);
+   /* The pass's tiling so far ran ahead of this batch's fragment work: the
+    * draw goes on in a new batch, which waits for it. */
+   if (vtc_req_closes(cmd, req))
+      mali_jm_cmd_pass_split(cmd);
+   vtc_chain(cmd, true);
+#else
+   (void)cmd;
+#endif
 }
 
 struct mali_jm_chain *
@@ -690,15 +742,62 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT | \
     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
 
+static uint16_t
+barrier_req(VkPipelineStageFlags2 src_stages, VkPipelineStageFlags2 dst_stages,
+            VkAccessFlags2 dst_access);
+
 void
 mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stages,
                     VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stages,
                     VkAccessFlags2 dst_access)
 {
+   (void)src_access;
+   const uint16_t req = barrier_req(src_stages, dst_stages, dst_access);
+   cmd->jm.req |= req;
+   /* Not known to be about images only (mali_jm_cmd::xvtc_buf). */
+   if (req & REQ_XVTC_ALL)
+      cmd->jm.xvtc_buf = true;
+}
+
+#if PAN_ARCH < 9
+/*
+ * MALI_JM_IMAGE_BARRIER_NARROW: the vtc requirements of image memory
+ * barriers. Their memory dependency covers only the image; what is global
+ * is the execution dependency. A vtc job that cannot access the image and
+ * has no side effects cannot tell whether it ran before the first scope's
+ * fragment work or after it: a read of a buffer that work wrote needs a
+ * buffer or global memory dependency, which keeps the full rule, and a
+ * write-after-read needs a write. So only the vtc jobs that can touch
+ * images wait (REQ_XVTC_*, the transfer-only class): a pass whose vertex
+ * shaders read no textures or images and write no memory tiles while the
+ * fragment work before it still runs.
+ *
+ * Titles that end every render-to-texture pass with an "all commands ->
+ * all commands" image barrier (hakuX) otherwise get no overlap between a
+ * pass's tiling and the fragment work before it: on the Mali-G52 that
+ * left about a quarter of the GPU's time serialised. Off with the debug
+ * switch vtcwait.
+ */
+static uint16_t
+image_barrier_req(VkPipelineStageFlags2 src_stages, VkPipelineStageFlags2 dst_stages,
+                  VkAccessFlags2 dst_access)
+{
+   uint16_t req = barrier_req(src_stages, dst_stages, dst_access);
+   if (req & REQ_VTC_AFTER_FRAG)
+      req = (req & ~REQ_VTC_AFTER_FRAG) | REQ_XVTC_AFTER_FRAG;
+   if (req & REQ_VTC_AFTER_FRAG_XFER)
+      req = (req & ~REQ_VTC_AFTER_FRAG_XFER) | REQ_XVTC_AFTER_FRAG_XFER;
+   return req;
+}
+#endif
+
+static uint16_t
+barrier_req(VkPipelineStageFlags2 src_stages, VkPipelineStageFlags2 dst_stages,
+            VkAccessFlags2 dst_access)
+{
    src_stages = vk_expand_src_stage_flags2(src_stages);
    dst_stages = vk_expand_dst_stage_flags2(dst_stages);
    dst_access = vk_filter_dst_access_flags2(dst_stages, dst_access);
-   (void)src_access;
 
    const bool src_vtc = src_stages & VTC_STAGES;
    const bool src_frag = src_stages & FRAG_RENDER_STAGES;
@@ -726,7 +825,7 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
       if (src_frag || src_frag_xfer)
          req |= REQ_FRAG_AFTER_FRAG | (flush ? REQ_FRAG_FLUSH : 0);
    }
-   cmd->jm.req |= req;
+   return req;
 }
 
 #if PAN_ARCH < 9
@@ -856,8 +955,13 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
    const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
 #endif
+   VkPipelineStageFlags2 img_src = 0, img_dst = 0;
+   VkAccessFlags2 img_dsta = 0;
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
+      img_src |= m->srcStageMask;
+      img_dst |= m->dstStageMask;
+      img_dsta |= m->dstAccessMask;
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -880,11 +984,25 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
          MALI_PER_ARCH(cmd_fb_barrier)(cmd);
       return;
    }
-   mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
 #if PAN_ARCH < 9
+   if (cmd->dev->jm->v7_image_barrier_narrow) {
+      /* The global and buffer dependencies keep the full rule; the image
+       * ones apply to the vtc jobs that can touch images. */
+      const uint16_t buf_req = barrier_req(buf_src, buf_dst, buf_dsta);
+      cmd->jm.req |= buf_req | image_barrier_req(img_src, img_dst, img_dsta);
+      if (buf_req & REQ_XVTC_ALL)
+         cmd->jm.xvtc_buf = true;
+   } else {
+      mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
+   }
    if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
       mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                           VK_ACCESS_2_UNIFORM_READ_BIT);
+#else
+   (void)img_src;
+   (void)img_dst;
+   (void)img_dsta;
+   mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
 #endif
 }
 
@@ -904,6 +1022,8 @@ MALI_PER_ARCH(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
     * buffer pending twice at once (SIMULTANEOUS_USE) runs its submissions
     * one after the other: one chain cannot run twice at the same time. */
    cmd->jm.resubmit = !(info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+   cmd->jm.xvtc_buf = false;
+   cmd->jm.xfer_fresh = false;
 #if PAN_ARCH < 9
    cmd->jm.idx_hint.set = false;
 #endif
@@ -940,7 +1060,11 @@ MALI_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    }
    if (req & REQ_FRAG_AFTER_VTC)
       cmd->jm.end_req |= MALI_JM_REQ_FRAG_AFTER_VTC;
+   if (cmd->jm.xvtc_buf &&
+       (cmd->jm.end_req & (MALI_JM_REQ_XVTC_AFTER_FRAG | MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)))
+      cmd->jm.end_req |= MALI_JM_REQ_XVTC_BUF;
    cmd->jm.req = 0;
+   cmd->jm.xvtc_buf = false;
    return vk_command_buffer_end(&cmd->vk);
 }
 

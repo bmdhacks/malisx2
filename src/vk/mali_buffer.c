@@ -96,6 +96,7 @@ mali_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
 
       buf->mem = mem;
       buf->mem_offset = pBindInfos[i].memoryOffset;
+      mem->binds++;
       buf->vk.device_address = mali_device_memory_gpu_va(mem, pBindInfos[i].memoryOffset);
       if (status)
          *status->pResult = VK_SUCCESS;

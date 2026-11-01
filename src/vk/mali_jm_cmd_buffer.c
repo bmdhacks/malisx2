@@ -783,6 +783,48 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
            m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT);
 }
 
+/*
+ * An in-pass by-region barrier that only orders attachment writes before
+ * attachment and input attachment reads (local read, framebuffer fetch).
+ * On v7 those reads are LD_TILE without resource tracking
+ * (mali_nir_lower_input_attachments.c, nir load_tile_pan), which keeps
+ * absolute pixel ordering: the read waits in the tile unit for every older
+ * fragment of its pixel. The barrier's draw (cmd_fb_barrier: a primitive
+ * barrier over the whole framebuffer) only adds a drain of every tile's
+ * pipeline per barrier: hakuX's cockpit passes have about 22 of them, and
+ * with every draw scissored to one pixel such a 640x720 pass still took
+ * 4.1 ms of fragment time on the G52. Storage and other memory accesses
+ * keep the barrier; so does everything with the debug switch fbbarrier.
+ */
+#define TILE_SRC_ACCESS                                                        \
+   (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | \
+    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |                           \
+    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT)
+#define TILE_DST_ACCESS                                                        \
+   (TILE_SRC_ACCESS | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
+
+static bool
+tile_ordered_barrier(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineStageFlags2 dst,
+                     VkAccessFlags2 dsta, const struct mali_cmd_buffer *cmd)
+{
+#if PAN_ARCH < 9
+   if (!cmd->dev->jm->v7_tile_ordered_fb_barrier)
+      return false;
+   src = vk_expand_src_stage_flags2(src);
+   dst = vk_expand_dst_stage_flags2(dst);
+   srca = vk_filter_src_access_flags2(src, srca);
+   dsta = vk_filter_dst_access_flags2(dst, dsta);
+   return !(srca & ~TILE_SRC_ACCESS) && !(dsta & ~TILE_DST_ACCESS);
+#else
+   (void)src;
+   (void)srca;
+   (void)dst;
+   (void)dsta;
+   (void)cmd;
+   return false;
+#endif
+}
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                    const VkDependencyInfo *info)
@@ -833,7 +875,8 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
        * nothing. */
       const VkPipelineStageFlags2 fs = FRAG_RENDER_STAGES;
       if ((info->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
-          (vk_expand_src_stage_flags2(src) & fs) && (vk_expand_dst_stage_flags2(dst) & fs))
+          (vk_expand_src_stage_flags2(src) & fs) && (vk_expand_dst_stage_flags2(dst) & fs) &&
+          !tile_ordered_barrier(src, srca, dst, dsta, cmd))
          MALI_PER_ARCH(cmd_fb_barrier)(cmd);
       return;
    }

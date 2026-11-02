@@ -170,11 +170,11 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
     * not built: ANDROID_API_LEVEL is undefined), keeping the dedicated
     * allocation and the allocation flags.
     */
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
    const VkImportAndroidHardwareBufferInfoANDROID *ahb_info =
       __vk_find_struct((void *)pAllocateInfo->pNext,
                        VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID);
    if (ahb_info) {
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
       int fd;
       VkResult r = mali_android_import_ahb(dev, ahb_info->buffer, &fd);
       if (r != VK_SUCCESS)
@@ -206,11 +206,8 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
       if (r != VK_SUCCESS)
          close(fd);                      /* a failed import does not own it */
       return r;
-#else
-      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "AHardwareBuffer import outside Android");
-#endif
    }
+#endif
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
    const bool export_dmabuf =

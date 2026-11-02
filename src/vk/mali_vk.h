@@ -370,8 +370,8 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
 bool mali_debug_flag(const char *name);
 
 /* malisx2's own command, handed out by vkGetDeviceProcAddr on v7
- * (mali_device.c): the index range of the next indexed draw
- * (mali_jm_cmd_draw_v7.c). */
+ * (mali_device.c): the index range of the next indexed draw, which must
+ * cover all its indices but the restart index (mali_jm_cmd_draw_v7.c). */
 typedef void(VKAPI_PTR *PFN_vkCmdSetIndexRangeMALISX2)(VkCommandBuffer commandBuffer,
                                                       uint32_t firstIndex, uint32_t indexCount,
                                                       uint32_t minIndex, uint32_t maxIndex);

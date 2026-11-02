@@ -1443,9 +1443,16 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
  * the application gives the index range of its next indexed draw, which
  * it knows from building the indices, and the draw skips reading them
  * back (index_range). The hint names the draw by the index buffer bound
- * now, the first index and the count, so a draw recorded in between (a
- * layer's own) is not taken for it. Every index of that draw must be in
- * [minIndex, maxIndex]; a wider range only shades more vertices.
+ * now, the first index and the count. Only the next indexed draw can take
+ * it: if that one is another draw (a layer's own), the hint is dropped,
+ * not taken for it, and the draw it named scans its indices as before.
+ *
+ * Every index of that draw must be in [minIndex, maxIndex], the
+ * primitive restart index left out as the scan leaves it out (0xFFFF or
+ * 0xFFFFFFFF, when restart is enabled). A wider range only shades more
+ * vertices. A narrower one is undefined: the tiler then reads varyings of
+ * vertices that were not shaded, which draws garbage or can fault the
+ * GPU. The debug switch idxcheck logs such hints.
  */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdSetIndexRangeMALISX2)(VkCommandBuffer commandBuffer, uint32_t firstIndex,

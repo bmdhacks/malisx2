@@ -330,21 +330,23 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 }
 
-/* Buffers: a dma-buf can be imported as a buffer's memory (not on Android,
- * where nothing is imported this way); nothing is exportable. */
+/* Buffers: a dma-buf (not on Android) or a BLOB AHardwareBuffer (Android)
+ * can be imported as a buffer's memory (mali_device_memory.c); nothing is
+ * exportable. */
 VKAPI_ATTR void VKAPI_CALL
 mali_GetPhysicalDeviceExternalBufferProperties(
    VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
    VkExternalBufferProperties *pExternalBufferProperties)
 {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
-   const bool dmabuf = false;
+   const VkExternalMemoryHandleTypeFlagBits type =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #else
-   const bool dmabuf =
-      pExternalBufferInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   const VkExternalMemoryHandleTypeFlagBits type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 #endif
+   const bool importable = pExternalBufferInfo->handleType == type;
    pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){
-      .externalMemoryFeatures = dmabuf ? VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT : 0,
-      .compatibleHandleTypes = dmabuf ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : 0,
+      .externalMemoryFeatures = importable ? VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT : 0,
+      .compatibleHandleTypes = importable ? type : 0,
    };
 }

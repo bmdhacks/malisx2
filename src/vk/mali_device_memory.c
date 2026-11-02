@@ -15,6 +15,9 @@
 #include "mali_vk.h"
 #include "mali_image.h"
 #include "mali_memory.h"
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+#include "mali_wsi.h"
+#endif
 
 #include <errno.h>
 #include <string.h>
@@ -161,14 +164,53 @@ mali_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
                        fd_info->handleType);
 
    /*
-    * Seam for the Android WSI: AHB import and export go through gralloc
-    * and the same kbase import as dma-bufs. Refused here, before the
-    * runtime's memory object (which would take an AHB reference).
+    * An AHardwareBuffer (a BLOB, buffers only): imported as its dma-buf, by
+    * the same path as an fd import. The chain is rebuilt without the AHB
+    * struct before the runtime's memory object sees it (its AHB code is
+    * not built: ANDROID_API_LEVEL is undefined), keeping the dedicated
+    * allocation and the allocation flags.
     */
-   if (__vk_find_struct((void *)pAllocateInfo->pNext,
-                        VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID))
+   const VkImportAndroidHardwareBufferInfoANDROID *ahb_info =
+      __vk_find_struct((void *)pAllocateInfo->pNext,
+                       VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID);
+   if (ahb_info) {
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+      int fd;
+      VkResult r = mali_android_import_ahb(dev, ahb_info->buffer, &fd);
+      if (r != VK_SUCCESS)
+         return r;
+      VkImportMemoryFdInfoKHR fdi = {
+         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd};
+      const VkMemoryDedicatedAllocateInfo *d =
+         vk_find_struct_const(pAllocateInfo->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+      const VkMemoryAllocateFlagsInfo *fl =
+         vk_find_struct_const(pAllocateInfo->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+      VkMemoryDedicatedAllocateInfo ded;
+      VkMemoryAllocateFlagsInfo flags;
+      const void **tail = &fdi.pNext;
+      if (d) {
+         ded = *d;
+         ded.pNext = NULL;
+         *tail = &ded;
+         tail = &ded.pNext;
+      }
+      if (fl) {
+         flags = *fl;
+         flags.pNext = NULL;
+         *tail = &flags;
+      }
+      VkMemoryAllocateInfo ai = *pAllocateInfo;
+      ai.pNext = &fdi;
+      r = mali_AllocateMemory(_device, &ai, pAllocator, pMem);
+      if (r != VK_SUCCESS)
+         close(fd);                      /* a failed import does not own it */
+      return r;
+#else
       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
-                       "AHardwareBuffer import is not implemented");
+                       "AHardwareBuffer import outside Android");
+#endif
+   }
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
    const bool export_dmabuf =

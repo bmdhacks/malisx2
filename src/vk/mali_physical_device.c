@@ -332,6 +332,10 @@ static const struct vk_device_extension_table mali_device_extensions = {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* Without it the Android loader builds no swapchain. */
    .ANDROID_native_buffer = true,
+   /* Buffers' memory from BLOB hardware buffers (mali_android.c): an
+    * emulator's guest RAM read in place. Images are not importable. */
+   .ANDROID_external_memory_android_hardware_buffer = true,
+   .EXT_queue_family_foreign = true,
 #else
    /* The Linux window system: Mesa's WSI owns the swapchain for a
     * VK_KHR_display surface (mali_wsi_linux.c). */

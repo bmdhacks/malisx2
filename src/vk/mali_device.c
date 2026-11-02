@@ -268,6 +268,19 @@ device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
              VK_ERROR_DEVICE_LOST;
 }
 
+/* Mesa's lookup, and malisx2's own commands by name (mali_vk.h). */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+mali_GetDeviceProcAddr(VkDevice _device, const char *pName)
+{
+   VK_FROM_HANDLE(vk_device, device, _device);
+   if (device && pName && !strcmp(pName, "vkCmdSetIndexRangeMALISX2")) {
+      const struct mali_physical_device *pdev =
+         container_of(device->physical, struct mali_physical_device, vk);
+      return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetIndexRangeMALISX2 : NULL;
+   }
+   return vk_device_get_proc_addr(device, pName);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_CreateDevice(VkPhysicalDevice physicalDevice,
                   const VkDeviceCreateInfo *pCreateInfo,

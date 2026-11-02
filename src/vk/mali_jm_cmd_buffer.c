@@ -861,6 +861,9 @@ MALI_PER_ARCH(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
     * buffer pending twice at once (SIMULTANEOUS_USE) runs its submissions
     * one after the other: one chain cannot run twice at the same time. */
    cmd->jm.resubmit = !(info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+#if PAN_ARCH < 9
+   cmd->jm.idx_hint.set = false;
+#endif
    return VK_SUCCESS;
 }
 

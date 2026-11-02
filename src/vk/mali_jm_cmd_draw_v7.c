@@ -68,6 +68,7 @@
 #include "panfrost/compiler/pan_nir.h"
 #include "util/blend.h"
 #include "util/log.h"
+#include "util/os_time.h"
 #include "vk_log.h"
 
 #include "mali_rsd_v7.h"
@@ -1188,7 +1189,11 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
        * indices cannot be read here is skipped. */
       uint32_t min, max;
       bool empty;
-      if (!index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty) || empty)
+      const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
+      const bool ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
+      if (unlikely(t_scan))
+         mali_cpuprof_part(MALI_CPUPROF_IDXSCAN, t_scan);
+      if (!ok || empty)
          return;
       dd.vertex_range = max - min + 1;
       dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
@@ -1197,7 +1202,11 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    dd.padded_count =
       di->instance_count > 1 ? padded_vertex_count(dd.vertex_range) : dd.vertex_range;
 
-   if (!prepare_draw(cmd, di, &dd)) {
+   const uint64_t t_prep = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
+   const bool prepared = prepare_draw(cmd, di, &dd);
+   if (unlikely(t_prep))
+      mali_cpuprof_part(MALI_CPUPROF_DRAWPREP, t_prep);
+   if (!prepared) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }

@@ -162,7 +162,9 @@ struct mali_measure_region {
                                 draw: count, instances, indexed, pass */
    uint64_t shader;          /* dispatch, draw: first 8 bytes of the (fragment) shader key */
    uint32_t extra;           /* draw: render targets blended by a blend shader */
-   uint64_t *slot;           /* CPU view: begin, end */
+   uint64_t *slot;           /* CPU view: begin, end (and with cycles, the GPU
+                                cycle counter at begin and end) */
+   bool cycles;              /* job manager: slot[2..3] are cycle counts */
    uint64_t slot_va;
 };
 

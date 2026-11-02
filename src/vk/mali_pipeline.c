@@ -279,6 +279,16 @@ stage_dump(const struct stage *st, const struct mali_shader *s)
       fwrite(s->bin, 1, s->bin_size, f);
       fclose(f);
    }
+#if PAN_ARCH == 7
+   /* The compiler's static estimate: registers, spills, and cycles per
+    * quad in the arithmetic, load/store, varying and texture units. */
+   snprintf(path, sizeof(path), "%s/%016" PRIx64 ".%s.stats", dir, key, sname);
+   f = fopen(path, "w");
+   if (f) {
+      pan_bifrost_stats_verbose(f, &s->info.stats.bifrost, s->info.tls_size);
+      fclose(f);
+   }
+#endif
    snprintf(path, sizeof(path), "%s/index.txt", dir);
    f = fopen(path, "a");
    if (f) {

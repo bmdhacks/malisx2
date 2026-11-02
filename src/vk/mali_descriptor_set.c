@@ -728,6 +728,9 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
    VK_FROM_HANDLE(mali_descriptor_pool, pool, pAllocateInfo->descriptorPool);
    VkResult result = VK_SUCCESS;
    uint32_t i;
+   /* A linear pool's position, put back if this call fails. */
+   const uint32_t next = pool->next;
+   const uint64_t bump = pool->bump;
 
    for (i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(mali_descriptor_set_layout, layout, pAllocateInfo->pSetLayouts[i]);
@@ -746,6 +749,12 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
     * pools on it. */
    for (uint32_t j = 0; j < i; j++)
       pool_free_set(dev, pool, mali_descriptor_set_from_handle(pDescriptorSets[j]));
+   /* This call's sets were a linear pool's last ones: their slots and
+    * memory go back too, not only at the next reset. */
+   if (pool->linear) {
+      pool->next = next;
+      pool->bump = bump;
+   }
    for (uint32_t j = 0; j < pAllocateInfo->descriptorSetCount; j++)
       pDescriptorSets[j] = VK_NULL_HANDLE;
    return result;

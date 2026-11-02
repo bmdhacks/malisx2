@@ -915,8 +915,10 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
                    bt->vtc_after_frag - 1u < k)
                   req = newer(req, batch_frag[bt->vtc_after_frag - 1u]);
             }
-            if (bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX)
+            if (bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX) {
                req = newer(req, q->heap_last_frag[bt->heap_slot]);
+               q->submit_tiled++;
+            }
             /* A transfer-only requirement carried from an earlier command
              * buffer: met by the first vtc chain with a transfer job, or
              * by any vtc atom that waits for as much anyway (later vtc
@@ -1075,6 +1077,7 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    }
 
    mali_jm_build_begin(dev, seqno);
+   q->submit_tiled = 0;
    result = build_submit(dev, submit, batch_frag);
    free(batch_frag);
    mali_jm_ref tracker = 0;
@@ -1091,6 +1094,7 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
 
    if (result == VK_SUCCESS) {
       if (built) {
+         mali_jm_heap_note_submit(jd, q->submit_tiled);
          q->seq++;
          q->tracker = tracker;
          /* Everything already finished and was read meanwhile. */

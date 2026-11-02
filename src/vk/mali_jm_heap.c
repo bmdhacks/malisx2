@@ -5,7 +5,8 @@
 
 /*
  * The tiler heap ring of the job-manager (v7 and v9) back half:
- * MALI_JM_HEAP_SLOTS growable GPU regions the tiler allocates polygon lists
+ * growable GPU regions (MALI_JM_HEAP_SLOTS at first, more when submissions
+ * keep wrapping the ring; mali_jm.h) the tiler allocates polygon lists
  * from, and on v9 vertex packets too (mali_jm.h has the scheme). The
  * driver owns the memory and writes the Tiler Heap descriptor itself when
  * it records, as Mesa's gallium driver does; there is no JIT allocation
@@ -45,12 +46,14 @@ mali_jm_heap_init(struct mali_jm_device *jd)
 {
    simple_mtx_init(&jd->heap.lock, mtx_plain);
    jd->heap.next = 0;
+   jd->heap.count = MALI_JM_HEAP_SLOTS;
+   jd->heap.win_len = jd->heap.win_hits = jd->heap.win_max = 0;
 }
 
 void
 mali_jm_heap_finish(struct mali_jm_device *jd)
 {
-   for (unsigned i = 0; i < MALI_JM_HEAP_SLOTS; i++) {
+   for (unsigned i = 0; i < MALI_JM_HEAP_SLOTS_MAX; i++) {
       if (jd->heap.bo[i].size)
          mali_kbase_free(jd->kb, &jd->heap.bo[i]);
    }
@@ -59,9 +62,8 @@ mali_jm_heap_finish(struct mali_jm_device *jd)
 
 /* A slot's memory: GPU-only and growable. On a 64-bit job-manager context
  * the kernel makes it SAME_VA, so mali_kbase_alloc maps it whole with no CPU
- * access (PROT_NONE) to get its address; 4 slots take 1 GiB of the
- * process's address space and commit 2 MiB each until the tiler grows
- * them. */
+ * access (PROT_NONE) to get its address; each slot takes 256 MiB of the
+ * process's address space and commits 2 MiB until the tiler grows it. */
 static bool
 slot_alloc(struct mali_jm_device *jd, struct mali_kbase_bo *bo)
 {
@@ -96,7 +98,7 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    const uint32_t slot = h->next;
    bool ok = h->bo[slot].size || slot_alloc(jd, &h->bo[slot]);
    if (ok)
-      h->next = (slot + 1) % MALI_JM_HEAP_SLOTS;
+      h->next = (slot + 1) % h->count;
    const uint64_t base = h->bo[slot].gpu_va;
    const uint64_t size = h->bo[slot].size;
    simple_mtx_unlock(&h->lock);
@@ -119,9 +121,34 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    /* The GPU advances Bottom and Top. */
    mali_jm_cmd_note_reset(cmd, p.cpu, &desc, sizeof(desc));
 
-   STATIC_ASSERT(MALI_JM_HEAP_SLOTS <= MALI_JM_HEAP_SLOTS_MAX);
+   STATIC_ASSERT(MALI_JM_HEAP_SLOTS_GROWN <= MALI_JM_HEAP_SLOTS_MAX);
    STATIC_ASSERT(MALI_JM_HEAP_SLOT_SIZE <= UINT32_MAX);
    b->heap_slot = (int16_t)slot;
    b->heap_desc = p.gpu;
    return true;
+}
+
+void
+mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled)
+{
+   struct mali_jm_heap *h = &jd->heap;
+   if (h->count >= MALI_JM_HEAP_SLOTS_GROWN)
+      return;
+   if (tiled > h->count) {
+      h->win_hits++;
+      h->win_max = MAX2(h->win_max, tiled);
+   }
+   if (++h->win_len < MALI_JM_HEAP_GROW_WINDOW)
+      return;
+   if (h->win_hits >= MALI_JM_HEAP_GROW_HITS) {
+      const uint32_t want = MIN2(ALIGN_POT(h->win_max, 4), MALI_JM_HEAP_SLOTS_GROWN);
+      simple_mtx_lock(&h->lock);
+      const uint32_t old = h->count;
+      h->count = MAX2(h->count, want);
+      simple_mtx_unlock(&h->lock);
+      mesa_logi("malisx2: tiler heap ring %u -> %u slots (%u of the last %u submissions "
+                "wrapped it, up to %u tiled passes)",
+                old, want, h->win_hits, h->win_len, h->win_max);
+   }
+   h->win_len = h->win_hits = h->win_max = 0;
 }

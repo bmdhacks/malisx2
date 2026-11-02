@@ -59,6 +59,7 @@
 #define mali_jm_draw_tmpl_init MALI_PER_ARCH(jm_draw_tmpl_init)
 #define mali_jm_heap_finish MALI_PER_ARCH(jm_heap_finish)
 #define mali_jm_heap_init MALI_PER_ARCH(jm_heap_init)
+#define mali_jm_heap_note_submit MALI_PER_ARCH(jm_heap_note_submit)
 #define mali_jm_heap_take MALI_PER_ARCH(jm_heap_take)
 #define mali_jm_measure_begin MALI_PER_ARCH(jm_measure_begin)
 #define mali_jm_measure_capture_atoms MALI_PER_ARCH(jm_measure_capture_atoms)

@@ -627,6 +627,11 @@ void mali_jm_heap_finish(struct mali_jm_device *jd);
  * b->heap_desc). False on failure, with the command buffer's error set. */
 bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 
+/* After a submission is built: it had `tiled` batches with a heap slot.
+ * Grows the ring when submissions keep wrapping it (mali_jm.h). With
+ * dev->lock held. */
+void mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled);
+
 #if PAN_ARCH < 9
 /* ---------------------------------------------------------------------- */
 /* Bifrost descriptor tables (mali_jm_desc_v7.c)                           */
@@ -841,7 +846,7 @@ struct mali_jm_atom_info {
  * from the heap, and on v9 vertex packets (varyings) too; v7 keeps its
  * varyings in command memory. The kernel does not order atoms that share
  * memory, so a heap region is reused only after the fragment work that
- * reads it. The ring has MALI_JM_HEAP_SLOTS regions; a batch that tiles
+ * reads it. The ring has MALI_JM_HEAP_SLOTS regions at first (below); a batch that tiles
  * takes the next one when its first pass starts tiling, and every pass and
  * layer of the batch tiles through one Tiler Heap descriptor in its
  * command memory. The queue keeps, per slot, the last fragment atom that
@@ -852,16 +857,33 @@ struct mali_jm_atom_info {
  * commit the gaps between them): GPU read/write, no CPU access,
  * TILER_ALIGN_TOP, 2 MiB committed, 2 MiB growth steps, 256 MiB of VA (the
  * T820 blob's big JIT heaps are 360 MiB).
+ *
+ * The ring starts with MALI_JM_HEAP_SLOTS slots and grows, never shrinks,
+ * up to MALI_JM_HEAP_SLOTS_GROWN. A submission with more tiled batches than
+ * the ring has slots makes a batch's tiling wait for the fragment work of a
+ * batch in the same submission, which cannot have finished yet. When that
+ * happens in MALI_JM_HEAP_GROW_HITS of MALI_JM_HEAP_GROW_WINDOW submissions,
+ * the ring grows to the most tiled batches one of them had, rounded up to a
+ * multiple of 4 (mali_jm_heap_note_submit). An application with few passes
+ * per submission keeps 4 slots and 8 MiB.
  */
 #define MALI_JM_HEAP_SLOTS_MAX 32
 #define MALI_JM_HEAP_SLOTS 4
+#define MALI_JM_HEAP_SLOTS_GROWN 16
+#define MALI_JM_HEAP_GROW_WINDOW 32
+#define MALI_JM_HEAP_GROW_HITS 8
 #define MALI_JM_HEAP_CHUNK (2ull << 20)
 #define MALI_JM_HEAP_SLOT_SIZE (256ull << 20)
 
 struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
-   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS];
+   uint32_t count;          /* slots in the ring now; written under lock */
+   /* The current window of submissions (the submit path only, under
+    * dev->lock): how many there were, how many wrapped the ring, and the
+    * most tiled batches one of those had. */
+   uint32_t win_len, win_hits, win_max;
+   struct mali_kbase_bo bo[MALI_JM_HEAP_SLOTS_MAX];
 };
 
 #define MALI_JM_EVENTS_PER_READ 32
@@ -943,6 +965,7 @@ struct mali_jm_queue {
    mali_jm_ref last[MALI_JM_SLOT_COUNT];
    /* Per tiler heap slot, the last fragment atom that used it. */
    mali_jm_ref heap_last_frag[MALI_JM_HEAP_SLOTS_MAX];
+   uint32_t submit_tiled;   /* batches with a heap slot in the submission being built */
    /* Submissions with atoms so far, the last one's tracker, and the
     * newest submission whose tracker event has been read. */
    uint64_t seq;

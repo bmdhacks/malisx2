@@ -326,8 +326,8 @@ c vkResetQueryPoolEXT
 c vkSubmitDebugUtilsMessageEXT
 c vkTrimCommandPool
 c vkTrimCommandPoolKHR
-c vkUpdateDescriptorSetWithTemplate
-c vkUpdateDescriptorSetWithTemplateKHR
+b vkUpdateDescriptorSetWithTemplate
+b vkUpdateDescriptorSetWithTemplateKHR
 
 d vkBindBufferMemory2 nonnull
 d vkBindBufferMemory2KHR

@@ -355,6 +355,36 @@ mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
 }
 #endif
 
+bool
+mali_jm_cmd_add_job_at(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                       struct mali_ptr job, enum mali_job_type type, bool barrier,
+                       uint16_t dep1)
+{
+#if PAN_ARCH < 9
+   if (unlikely(cmd->jm.pend_tilers) && !cmd->jm.tiler_defer)
+      mali_v7_link_tilers(cmd, 0);
+#endif
+   if (!chain_has_room(cmd, c))
+      return false;
+
+   if (unlikely(c->pending)) {
+      if (c->pending & MALI_JM_PENDING_FLUSH) {
+         struct mali_ptr f = mali_cmd_alloc(cmd, pan_size(CACHE_FLUSH_JOB), 128);
+         if (!f.cpu)
+            return false;
+         link_job(cmd, c, f, MALI_JOB_TYPE_CACHE_FLUSH, true, 0);
+         pan_section_pack(f.cpu, CACHE_FLUSH_JOB, PAYLOAD, p) {
+            p.invalidate_shader_core_other = true;
+         }
+      }
+      barrier = true;
+      c->pending = 0;
+   }
+
+   link_job(cmd, c, job, type, barrier, dep1);
+   return true;
+}
+
 struct mali_ptr
 mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                     enum mali_job_type type, unsigned size, bool barrier, uint16_t dep1)

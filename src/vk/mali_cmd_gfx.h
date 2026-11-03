@@ -356,6 +356,11 @@ MALI_PER_ARCH_DECL(void, cmd_dispatch_meta,
                     const void *push, uint32_t push_size, const uint32_t groups[3],
                     const uint32_t (*textures)[8], unsigned texture_count));
 
+/* Internal shader m (enum mali_meta_shader, mali_cmd_copy.c), compiled on
+ * first use; NULL with the command buffer's error set on failure. */
+MALI_PER_ARCH_DECL(const struct mali_shader *, cmd_meta_shader,
+                   (struct mali_cmd_buffer *cmd, unsigned m));
+
 /* The internal copy/fill shaders, blend shaders and internal fragment
  * shaders of a device, freed at device destruction (mali_cmd_copy.c). */
 MALI_PER_ARCH_DECL(void, meta_finish, (struct mali_device *dev));

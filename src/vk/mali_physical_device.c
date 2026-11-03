@@ -415,10 +415,29 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_create_renderpass2 = true,
 };
 
+/*
+ * 8- and 16-bit storage buffer and push constant access, and 8-bit integer
+ * arithmetic, as panvk reports them. v7 only: its shaders go through Mesa's
+ * Bifrost backend, which lowers narrow loads and stores itself
+ * (bifrost_nir.c, nir_lower_mem_access_bit_sizes); kraid (v9, v11) is not
+ * checked for them yet. parallel-RDP (N64) requires the storage features.
+ */
+static bool
+small_storage_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+   /* 8- and 16-bit storage (see small_storage_for_arch). */
+   if (small_storage_for_arch(arch)) {
+      ext.KHR_8bit_storage = true;
+      ext.KHR_16bit_storage = true;
+      ext.KHR_shader_float16_int8 = true;
+   }
    return ext;
 }
 
@@ -508,6 +527,16 @@ get_features(struct vk_features *f, uint32_t arch)
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       .shaderInt16 = true,
+
+      /* VK_KHR_8bit_storage, VK_KHR_16bit_storage and the int8 half of
+       * VK_KHR_shader_float16_int8 (small_storage_for_arch). */
+      .storageBuffer8BitAccess = small_storage_for_arch(arch),
+      .uniformAndStorageBuffer8BitAccess = small_storage_for_arch(arch),
+      .storagePushConstant8 = small_storage_for_arch(arch),
+      .storageBuffer16BitAccess = small_storage_for_arch(arch),
+      .uniformAndStorageBuffer16BitAccess = small_storage_for_arch(arch),
+      .storagePushConstant16 = small_storage_for_arch(arch),
+      .shaderInt8 = small_storage_for_arch(arch),
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,

@@ -886,14 +886,26 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
           * on the G615 adds a Less/Lequal/Greater/Gequal depth function, no
           * stencil test and no occlusion query. Nothing observes the order
           * when no target blends against the destination and the depth test
-          * picks the winner. */
+          * picks the winner.
+          *
+          * A shader that reads the colour attachment it writes (input
+          * attachment or rasterization-order access) does observe it: each
+          * fragment reads what the earlier primitives left there, so a
+          * reordered draw composes in a different order. ARMSX2 draws with
+          * rasterization-order colour access on Mali, and with the bit set
+          * WRC 3 got light vertical streaks a few pixels wide and Katamari
+          * Damacy changed at 2x upscale and above, on the G57 and the G615.
+          * Those draws are excluded the same way forward pixel kill
+          * excludes them. */
          cfg.allow_primitive_reorder =
             has_depth(in->rp) && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable &&
             (dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS ||
              dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS_OR_EQUAL ||
              dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER ||
              dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL) &&
-            !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read;
+            !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read &&
+            !(out->rt_read & out->rt_written) &&
+            !(dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT);
          cfg.scissor_to_bounding_box = true;
 #if PAN_ARCH >= 10
          cfg.conservative_rast_mode =

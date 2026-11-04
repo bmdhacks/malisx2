@@ -496,6 +496,13 @@ hash_fs_state(struct mesa_blake3 *ctx, const struct mali_device *dev,
       _mesa_blake3_update(ctx, state->ial, sizeof(*state->ial));
    if (state->cal)
       _mesa_blake3_update(ctx, state->cal, sizeof(*state->cal));
+#if PAN_ARCH < 9
+   /* Which output locations feed an attachment (mali_shader.c
+    * location_attachment). */
+   if (state->rp)
+      _mesa_blake3_update(ctx, &state->rp->color_attachment_count,
+                          sizeof(state->rp->color_attachment_count));
+#endif
 }
 
 /* Descriptor sets a stage's resource table reads: the sets it indexes and

@@ -14,12 +14,19 @@
  * the GPU:
  *
  *  - Size: the region's size; Base and Bottom: its start;
- *  - Top: the end of the first 2 MiB chunk, not the end of the region. The
- *    tiler allocates chunks from both the bottom and the top pointer and
- *    moves either on to a new chunk when its part is used up. A Top at the
- *    region's end would make the first top-side allocation fault at the
- *    region's last page, and a GROW_ON_GPF fault commits every page from
- *    the current commit up to the faulting one: the whole region.
+ *  - Top on v7: the region's end. v7's tiler fails a batch with
+ *    OUT_OF_MEMORY (0x60) once its polygon lists would pass Top, and the
+ *    region is backed only as far as the tiler has used it (measured on a
+ *    G52 r1 with kbase r34p0: one triangle backs 2 MiB, four million
+ *    small ones 40 MiB). With Top at the end of the first 2 MiB chunk, as
+ *    on v9, ARMSX2's batches of upscaled passes ran out (issue #5);
+ *  - Top on v9: the end of the first 2 MiB chunk, not the end of the
+ *    region. The tiler allocates chunks from both the bottom and the top
+ *    pointer and moves either on to a new chunk when its part is used up.
+ *    A Top at the region's end would make the first top-side allocation
+ *    fault at the region's last page, and a GROW_ON_GPF fault commits
+ *    every page from the current commit up to the faulting one: the whole
+ *    region.
  *    TILER_ALIGN_TOP with a 2 MiB commit and a 2 MiB growth step makes the
  *    kernel place the region so that start + commit is 2 MiB aligned, so
  *    start + 2 MiB is the end of the committed chunk;
@@ -115,7 +122,11 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
       cfg.size = (uint32_t)size;
       cfg.base = base;
       cfg.bottom = base;
+#if PAN_ARCH == 7
+      cfg.top = base + size;
+#else
       cfg.top = base + MIN2(MALI_JM_HEAP_CHUNK, size);
+#endif
    }
    memcpy(p.cpu, &desc, sizeof(desc));
    /* The GPU advances Bottom and Top. */

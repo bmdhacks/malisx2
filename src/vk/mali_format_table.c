@@ -42,12 +42,12 @@ compressed_format_bits(const struct mali_physical_device *pdev)
 }
 
 /*
- * The BCn formats. The GPU's TEXTURE_FEATURES_0 can have their bits (the
- * G57 does), but this driver reports textureCompressionBC false: its BC
- * upload and sampling path is not implemented, and hakuX's DXT textures
- * (uploaded as BC because the format answers claimed they were sampleable)
- * came out as noise. Answer no for them, as Arm's blob does, so an
- * application decodes DXT itself.
+ * The BCn formats. v7 samples the ones the GPU's TEXTURE_FEATURES_0 has
+ * (format_image_features). v9 and v11 answer no for them, as Arm's blob
+ * does, so an application decodes DXT itself: the GPU can have their bits
+ * (the G57 does), but their BC upload and sampling path is not
+ * implemented, and hakuX's DXT textures (uploaded as BC because the format
+ * answers claimed they were sampleable) came out as noise.
  */
 static bool
 is_bc_format(VkFormat format)
@@ -98,11 +98,12 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
     * the T618's Mali-G52, 0xf7fffffe), as sampled images with linear
     * filtering, transfer source and destination: the layout (u-interleaved
     * tiles of 4x4 blocks) and the block copies are the ones the other
-    * compressed formats use. textureCompressionBC stays false; hakuX asks
-    * per format (BC1-3) and then uploads its DXT textures as they are, a
-    * quarter to an eighth of the BGRA8 it decodes them to otherwise. Not
-    * on v9/v11, where the earlier noise was seen. The debug switch nobc
-    * answers no again.
+    * compressed formats use. With all of BC1-7 that is
+    * textureCompressionBC (mali_physical_device.c bc_formats_complete):
+    * hakuX asks per format (BC1-3), Dolphin for the feature, and then they
+    * upload their BC textures as they are, a quarter to an eighth of the
+    * BGRA8 they decode them to otherwise. Not on v9/v11, where the earlier
+    * noise was seen. The debug switch nobc answers no again.
     */
    if (is_bc_format(format) && (PAN_ARCH != 7 || mali_debug_flag("nobc")))
       return 0;

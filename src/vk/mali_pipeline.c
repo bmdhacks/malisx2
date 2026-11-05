@@ -170,6 +170,21 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
    st->info = info;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &st->rs,
                                      pipeline_pNext, info->pNext);
+#if PAN_ARCH == 7
+   /* A v7 Vertex job shades every vertex of the draw's index range,
+    * including ones no index names (mali_jm_cmd_draw_v7.c), which the
+    * application never meant to run. A vertex shader that pulls its
+    * vertices out of a storage buffer by gl_VertexIndex can compute an
+    * address far outside the buffer for one of those: ARMSX2's line
+    * expansion reads vertex BaseVertex + n - 1, which wraps to 2^32 - 1
+    * when BaseVertex and n are 0, and the unchecked load there faults the
+    * GPU context. Vertex shaders get bounds-checked storage buffer loads,
+    * as with robustBufferAccess; the hash below keeps them apart in the
+    * caches. */
+   if (info->stage == VK_SHADER_STAGE_VERTEX_BIT &&
+       st->rs.storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      st->rs.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+#endif
    vk_pipeline_hash_shader_stage(flags, info, &st->rs, st->stage_hash);
 }
 

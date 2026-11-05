@@ -419,6 +419,24 @@ static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+   if (arch == 7) {
+      /* What v7 has of what Vulkan 1.3 made core: synchronization2 (the
+       * driver's barrier and submit are the 2 forms; the runtime has the
+       * 1.0 ones), the dynamic states of VK_EXT_extended_dynamic_state
+       * and _2 and vertex input dynamic state (pipelines with dynamic
+       * state repack their words at the draw, mali_cmd_state.h
+       * mali_gfx_update_dirty), private data (runtime) and demote to
+       * helper invocation (Mesa's Bifrost backend). The device stays 1.1:
+       * 1.2 and 1.3 also require host query reset, buffer device address,
+       * maintenance4, inline uniform blocks and subgroup size control,
+       * which v7 does not have. */
+      ext.KHR_synchronization2 = true;
+      ext.EXT_extended_dynamic_state = true;
+      ext.EXT_extended_dynamic_state2 = true;
+      ext.EXT_vertex_input_dynamic_state = true;
+      ext.EXT_shader_demote_to_helper_invocation = true;
+      ext.EXT_private_data = true;
+   }
    return ext;
 }
 
@@ -561,6 +579,22 @@ get_features(struct vk_features *f, uint32_t arch)
        * and which requires all three names. */
       .dynamicRendering = true,
    };
+
+   /* The extensions of device_extensions_for_arch on v7. */
+   if (arch == 7) {
+      f->synchronization2 = true;
+      f->privateData = true;
+      f->shaderDemoteToHelperInvocation = true;
+      /* VK_EXT_extended_dynamic_state, _2 and vertex input dynamic
+       * state: the runtime keeps the state; a pipeline with dynamic
+       * state repacks its words from it at the draw. No logic op and no
+       * patch control points (no logicOp, no tessellation). */
+      f->extendedDynamicState = true;
+      f->extendedDynamicState2 = true;
+      f->extendedDynamicState2LogicOp = false;
+      f->extendedDynamicState2PatchControlPoints = false;
+      f->vertexInputDynamicState = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and

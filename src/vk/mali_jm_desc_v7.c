@@ -228,11 +228,19 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       return true;
 
    /* Every bound set: the copy shader's sources (panvk passes them all). */
+   out->cpu_fill = !cmd->dev->jm->v7_gpu_desc_copy;
    for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
+      out->set_host[i] = set ? set->host : NULL;
+      if (set && set->gpu &&
+          (!set->host ||
+           (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)))
+         out->cpu_fill = false;
    }
+   if (v7->count[MALI_V7_DESC_TABLE_IMG])
+      out->cpu_fill = false;
 
    for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
       const uint32_t regular = v7->count[t];
@@ -249,6 +257,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       if (!p.cpu)
          return false;
       out->tables[t] = p.gpu;
+      out->tables_cpu[t] = p.cpu;
 
       /* The dynamic uniform buffers behind the regular ones. */
       if (t == MALI_V7_DESC_TABLE_UBO && dyn_ubo_count)
@@ -763,6 +772,43 @@ mali_v7_desc_finish(struct mali_device *dev)
 /* ---------------------------------------------------------------------- */
 /* Filling the copied entries                                              */
 
+/*
+ * The copy job's work done on the CPU, when the command buffer is
+ * recorded, from the sets' host copies: the same entries, read the same
+ * way (a slot past a set's end, or of a set that is not bound, reads as
+ * zeros). The draw then has no copy job, and its Vertex job no dependency
+ * on one: on the G52 each copy job is a small dispatch the Vertex job has
+ * to wait for, and hakuX binds a new set for most draws. Valid because a
+ * set not laid out for update after bind may not change while a command
+ * buffer that bound it is recorded and run; the image table (storage
+ * images, texel buffers), whose entries the copy rewrites, keeps the
+ * job.
+ */
+static void
+desc_fill_cpu(const struct mali_shader *s, const struct mali_v7_desc_tables *t)
+{
+   static const uint8_t zero[MALI_DESCRIPTOR_SIZE];
+   uint32_t first = 0;
+   for (unsigned tab = 0; tab < MALI_V7_DESC_TABLE_COUNT; tab++) {
+      const uint32_t n = s->v7.count[tab];
+      const unsigned size = tab == MALI_V7_DESC_TABLE_UBO ? pan_size(UNIFORM_BUFFER)
+                            : tab == MALI_V7_DESC_TABLE_TEXTURE ? pan_size(TEXTURE)
+                                                                : pan_size(SAMPLER);
+      uint8_t *dst = t->tables_cpu[tab];
+      assert(!n || (dst && tab != MALI_V7_DESC_TABLE_IMG));
+      for (uint32_t i = 0; i < n; i++) {
+         const uint32_t h = s->v7.map[first + i];
+         const uint32_t set = MALI_COPY_DESC_HANDLE_SET(h);
+         const uint32_t slot = MALI_COPY_DESC_HANDLE_INDEX(h);
+         const void *src = zero;
+         if (set < MALI_MAX_SETS && slot < t->set_desc_counts[set] && t->set_host[set])
+            src = (const uint8_t *)t->set_host[set] + (size_t)slot * MALI_DESCRIPTOR_SIZE;
+         memcpy(dst + (size_t)i * size, src, size);
+      }
+      first += n;
+   }
+}
+
 bool
 mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                   const struct mali_shader *s, const struct mali_v7_desc_tables *t,
@@ -772,6 +818,10 @@ mali_v7_desc_copy(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    assert(t->shader == s);
    if (!s->v7.map_count)
       return true;
+   if (t->cpu_fill) {
+      desc_fill_cpu(s, t);
+      return true;
+   }
    /* The map is in GPU memory: shader_upload uploads it whatever the size
     * of the code, or fails the shader (mali_shader.c). */
    assert(s->v7.map_mem.gpu_va);

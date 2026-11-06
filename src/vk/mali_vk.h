@@ -393,7 +393,9 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
 /*
  * malisx2's own device extension on v7, in place of
  * VK_EXT_descriptor_indexing (whose required features and 500000
- * update-after-bind limits v7's 16-bit descriptor tables cannot meet):
+ * update-after-bind limits v7's 16-bit descriptor tables cannot meet). v9
+ * and v11 offer VK_EXT_descriptor_indexing itself (mali_physical_device.c)
+ * and not this one; v7 offers this one and not the EXT.
  *
  * - With it offered, VkPhysicalDeviceDescriptorIndexingFeatures and
  *   VkPhysicalDeviceDescriptorIndexingProperties may be chained into
@@ -423,12 +425,19 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
  *   maxPerStageDescriptorUpdateAfterBindSampledImages says of the last
  *   kind; pipeline creation fails with VK_ERROR_FEATURE_NOT_PRESENT past
  *   that.
- *
- * VK_EXT_descriptor_indexing itself is not offered on v7 and cannot be
- * enabled (mali_physical_device.c, mali_device.c).
  */
 #define VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME "VK_MALISX2_descriptor_indexing"
 #define VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION 1
+
+/* Whether descriptor indexing is offered to applications under malisx2's own
+ * name (v7) and not VK_EXT_descriptor_indexing's (v9, v11). Mesa's runtime
+ * keys the feature structs on the EXT, so it is supported to the runtime
+ * either way. */
+static inline bool
+mali_descriptor_indexing_renamed(uint32_t arch)
+{
+   return arch == 7;
+}
 
 #if defined(PAN_ARCH) && PAN_ARCH == 7
 #include "util/log.h"

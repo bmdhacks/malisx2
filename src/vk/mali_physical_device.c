@@ -1090,11 +1090,11 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->dynamicRenderingLocalReadDepthStencilAttachments = true;
       props->dynamicRenderingLocalReadMultisampledAttachments = false;
 
-      /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
-       * the ordinary ones; per-stage ones are raised below. A non-uniform
-       * index must be uniform within a fragment quad even for explicit
-       * level of detail, which quadDivergentImplicitLod does not cover
-       * (mali_vk.h). */
+      /* VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features):
+       * the limits start as the ordinary ones; per-stage ones are raised
+       * below. A non-uniform index must be uniform within a fragment quad
+       * even for explicit level of detail, which quadDivergentImplicitLod
+       * does not cover (mali_vk.h). */
       props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
       props->quadDivergentImplicitLod = false;
       props->shaderSampledImageArrayNonUniformIndexingNative = false;
@@ -1123,10 +1123,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
          props->maxDescriptorSetInputAttachments;
 
       /*
-       * VK_MALISX2_descriptor_indexing (get_features). An update-after-bind
-       * limit counts the descriptors of sets with and without the
-       * update-after-bind bit, so none is below its ordinary counterpart:
-       * per set they are the ordinary limits.
+       * VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features).
+       * An update-after-bind limit counts the descriptors of sets with and
+       * without the update-after-bind bit, so none is below its ordinary
+       * counterpart: per set they are the ordinary limits.
        *
        * Per stage, a stage whose textures and samplers all come from one
        * update-after-bind set reads that set as its tables

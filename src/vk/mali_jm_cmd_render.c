@@ -101,17 +101,7 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
     * batch, so a full batch closes before the pass starts. */
    if (cmd->jm.open) {
       const struct mali_jm_batch *b = &cmd->jm.cur;
-      unsigned max_passes = MALI_JM_BATCH_MAX_PASSES;
-#if PAN_ARCH < 9
-      /* A batch's fragment work waits for all of its tiling, and the next
-       * batch's tiling runs while it shades: one pass a batch overlaps the
-       * two the most. With image barriers narrowed, render-to-texture
-       * passes no longer end their batch at the barrier between them, so
-       * the limit does it, which keeps the atoms hakuX's passes had. */
-      if (cmd->dev->jm->v7_image_barrier_narrow)
-         max_passes = 1;
-#endif
-      if (b->passes >= max_passes || b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS ||
+      if (b->passes >= MALI_JM_BATCH_MAX_PASSES || b->vtc.jobs >= MALI_JM_BATCH_MAX_JOBS ||
           b->est_heap_bytes >= MALI_JM_HEAP_SLOT_SIZE / 2)
          mali_jm_cmd_batch_close(cmd);
    }

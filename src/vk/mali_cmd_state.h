@@ -1162,6 +1162,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .rp = &p->rp,
             .vs = p->vs,
             .fs = p->fs,
+            .view_mask = p->state.rp.view_mask,
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

@@ -136,6 +136,12 @@ struct mali_jm_batch {
                                only requirement carried from an earlier
                                command buffer (mali_jm_queue::xvtc_frag) */
 #if PAN_ARCH < 9
+   bool vtc_img;            /* its vtc chain has a job that can touch images
+                               or memory (a transfer, a dispatch, a draw whose
+                               vertex shader reads images or writes memory):
+                               it meets an image barrier's requirement
+                               carried from an earlier command buffer
+                               (mali_jm_queue::ivtc_frag) */
    bool vtc_fresh;          /* its vtc chain has a copy into a fresh image
                                (mali_image::fresh): it meets such a
                                requirement only when a buffer barrier
@@ -192,6 +198,13 @@ struct mali_jm_batch {
  * made): a copy into a fresh image waits for them too
  * (mali_jm_batch::vtc_fresh). */
 #define MALI_JM_REQ_XVTC_BUF             (1u << 5)
+#if PAN_ARCH < 9
+/* v7: the "vtc after fragment" requirements of image memory barriers: the
+ * next vtc chain that can touch images (mali_jm_batch::vtc_img) waits, not
+ * the next frame's tiling. */
+#define MALI_JM_REQ_IVTC_AFTER_FRAG      (1u << 6)
+#define MALI_JM_REQ_IVTC_AFTER_FRAG_XFER (1u << 7)
+#endif
 
 /* A GPU-written range to restore before a command buffer runs again
  * (mali_jm_cmd::resets): size bytes at dst, from data_off in
@@ -480,22 +493,25 @@ struct mali_jm_batch *mali_jm_cmd_batch(struct mali_cmd_buffer *cmd);
 void mali_jm_cmd_batch_close(struct mali_cmd_buffer *cmd);
 
 /* The open batch's vtc chain, for a job outside a render pass: closes a
- * full batch first (MALI_JM_BATCH_MAX_JOBS). NULL on failure. */
+ * full batch first (MALI_JM_BATCH_MAX_JOBS). NULL on failure. For a
+ * dispatch: on v7 it also waits for what image barriers asked of the vtc
+ * jobs that can touch images, which it may be one of. */
 struct mali_jm_chain *mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd);
 
 /* The same for a transfer done by compute (buffer and image copies, fills,
  * updates): it also waits for what barriers whose destination stages are
- * only transfer stages asked for. Plain vtc jobs (dispatches, draws) are
- * not in those barriers' second scope, so such a barrier does not close a
- * batch at the next draw. */
+ * only transfer stages asked for (and on v7, as a dispatch does, for the
+ * image barriers' requirements). Dispatches and draws are not in those
+ * barriers' second scope, so such a barrier does not close a batch at the
+ * next draw or hold the next dispatch. */
 struct mali_jm_chain *mali_jm_cmd_vtc_transfer(struct mali_cmd_buffer *cmd);
 
 /*
  * A render pass's tiling, at its first tiled job (cmd_render_tiler). On v7
- * mali_jm_cmd_vtc also waits for what image-only barriers asked of vtc work
- * (mali_jm_cmd_buffer.c, MALI_JM_IMAGE_BARRIER_NARROW), as a transfer does;
- * a pass's draws do not, unless their vertex shader can touch images or
- * memory (mali_jm_cmd_pass_images). On v9 the two are the same.
+ * a dispatch or a transfer waits for what image barriers asked of vtc work
+ * (mali_jm_cmd_buffer.c, image_barrier_req); a pass's draws do not, unless
+ * their vertex shader can touch images or memory
+ * (mali_jm_cmd_pass_images). On v9 the two are the same.
  */
 struct mali_jm_chain *mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd);
 
@@ -507,8 +523,8 @@ struct mali_jm_chain *mali_jm_cmd_vtc_value(struct mali_cmd_buffer *cmd);
 /* Before a draw whose vertex shader reads textures or images or writes
  * memory, in a pass: the image-only barrier requirements a plain pass left
  * pending apply to it, by a pass split when its batch already has
- * fragment work. Its batch then counts as one with a transfer job for the
- * requirements carried from earlier command buffers. */
+ * fragment work. Its batch then meets the image barrier requirements
+ * carried from earlier command buffers (mali_jm_batch::vtc_img). */
 void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
 
 /* Would a transfer job on the vtc chain close the open batch now (a
@@ -1016,7 +1032,8 @@ struct mali_jm_queue {
    mali_jm_ref last_frag_xfer;
    /* Barrier requirements (MALI_JM_REQ_*) recorded at the end of a
     * command buffer and not yet met by a later atom; the transfer-only
-    * ones are kept as xvtc_frag instead. */
+    * ones are kept as xvtc_frag instead, and on v7 the image barrier ones
+    * as ivtc_frag. */
    uint8_t carry;
    /* The newest fragment atom the next vtc chain with a transfer job has
     * to wait for (MALI_JM_REQ_XVTC_*: everything, or the fragment-side
@@ -1027,6 +1044,10 @@ struct mali_jm_queue {
    /* Part of what xvtc_frag owes came from a buffer or global barrier
     * (MALI_JM_REQ_XVTC_BUF): copies into fresh images wait for it too. */
    bool xvtc_buf;
+   /* The same as xvtc_frag for the image barrier requirements
+    * (MALI_JM_REQ_IVTC_*): the next vtc chain with a job that can touch
+    * images waits (mali_jm_batch::vtc_img). */
+   mali_jm_ref ivtc_frag;
 #endif
 };
 

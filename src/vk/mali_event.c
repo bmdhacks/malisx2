@@ -7,23 +7,15 @@
  * VkEvent from the host's side: vkCreateEvent, vkDestroyEvent, vkSetEvent,
  * vkResetEvent, vkGetEventStatus. The object, and what the device does to
  * the word, are in mali_event.h; the vkCmd* that write and wait on events
- * are mali_cmd_event.c.
+ * are mali_cmd_event.c (v11) and mali_jm_event.c (v7, v9).
  *
- * Built once with the command-stream frontend, so these are the v11 table's
- * entries (MALI_PER_ARCH, as in mali_cmd_event.c). The job-manager GPUs
- * (v7, v9) have no events: their entry points stay waist stubs.
+ * Built once: these are the shared table's entries, for every arch.
  *
  * The words come from one device-wide pool (dev->event_pool): ARMSX3
  * creates an event for every texture readback and polls it hot, so an
  * event cannot cost a kbase allocation, and a poll must not cost a system
  * call when the event is set.
  */
-
-/* Built with the v11 files: MALI_PER_ARCH needs PAN_ARCH (mali_cs.h does
- * the same). */
-#ifndef PAN_ARCH
-#define PAN_ARCH MALI_PAN_ARCH
-#endif
 
 #include "mali_event.h"
 
@@ -52,7 +44,7 @@ mali_event_pool_finish(struct mali_device *dev)
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(CreateEvent)(VkDevice _device, const VkEventCreateInfo *pCreateInfo,
+mali_CreateEvent(VkDevice _device, const VkEventCreateInfo *pCreateInfo,
                  const VkAllocationCallbacks *pAllocator, VkEvent *pEvent)
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
@@ -78,7 +70,7 @@ MALI_PER_ARCH(CreateEvent)(VkDevice _device, const VkEventCreateInfo *pCreateInf
 }
 
 VKAPI_ATTR void VKAPI_CALL
-MALI_PER_ARCH(DestroyEvent)(VkDevice _device, VkEvent _event, const VkAllocationCallbacks *pAllocator)
+mali_DestroyEvent(VkDevice _device, VkEvent _event, const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
    VK_FROM_HANDLE(mali_event, ev, _event);
@@ -89,16 +81,33 @@ MALI_PER_ARCH(DestroyEvent)(VkDevice _device, VkEvent _event, const VkAllocation
    vk_object_free(&dev->vk, pAllocator, ev);
 }
 
+/* The store makes the event read as set at once, for vkGetEventStatus and
+ * for GPU work that reaches its wait later. Work already waiting needs the
+ * kernel: on the job manager an EVENT_WAIT soft atom waits in the kernel
+ * and only SOFT_EVENT_UPDATE (or an EVENT_SET atom) completes it; a CPU
+ * store alone leaves it waiting until the kernel's soft-job timeout
+ * cancels it. On the command-stream frontend a stream in a sync wait on
+ * the word is looked at again when the kernel is signalled
+ * (CS_EVENT_SIGNAL). */
 VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(SetEvent)(VkDevice _device, VkEvent _event)
+mali_SetEvent(VkDevice _device, VkEvent _event)
 {
+   VK_FROM_HANDLE(mali_device, dev, _device);
    VK_FROM_HANDLE(mali_event, ev, _event);
    __atomic_store_n(mali_event_word(ev), 1, __ATOMIC_RELEASE);
+   if (dev->jm) {
+      if (mali_kbase_jm_soft_event_update(dev->kbase, mali_event_va(ev), true) !=
+          MALI_KBASE_SUCCESS)
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "SOFT_EVENT_UPDATE failed: GPU work waiting on the event is not woken");
+   } else {
+      mali_kbase_event_signal(dev->kbase);
+   }
    return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(ResetEvent)(VkDevice _device, VkEvent _event)
+mali_ResetEvent(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(mali_event, ev, _event);
    __atomic_store_n(mali_event_word(ev), 0, __ATOMIC_RELEASE);
@@ -106,7 +115,7 @@ MALI_PER_ARCH(ResetEvent)(VkDevice _device, VkEvent _event)
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-MALI_PER_ARCH(GetEventStatus)(VkDevice _device, VkEvent _event)
+mali_GetEventStatus(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
    VK_FROM_HANDLE(mali_event, ev, _event);

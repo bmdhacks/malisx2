@@ -7,10 +7,9 @@
  * VkEvent commands on the command-stream frontend (v11): vkCmdSetEvent2,
  * vkCmdResetEvent2, vkCmdWaitEvents2. The Vulkan 1.0 vkCmdSetEvent,
  * vkCmdResetEvent and vkCmdWaitEvents are Mesa's, which call these; an
- * application that enables synchronization2 names the "2" forms itself. (The
- * job-manager archs offer synchronization2 too, with these event commands
- * as waist stubs: no VkEvent can be created there.) The object and the host
- * side are mali_event.c.
+ * application that enables synchronization2 names the "2" forms itself. The
+ * object and the host side are mali_event.c; the job manager's commands are
+ * mali_jm_event.c.
  *
  * A set or reset is a barrier from every subqueue into the compute
  * subqueue (mali_cmd_emit_barrier: each source waits for its own
@@ -101,17 +100,57 @@ MALI_PER_ARCH(CmdResetEvent2)(VkCommandBuffer commandBuffer, VkEvent _event,
    emit_event_write(cmd, ev, false);
 }
 
-/* One queue, and the event is set earlier in it or by the host before the
- * command buffer is submitted, so the wait is the dependency its info
- * describes: a pipeline barrier, built by the same code (inside a render
- * pass that is the by-region framebuffer dependency a subpass
- * self-dependency asks for). An event the host sets after the command
- * buffer was submitted is not supported: nothing here waits for it, and
- * the work after the wait runs at once. */
+/*
+ * Each event's dependency info is a pipeline barrier, built by the same code
+ * (inside a render pass that is the by-region framebuffer dependency a
+ * subpass self-dependency asks for). Outside a render pass every stream
+ * then waits for the word to be set (SYNC_WAIT32, greater than 0), so an
+ * event the host sets after the command buffer was submitted holds the work
+ * after the wait until then (vkSetEvent signals the kernel, which has the
+ * firmware evaluate the waits again). Every stream waits, whatever the
+ * destination stages: the strictest reading. The compute stream's put-off
+ * barrier waits come first (mali_cmd_cs), then the fragment stream's
+ * put-off signal (mali_cmd_frag_flush_pending): a set recorded earlier in
+ * this command buffer waits on the compute stream for that signal, so
+ * the signal must not come after a wait on the set.
+ *
+ * Inside a render pass only the barrier is recorded: an event waited for
+ * there must have been set before (Vulkan forbids a host set after the
+ * submit for a wait inside a render pass), by the host or earlier in the
+ * queue.
+ *
+ * A wait on an event that nobody sets never ends: the streams stay in their
+ * sync wait (kbase has no timeout for it), the submission's fences never
+ * signal, and a host wait with a timeout returns VK_TIMEOUT.
+ */
+static void
+emit_event_wait(struct mali_cmd_buffer *cmd, const struct mali_event *ev)
+{
+   static const enum mali_subqueue order[] = {
+      MALI_SUBQUEUE_COMPUTE, MALI_SUBQUEUE_VERTEX_TILER, MALI_SUBQUEUE_FRAGMENT,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(order); i++) {
+      struct cs_builder *b = mali_cmd_cs(cmd, order[i]);
+      if (order[i] == MALI_SUBQUEUE_COMPUTE)
+         mali_cmd_frag_flush_pending(cmd);
+      struct cs_index addr = mali_cs_scratch_reg64(b, 0);
+      struct cs_index ref = mali_cs_scratch_reg32(b, 2);
+      cs_move64_to(b, addr, mali_event_va(ev));
+      cs_move32_to(b, ref, 0);
+      cs_sync32_wait(b, false, MALI_CS_CONDITION_GREATER, ref, addr);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdWaitEvents2)(VkCommandBuffer commandBuffer, uint32_t eventCount,
                               const VkEvent *pEvents, const VkDependencyInfo *pDependencyInfos)
 {
-   for (uint32_t i = 0; i < eventCount; i++)
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+
+   for (uint32_t i = 0; i < eventCount; i++) {
+      VK_FROM_HANDLE(mali_event, ev, pEvents[i]);
       MALI_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &pDependencyInfos[i]);
+      if (!cmd->gfx.render.active)
+         emit_event_wait(cmd, ev);
+   }
 }

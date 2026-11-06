@@ -47,6 +47,8 @@
 #define mali_jm_cmd_barrier MALI_PER_ARCH(jm_cmd_barrier)
 #define mali_jm_cmd_batch MALI_PER_ARCH(jm_cmd_batch)
 #define mali_jm_cmd_batch_close MALI_PER_ARCH(jm_cmd_batch_close)
+#define mali_jm_cmd_dep_crc MALI_PER_ARCH(jm_cmd_dep_crc)
+#define mali_jm_cmd_event MALI_PER_ARCH(jm_cmd_event)
 #define mali_jm_cmd_frag MALI_PER_ARCH(jm_cmd_frag)
 #define mali_jm_cmd_mark_frag_transfer MALI_PER_ARCH(jm_cmd_mark_frag_transfer)
 #define mali_jm_cmd_note_reset MALI_PER_ARCH(jm_cmd_note_reset)

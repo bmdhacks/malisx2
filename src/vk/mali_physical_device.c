@@ -435,9 +435,7 @@ static const struct vk_device_extension_table mali_device_extensions = {
     *  - synchronization2: the driver's barrier, submit and timestamp
     *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
     *    around them), so the 64-bit stage and access masks reach the same
-    *    code. The event commands exist on v11 only; the job-manager archs
-    *    (v7, v9) have no VkEvent (vkCreateEvent fails), so no event
-    *    command can be reached there;
+    *    code, the event commands included (every arch has VkEvent);
     *  - extended dynamic state 1 and 2 and vertex input dynamic state: the
     *    runtime keeps the state, and a pipeline that leaves any of it
     *    dynamic has its hardware words packed again at the draw from the

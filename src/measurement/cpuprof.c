@@ -4,9 +4,9 @@
  */
 
 /*
- * The debug switch "cpuprof" (mali_debug_flag): how much CPU time each of
- * the application's threads spends inside the driver, and in which entry
- * points. The device's dispatch table gets a timing wrapper in front of
+ * MALISX2_MEASURE=cpuprof: how much CPU time each of the application's
+ * threads spends inside the driver, and in which entry points. The
+ * device's dispatch table gets a timing wrapper in front of
  * the entry points an emulator calls per draw, per pass and per frame
  * (the ones vkGetDeviceProcAddr hands out after vkCreateDevice); each
  * thread adds up its own calls and logs them about once a second:
@@ -19,6 +19,7 @@
  * file-scope pointers.
  */
 
+#include "mali_measure.h"
 #include "mali_vk.h"
 
 #include <stdio.h>
@@ -239,7 +240,7 @@ CPUPROF_RESULT(X)
 void
 mali_cpuprof_install(struct vk_device_dispatch_table *t)
 {
-   if (!mali_debug_flag("cpuprof"))
+   if (!mali_measure_cpuprof())
       return;
    mali_cpuprof_on = true;
 #define A(name, alias)                                                           \

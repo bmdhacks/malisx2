@@ -71,6 +71,7 @@
 #include "util/os_time.h"
 #include "vk_log.h"
 
+#include "mali_measure.h"
 #include "mali_rsd_v7.h"
 
 #if PAN_ARCH != 7

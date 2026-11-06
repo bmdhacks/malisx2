@@ -369,24 +369,6 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
  */
 bool mali_debug_flag(const char *name);
 
-/* With the debug switch "cpuprof", timing wrappers in front of the
- * per-draw and per-frame entry points of the device's dispatch table
- * (mali_cpuprof.c). */
-struct vk_device_dispatch_table;
-void mali_cpuprof_install(struct vk_device_dispatch_table *t);
-
-/* Sections of the wrapped entry points, timed apart with the same switch:
- * mali_cpuprof_part(part, t0) adds the time since t0 (os_time_get_nano)
- * when mali_cpuprof_on. Reported with the entry points, not added to the
- * total. */
-enum mali_cpuprof_part {
-   MALI_CPUPROF_IDXSCAN,  /* v7: an indexed draw's index range scan */
-   MALI_CPUPROF_DRAWPREP, /* v7: a draw's descriptors and state (prepare_draw) */
-   MALI_CPUPROF_PART_COUNT
-};
-extern bool mali_cpuprof_on;
-void mali_cpuprof_part(enum mali_cpuprof_part part, uint64_t t0);
-
 /* malisx2's own command, handed out by vkGetDeviceProcAddr on v7
  * (mali_device.c): the index range of the next indexed draw, which must
  * cover all its indices but the restart index (mali_jm_cmd_draw_v7.c). */

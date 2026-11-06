@@ -15,15 +15,22 @@
  *  - capture: at vkQueueSubmit, the words written into the kernel rings,
  *    the recorded streams they CALL and the command memory those streams
  *    point at, one file per submit, for tools/mali_cs_decode.py.
+ *  - shaders: every shader the driver compiles, as SPIR-V and machine code
+ *    under <dir>/shaders (mali_pipeline.c).
+ *  - cpuprof: how much CPU time each application thread spends inside the
+ *    driver, by entry point (cpuprof.c). It writes no files: each thread
+ *    logs its totals about once a second.
  *
  * One configuration string, from the environment variable MALISX2_MEASURE
  * or, on Android, the property debug.malisx2.measure:
  *
- *   timing | draws | csf | both, then any of dir=PATH chunk=N ring=N
- *   start=N count=N csfmax=N trigger=PATH, comma-separated
+ *   timing | draws | csf | both | shaders | cpuprof | off, then any of
+ *   dir=PATH chunk=N ring=N start=N count=N csfmax=N trigger=PATH,
+ *   comma-separated
  *
  * With neither set, dev->measure and every cmd->measure are NULL and the
- * driver pays one pointer test per hook.
+ * driver pays one pointer test per hook. shaders and cpuprof work without
+ * dev->measure and take none of the options (shaders writes under dir=).
  */
 
 #ifndef MALI_MEASURE_H
@@ -60,6 +67,7 @@ struct mali_measure_config {
    bool draws;             /* also every draw (implies timing) */
    bool csf;               /* command-stream capture */
    bool shaders;           /* every compiled shader, to <dir>/shaders */
+   bool cpuprof;           /* driver CPU time per thread, logged (cpuprof.c) */
    char dir[512];          /* output directory, created if missing */
    uint32_t chunk;         /* submits per timing file */
    uint32_t ring;          /* timing files and captures kept; 0 = all */
@@ -83,6 +91,31 @@ bool mali_measure_config_get(struct mali_measure_config *cfg);
  * <dir>/shaders, created on first use), or NULL when the mode is off.
  * Read once per process. */
 const char *mali_measure_shader_dir(void);
+
+/* Whether the "cpuprof" mode is on (read from the environment or property
+ * each call; vkCreateDevice calls it once). */
+bool mali_measure_cpuprof(void);
+
+/* ---------------------------------------------------------------------- */
+/* CPU profile (cpuprof.c)                                                 */
+
+/* With the "cpuprof" mode, timing wrappers in front of the per-draw,
+ * per-pass and per-frame entry points of the device's dispatch table.
+ * Called from vkCreateDevice; does nothing when the mode is off. */
+struct vk_device_dispatch_table;
+void mali_cpuprof_install(struct vk_device_dispatch_table *t);
+
+/* Sections of the wrapped entry points, timed apart:
+ * mali_cpuprof_part(part, t0) adds the time since t0 (os_time_get_nano)
+ * when mali_cpuprof_on. Reported with the entry points, not added to the
+ * total. */
+enum mali_cpuprof_part {
+   MALI_CPUPROF_IDXSCAN,  /* v7: an indexed draw's index range scan */
+   MALI_CPUPROF_DRAWPREP, /* v7: a draw's descriptors and state (prepare_draw) */
+   MALI_CPUPROF_PART_COUNT
+};
+extern bool mali_cpuprof_on;
+void mali_cpuprof_part(enum mali_cpuprof_part part, uint64_t t0);
 
 /* ---------------------------------------------------------------------- */
 /* Per device                                                              */

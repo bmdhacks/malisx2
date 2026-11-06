@@ -70,10 +70,13 @@ is part of this repository or linked into the library.
 
 ## Measurement
 
-`MALISX2_MEASURE=timing` (or `draws`, `csf`, `both`, `shaders`; on Android
-the property `debug.malisx2.measure`) makes the driver write GPU timestamps
-per render pass, dispatch and draw, captures of the submitted command
-streams, or the shaders it compiles.
+`MALISX2_MEASURE=timing` (or `draws`, `csf`, `both`, `shaders`, `cpuprof`;
+on Android the property `debug.malisx2.measure`) makes the driver write GPU
+timestamps per render pass, dispatch and draw, captures of the submitted
+command streams, or the shaders it compiles. `cpuprof` writes no files:
+each application thread logs, about once a second, how much CPU time it
+spent inside the driver and in which entry points. It wraps the device's
+entry points, so it adds a little time of its own to every call.
 
 ## Rules
 

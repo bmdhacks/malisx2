@@ -163,7 +163,7 @@ dep_gbm = with_platform_android ? dependency('', required : false) \
 
 malisx2_vk = static_library(
   'mali_vk',
-  files('vk/mali_cpuprof.c', 'vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
+  files('vk/mali_device.c', 'vk/mali_icd.c', 'vk/mali_instance.c',
         'vk/mali_physical_device.c'),
   # Memory, buffers, images, formats.
   files('vk/mali_buffer.c', 'vk/mali_device_memory.c', 'vk/mali_formats.c',
@@ -185,8 +185,9 @@ malisx2_vk = static_library(
   # Sync files and the Android window system; mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
   with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c'),
-  # Timing and command-stream capture (MALISX2_MEASURE).
-  files('measurement/config.c', 'measurement/recorder.c', 'measurement/timing.c'),
+  # Timing, command-stream capture and the CPU profile (MALISX2_MEASURE).
+  files('measurement/config.c', 'measurement/cpuprof.c', 'measurement/recorder.c',
+        'measurement/timing.c'),
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],

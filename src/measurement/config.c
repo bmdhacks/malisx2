@@ -122,8 +122,10 @@ mali_measure_config_parse(const char *str, struct mali_measure_config *c,
             c->timing = c->csf = true;
          } else if (len == 7 && !strncmp(p, "shaders", 7)) {
             c->shaders = true;
+         } else if (len == 7 && !strncmp(p, "cpuprof", 7)) {
+            c->cpuprof = true;
          } else if (len == 3 && !strncmp(p, "off", 3)) {
-            c->timing = c->draws = c->csf = c->shaders = false;
+            c->timing = c->draws = c->csf = c->shaders = c->cpuprof = false;
          } else {
             ok = false;
          }
@@ -671,4 +673,11 @@ mali_measure_shader_dir(void)
    }
    simple_mtx_unlock(&lock);
    return ok ? dir : NULL;
+}
+
+bool
+mali_measure_cpuprof(void)
+{
+   struct mali_measure_config c;
+   return config_read(&c) && c.cpuprof;
 }

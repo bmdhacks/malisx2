@@ -427,7 +427,11 @@ MALI_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 /* ---------------------------------------------------------------------- */
 /* Barriers                                                                */
 
-/* Stages each subqueue carries (panvk_get_subqueue_stages). */
+/* Stages each subqueue carries (panvk_get_subqueue_stages). DRAW_INDIRECT
+ * is on two: indirect draws read their commands in the vertex/tiler
+ * stream, indirect dispatches theirs in the compute stream (panvk has it
+ * on the vertex/tiler subqueue only), so a barrier that ends in it has
+ * both wait. */
 static VkPipelineStageFlags2
 subqueue_stages(unsigned sq)
 {
@@ -445,7 +449,8 @@ subqueue_stages(unsigned sq)
              VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
              VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
    default:
-      return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+      return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
              VK_PIPELINE_STAGE_2_COPY_BIT;
    }
 }

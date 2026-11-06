@@ -361,14 +361,6 @@ mali_diag_should_log(uint32_t *counter, uint32_t *n)
    return i < 8 || (i + 1) % 100 == 0;
 }
 
-/*
- * Switches for trying a change both ways on the device: MALISX2_DEBUG (on
- * Android the property debug.malisx2.debug), a comma-separated list of
- * names, read once per process. mali_debug_flag says whether name is in
- * it.
- */
-bool mali_debug_flag(const char *name);
-
 /* malisx2's own command, handed out by vkGetDeviceProcAddr on v7
  * (mali_device.c): the index range of the next indexed draw, which must
  * cover all its indices but the restart index (mali_jm_cmd_draw_v7.c). */

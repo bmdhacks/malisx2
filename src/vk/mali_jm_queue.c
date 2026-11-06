@@ -825,32 +825,30 @@ udata_of(unsigned cmd, unsigned batch)
 }
 
 /*
- * Extra core_req bits a chain needs: PERMON when it writes system
- * timestamps (queries, MALISX2_MEASURE), which keeps the GPU's timestamp
- * counter running while the atom is on the GPU, as the blob does for its
- * query chains.
+ * Extra core_req bits a chain needs. PERMON asks the kernel to run the GPU's
+ * cycle counter while the atom is on the GPU (a reference-counted
+ * CYCLE_COUNT_START / STOP pair in kbase r40p0 and r44p1; it touches no
+ * other power state). A chain that writes system timestamps (queries,
+ * MALISX2_MEASURE) needs it, because the timestamp counter is stopped
+ * otherwise, as the blob does for its query chains.
  *
- * On v7 every hardware atom asks for it (the debug switch "nopermon"
- * turns that off). On the Unisoc T618's kernel, hakuX lost the device to
- * a GPU that stopped making progress and had to be reset, 2 races out of
- * 2, about a minute in; with hakuX's per-pass timestamps, which put
- * PERMON on nearly every atom, the same race ran for minutes. While a
- * PERMON atom runs the kernel keeps the cycle counter, and with it the
- * GPU's power domains, on, so the GPU does not power its cores and L2
- * down and up between atoms.
+ * On v7 every atom asks for it. On the Unisoc T618's kernel hakuX lost the
+ * device to a GPU that stopped making progress and had to be reset, 2 races
+ * out of 2, about a minute in; with hakuX's per-pass timestamps, which put
+ * PERMON on nearly every atom, the same race ran for minutes. This was
+ * observed, not explained: the kernel code shows nothing that PERMON would
+ * change besides the counter, so the cause may lie in that vendor kernel or
+ * in the timing of the start/stop commands between atoms. v9 is unchanged.
  */
-#if PAN_ARCH < 9
-static bool permon_always;
-#endif
-
 static inline uint32_t
 chain_req(const struct mali_jm_chain *c)
 {
 #if PAN_ARCH < 9
-   if (permon_always)
-      return KB_JM_REQ_PERMON;
-#endif
+   (void)c;
+   return KB_JM_REQ_PERMON;
+#else
    return c->timestamps ? KB_JM_REQ_PERMON : 0;
+#endif
 }
 
 /* The atom graph of the submit's waits and command buffers (file
@@ -1251,9 +1249,6 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
-#if PAN_ARCH < 9
-   permon_always = !mali_debug_flag("nopermon");
-#endif
 
    dev->jm = jd;
    dev->fe = jd;

@@ -99,7 +99,8 @@ struct mali_jm_chain {
    uint32_t jobs;
    uint8_t pending;         /* MALI_JM_PENDING_* */
    /* The chain writes system timestamps: its atom asks for PERMON, without
-    * which the kernel leaves the GPU's timestamp counter stopped. */
+    * which the kernel leaves the GPU's timestamp counter stopped (on v7
+    * every atom asks for it, see chain_req in mali_jm_queue.c). */
    bool timestamps;
 };
 

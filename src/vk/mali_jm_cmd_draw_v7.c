@@ -71,6 +71,7 @@
 #include "util/os_time.h"
 #include "vk_log.h"
 
+#include "mali_measure.h"
 #include "mali_rsd_v7.h"
 
 #if PAN_ARCH != 7
@@ -1197,20 +1198,6 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          /* vkCmdSetIndexRangeMALISX2: the application's range. */
          min = cmd->jm.idx_hint.min;
          max = cmd->jm.idx_hint.max;
-         /* Debug switch idxcheck: the indices scanned anyway, a range the
-          * hint does not cover logged (the first 16). */
-         static int check = -1;
-         if (unlikely(check < 0))
-            check = mali_debug_flag("idxcheck");
-         if (unlikely(check)) {
-            uint32_t smin, smax;
-            bool sempty = false;
-            static unsigned logged;
-            if (index_range(cmd, di, st->ia.primitive_restart_enable, &smin, &smax, &sempty) &&
-                !sempty && (smin < min || smax > max) && logged++ < 16)
-               mesa_logw("malisx2 idxcheck: draw of %u indices from %u: indices %u..%u, "
-                         "hint %u..%u", di->count, di->first_index, smin, smax, min, max);
-         }
       } else {
          const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
          ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
@@ -1460,7 +1447,8 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
  * 0xFFFFFFFF, when restart is enabled). A wider range only shades more
  * vertices. A narrower one is undefined: the tiler then reads varyings of
  * vertices that were not shaded, which draws garbage or can fault the
- * GPU. The debug switch idxcheck logs such hints.
+ * GPU. The driver does not check the hint: reading the indices to do so
+ * is the work the hint exists to skip.
  */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdSetIndexRangeMALISX2)(VkCommandBuffer commandBuffer, uint32_t firstIndex,

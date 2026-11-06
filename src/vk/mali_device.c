@@ -16,13 +16,6 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef __ANDROID__
-#include <sys/system_properties.h>
-#define PROP_VALUE_MAX_ PROP_VALUE_MAX
-#else
-#define PROP_VALUE_MAX_ 92
-#endif
-
 #include "c11/threads.h"
 #include "util/log.h"
 
@@ -42,43 +35,6 @@
 #ifndef __ANDROID__
 #include "wsi_common.h"
 #endif
-
-/* ---------------------------------------------------------------------- */
-/* Debug switches (mali_vk.h)                                              */
-
-static char debug_flags[PROP_VALUE_MAX_ + 2];
-static once_flag debug_flags_once = ONCE_FLAG_INIT;
-
-static void
-debug_flags_read(void)
-{
-   /* Kept with a comma at each end, so a name matches as ",name,". */
-   const char *s = getenv("MALISX2_DEBUG");
-#ifdef __ANDROID__
-   char prop[PROP_VALUE_MAX];
-   if (!s || !*s) {
-      prop[0] = 0;
-      __system_property_get("debug.malisx2.debug", prop);
-      s = prop;
-   }
-#endif
-   snprintf(debug_flags, sizeof(debug_flags), ",%s,", s ? s : "");
-   for (char *p = debug_flags; *p; p++) {
-      if (*p == ' ')
-         *p = ',';
-   }
-   if (debug_flags[2])
-      mesa_logi("malisx2: debug switches \"%s\"", s);
-}
-
-bool
-mali_debug_flag(const char *name)
-{
-   call_once(&debug_flags_once, debug_flags_read);
-   char key[48];
-   snprintf(key, sizeof(key), ",%s,", name);
-   return strstr(debug_flags, key) != NULL;
-}
 
 /* ---------------------------------------------------------------------- */
 /* Interned keys (mali_pipeline.h), shared by every arch's pipelines      */

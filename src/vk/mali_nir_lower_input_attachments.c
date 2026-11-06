@@ -33,6 +33,10 @@ struct ia_ctx {
    uint32_t input_attachment_read;
 };
 
+/* The fragment output locations the shader writes, as a bit mask. An array
+ * output is taken to write every slot of the array: which element a store
+ * reaches may not be known here, and calling an attachment written when it
+ * is not only costs it the read-only tile load. */
 static bool
 collect_frag_writes(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -48,30 +52,41 @@ collect_frag_writes(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        var->data.location > FRAG_RESULT_DATA7)
       return false;
 
-   *(uint32_t *)data |= BITFIELD_BIT(var->data.location - FRAG_RESULT_DATA0);
+   const unsigned first = var->data.location - FRAG_RESULT_DATA0;
+   const unsigned slots = MAX2(glsl_count_vec4_slots(var->type, false, false), 1);
+   *(uint32_t *)data |= BITFIELD_RANGE(first, MIN2(slots, 8 - first));
    return true;
 }
 
-/* Colour attachments mapped as input attachments that the shader does not
- * write. */
-static uint32_t
-readonly_color_mask(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
+/*
+ * Colour attachments mapped as input attachments that the shader does not
+ * write: bit i is colour attachment i, the render target the tile load
+ * takes. Both halves are in attachments. The input map says which
+ * attachments can be read; the location map says which output location each
+ * attachment receives, so attachment i is written when the shader writes
+ * output location cal[i], and not when it writes location i.
+ */
+uint32_t
+mali_nir_readonly_color_mask(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
 {
    if (!state || !state->ial || !state->cal)
       return 0;
 
-   uint32_t in_mask = 0, out_mask = 0;
+   uint32_t in_mask = 0;
    for (uint32_t i = 0; i < ARRAY_SIZE(state->ial->color_map) &&
                         i < state->ial->color_attachment_count; i++) {
       if (state->ial->color_map[i] != MESA_VK_ATTACHMENT_UNUSED)
          in_mask |= BITFIELD_BIT(i);
    }
 
-   nir_shader_intrinsics_pass(nir, collect_frag_writes, nir_metadata_all, &out_mask);
+   uint32_t written_locations = 0;
+   nir_shader_intrinsics_pass(nir, collect_frag_writes, nir_metadata_all, &written_locations);
 
+   uint32_t out_mask = 0;
    for (uint32_t i = 0; i < ARRAY_SIZE(state->cal->color_map); i++) {
-      if (state->ial->color_map[i] == MESA_VK_ATTACHMENT_UNUSED)
-         out_mask &= ~BITFIELD_BIT(i);
+      const uint8_t loc = state->cal->color_map[i];
+      if (loc < MESA_VK_MAX_COLOR_ATTACHMENTS && (written_locations & BITFIELD_BIT(loc)))
+         out_mask |= BITFIELD_BIT(i);
    }
 
    return in_mask & ~out_mask;
@@ -337,7 +352,7 @@ mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
     * v10 on; v9 reads every colour attachment with the plain tile load. */
    struct ia_ctx ctx = {
       .arch = arch,
-      .ro_color_mask = arch >= 10 ? readonly_color_mask(nir, state) : 0,
+      .ro_color_mask = arch >= 10 ? mali_nir_readonly_color_mask(nir, state) : 0,
    };
 
    NIR_PASS(progress, nir, dedup_subpass_loads);

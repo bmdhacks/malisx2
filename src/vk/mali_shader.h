@@ -545,6 +545,11 @@ bool mali_nir_lower_descriptors_v7(nir_shader *nir,
  * whose options have has_load_global_bounded, as a load whose offset is
  * clamped into the buffer. */
 bool mali_nir_lower_bounded_loads(nir_shader *nir);
+/* The colour attachments the pipeline can read as input attachments and the
+ * shader does not write, one bit per attachment (the read-only tile loads of
+ * v10 and up). Exported for the host test. */
+uint32_t mali_nir_readonly_color_mask(nir_shader *nir,
+                                      const struct vk_graphics_pipeline_state *state);
 bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
                                            const struct vk_graphics_pipeline_state *state,
                                            uint32_t *input_attachment_read);

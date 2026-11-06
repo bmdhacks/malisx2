@@ -440,6 +440,20 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .EXT_vertex_input_dynamic_state = true,
    .EXT_shader_demote_to_helper_invocation = true,
    .EXT_private_data = true,
+
+   /* Reads of the bound colour and depth/stencil attachments inside a
+    * dynamic rendering pass, and the maps that decide which output location
+    * feeds which attachment and which input index reads which. Every arch
+    * has the three parts it needs: input attachments are tile reads
+    * (mali_nir_lower_input_attachments.c, panvk's scheme), where the maps
+    * are the pipeline's (VkRenderingAttachmentLocationInfo and
+    * VkRenderingInputAttachmentIndexInfo, kept by the runtime, which also
+    * implements the two vkCmdSetRendering* commands); a blend descriptor
+    * and the BLEND of an output location go with the attachment the
+    * location feeds (mali_pipeline_state.c pack_blend; v7 in mali_shader.c
+    * lower_sysvals); and a by-region barrier inside a pass is a draw with a
+    * primitive barrier (cmd_fb_barrier). */
+   .KHR_dynamic_rendering_local_read = true,
 };
 
 /*
@@ -460,16 +474,6 @@ device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
    if (arch == 7) {
-      /* Reads of the bound colour and depth attachments inside a dynamic
-       * rendering pass: input attachments are tile reads already
-       * (mali_nir_lower_input_attachments.c, panvk's scheme, with the
-       * input attachment map from the runtime's
-       * vkCmdSetRenderingInputAttachmentIndices), a by-region barrier
-       * inside a pass is a draw with a primitive barrier
-       * (mali_jm_cmd_buffer.c), and an output location blends into the
-       * attachment it feeds (mali_shader.c lower_sysvals). */
-      ext.KHR_dynamic_rendering_local_read = true;
-
       /* Descriptor indexing, the part hakuX uses (get_features), offered to
        * applications only as malisx2's own VK_MALISX2_descriptor_indexing
        * (mali_vk.h): v7 cannot meet VK_EXT_descriptor_indexing's required
@@ -666,12 +670,13 @@ get_features(struct vk_features *f, uint32_t arch)
       .extendedDynamicState2LogicOp = false,
       .extendedDynamicState2PatchControlPoints = false,
       .vertexInputDynamicState = true,
+
+      /* VK_KHR_dynamic_rendering_local_read (the table above). */
+      .dynamicRenderingLocalRead = true,
    };
 
    /* The extensions of device_extensions_for_arch on v7. */
    if (arch == 7) {
-      f->dynamicRenderingLocalRead = true;
-
       /* VK_MALISX2_descriptor_indexing (device_extensions_for_arch). v7
        * copies a stage's descriptors from the sets into its tables by a
        * copy job when the draw runs, so writes after the bind are what it
@@ -958,6 +963,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * per pipeline (panvk reports the same). */
       .provokingVertexModePerPipeline = false,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
+      /* VK_KHR_dynamic_rendering_local_read (get_features): depth and
+       * stencil are tile reads like colour; rendering is single-sampled
+       * (MALI_SUPPORTED_SAMPLE_COUNTS), so there is no multisampled
+       * attachment to read. */
+      .dynamicRenderingLocalReadDepthStencilAttachments = true,
+      .dynamicRenderingLocalReadMultisampledAttachments = false,
    };
 
    /*
@@ -998,11 +1010,6 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetSampledImages = UINT16_MAX;
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
-
-      /* Local read (get_features): depth/stencil reads are tile reads too;
-       * rendering is single-sampled. */
-      props->dynamicRenderingLocalReadDepthStencilAttachments = true;
-      props->dynamicRenderingLocalReadMultisampledAttachments = false;
 
       /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
        * the ordinary ones; per-stage ones are raised below. A non-uniform

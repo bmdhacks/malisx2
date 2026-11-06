@@ -411,15 +411,11 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
  *   limits.
  * - One deviation: a non-uniform index into a sampled-image or sampler
  *   array must be the same for the four invocations of each 2x2 fragment
- *   quad, and dynamically uniform in other stages. v7's texture unit takes
- *   one index a quad, and the per-invocation loop that makes a non-uniform
- *   index uniform leaves the inactive invocations' index stale, so a quad
- *   with two indices reads its first invocation's texture in all four.
- *   That holds for every operation of the texture unit, texelFetch,
- *   explicit level of detail and gather included, so it is wider than
- *   what the reported quadDivergentImplicitLod (false) excuses, which is
- *   only implicit level of detail. (hakuX indexes per draw, which a quad
- *   never straddles.)
+ *   quad, and dynamically uniform in other stages. That holds for every
+ *   operation of the texture unit, texelFetch, explicit level of detail and
+ *   gather included, so it is wider than what the reported
+ *   quadDivergentImplicitLod (false) excuses, which is only implicit level
+ *   of detail. (hakuX indexes per draw, which a quad never straddles.)
  * - A stage can use at most 240 storage images, storage texel buffers and
  *   uniform texel buffers together (the image table), whatever
  *   maxPerStageDescriptorUpdateAfterBindSampledImages says of the last

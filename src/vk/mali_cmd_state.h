@@ -532,20 +532,22 @@ mali_gfx_pack_dyn_bufs(const struct mali_shader_desc_info *di, const struct mali
    }
 }
 
-/* Resource table: entry 0 the driver set (already built), entry N + 1
- * descriptor set N. */
-static inline uint64_t
-mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
-                   const struct mali_desc_state *desc, uint64_t drv, uint32_t drv_count)
+/* Entries of a stage's resource table (mali_gfx_pack_res_table). */
+static ALWAYS_INLINE uint32_t
+mali_gfx_res_table_count(const struct mali_shader *s)
+{
+   return ALIGN_POT(1 + util_last_bit(s->desc.used_set_mask), MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
+}
+
+/* Resource table at out (count = mali_gfx_res_table_count entries):
+ * entry 0 the driver set at drv, entry N + 1 descriptor set N. */
+static ALWAYS_INLINE void
+mali_gfx_pack_res_table(const struct mali_shader *s, const struct mali_desc_state *desc,
+                        uint64_t drv, uint32_t drv_count, uint32_t count, uint8_t *out)
 {
    const struct mali_shader_desc_info *di = &s->desc;
-   uint32_t last = util_last_bit(di->used_set_mask);
-   uint32_t count = ALIGN_POT(1 + last, MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
-   struct mali_ptr t = mali_cmd_alloc(cmd, count * MALI_RESOURCE_SIZE, 64);
-   if (!t.cpu)
-      return 0;
 
-   pan_cast_and_pack(t.cpu, RESOURCE, cfg) {
+   pan_cast_and_pack(out, RESOURCE, cfg) {
       cfg.address = drv;
       cfg.size = drv_count * MALI_DESCRIPTOR_SIZE;
       cfg.contains_descriptors = true;
@@ -555,8 +557,21 @@ mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       const struct mali_descriptor_set *ds =
          (set < MALI_MAX_SETS && (di->used_set_mask & BITFIELD_BIT(set))) ? desc->sets[set]
                                                                           : NULL;
-      MALI_PER_ARCH(descriptor_set_pack_resource)(ds, (uint8_t *)t.cpu + i * MALI_RESOURCE_SIZE);
+      MALI_PER_ARCH(descriptor_set_pack_resource)(ds, out + i * MALI_RESOURCE_SIZE);
    }
+}
+
+/* Resource table: entry 0 the driver set (already built), entry N + 1
+ * descriptor set N. */
+static inline uint64_t
+mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
+                   const struct mali_desc_state *desc, uint64_t drv, uint32_t drv_count)
+{
+   const uint32_t count = mali_gfx_res_table_count(s);
+   struct mali_ptr t = mali_cmd_alloc(cmd, count * MALI_RESOURCE_SIZE, 64);
+   if (!t.cpu)
+      return 0;
+   mali_gfx_pack_res_table(s, desc, drv, drv_count, count, t.cpu);
    return t.gpu | count;
 }
 
@@ -601,26 +616,29 @@ mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *str
    }
 }
 
-/* Vertex stage resource table. Table 0: 16 attributes, the dummy sampler,
- * the dynamic buffers, then one Buffer per vertex binding (panvk
- * prepare_vs_driver_set). 0 on failure. */
-static inline uint64_t
-mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+/* Entries of the vertex stage's driver set (mali_gfx_pack_vs_drv): the
+ * *vb_count vertex buffers start at *vb_offset. */
+static ALWAYS_INLINE uint32_t
+mali_gfx_vs_drv_count(const struct mali_shader *vs, const struct vk_vertex_input_state *vi,
+                      uint32_t *vb_offset, uint32_t *vb_count)
+{
+   uint32_t n = 0;
+   u_foreach_bit(i, vi->attributes_valid)
+      n = MAX2(vi->attributes[i].binding + 1, n);
+   *vb_count = n;
+   *vb_offset = MALI_MAX_VS_ATTRIBS + 1 + vs->desc.dyn_bufs.count;
+   return *vb_offset + n;
+}
+
+/* The vertex stage's driver set at descs (mali_gfx_vs_drv_count entries):
+ * 16 attributes, the dummy sampler, the dynamic buffers, then one Buffer
+ * per vertex binding (panvk prepare_vs_driver_set). */
+static ALWAYS_INLINE void
+mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
+                     const struct vk_vertex_input_state *vi, uint8_t *descs, uint32_t vb_offset,
+                     uint32_t vb_count)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
-   const struct mali_shader *vs = d->pipeline->vs;
-   const struct vk_vertex_input_state *vi = d->vi;
-
-   uint32_t vb_count = 0;
-   u_foreach_bit(i, vi->attributes_valid)
-      vb_count = MAX2(vi->attributes[i].binding + 1, vb_count);
-   const uint32_t vb_offset = MALI_MAX_VS_ATTRIBS + 1 + vs->desc.dyn_bufs.count;
-   const uint32_t count = vb_offset + vb_count;
-
-   struct mali_ptr p = mali_cmd_alloc(cmd, count * MALI_DESCRIPTOR_SIZE, MALI_DESCRIPTOR_SIZE);
-   if (!p.cpu)
-      return 0;
-   uint8_t *descs = p.cpu;
 
    for (uint32_t i = 0; i < MALI_MAX_VS_ATTRIBS; i++) {
       void *o = descs + i * MALI_DESCRIPTOR_SIZE;
@@ -648,6 +666,22 @@ mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
          pan_cast_and_pack(o, NULL_DESCRIPTOR, cfg);
       }
    }
+}
+
+/* Vertex stage resource table: table 0 is the driver set
+ * (mali_gfx_pack_vs_drv). 0 on failure. */
+static inline uint64_t
+mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_shader *vs = d->pipeline->vs;
+   const struct vk_vertex_input_state *vi = d->vi;
+   uint32_t vb_offset, vb_count;
+   const uint32_t count = mali_gfx_vs_drv_count(vs, vi, &vb_offset, &vb_count);
+   struct mali_ptr p = mali_cmd_alloc(cmd, count * MALI_DESCRIPTOR_SIZE, MALI_DESCRIPTOR_SIZE);
+   if (!p.cpu)
+      return 0;
+   mali_gfx_pack_vs_drv(cmd, vs, vi, p.cpu, vb_offset, vb_count);
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
 }
 

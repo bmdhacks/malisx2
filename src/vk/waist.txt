@@ -416,7 +416,10 @@ d vkWriteAccelerationStructuresPropertiesKHR
 # here or implemented.
 # vkCmdDispatchIndirect2KHR is not here: every back half implements
 # vkCmdDispatchIndirect itself, so Mesa's forward to it is never in effect
-# (the same test checks that).
+# (the same test checks that). Every back half also implements the indirect
+# draws and their count forms, so Mesa's forwards to the four draw 2KHR
+# forms below are not in effect either; their stubs stay for a call made
+# directly.
 c vkCmdBeginConditionalRendering2EXT
 c vkCmdBeginTransformFeedback2EXT
 c vkCmdBindDescriptorBufferEmbeddedSamplers2EXT

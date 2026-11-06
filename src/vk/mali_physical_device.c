@@ -496,10 +496,24 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
    return arch == 7 || arch == 9 || arch == 11;
 }
 
+/*
+ * Indirect draws with more than one command, a first instance taken from
+ * the command, and VK_KHR_draw_indirect_count. v11 runs the commands in a
+ * command-stream loop (mali_cmd_draw.c). v7 and v9 have no indirect draws
+ * (their vkCmdDraw*Indirect* are logging stubs) and report one draw.
+ */
+static bool
+draw_indirect_for_arch(uint32_t arch)
+{
+   return arch == 11;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+
+   ext.KHR_draw_indirect_count = draw_indirect_for_arch(arch);
 
    /* 8- and 16-bit storage and int8 (see storage8_for_arch). */
    ext.KHR_8bit_storage = storage8_for_arch(arch);
@@ -625,8 +639,8 @@ get_features(struct vk_features *f, uint32_t arch)
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
       .logicOp = false,
-      .multiDrawIndirect = false,
-      .drawIndirectFirstInstance = false,
+      .multiDrawIndirect = draw_indirect_for_arch(arch),
+      .drawIndirectFirstInstance = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
       /* v7 and v11 (not v9): clip distances are varyings the fragment
@@ -891,7 +905,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .mipmapPrecisionBits = 8,
       .lineSubPixelPrecisionBits = 8,     /* same as panvk on this hardware */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = 1,
+      /* The stream compares the count as a signed word. */
+      .maxDrawIndirectCount = draw_indirect_for_arch(pdev->arch) ? INT32_MAX : 1,
       .maxSamplerLodBias = 126.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,

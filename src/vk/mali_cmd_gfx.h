@@ -477,6 +477,14 @@ MALI_PER_ARCH_DECL(uint64_t, cmd_gfx_fau,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *s,
                     const void *sysvals, const void *push, uint32_t push_size));
 
+/* The same block written at out, whose GPU address is self, for blocks the
+ * caller allocates itself (v11 indirect draws: one per draw). */
+#if !defined(PAN_ARCH) || PAN_ARCH >= 10
+MALI_PER_ARCH_DECL(void, gfx_fau_fill,
+                   (const struct mali_shader *s, const void *sysvals, const void *push,
+                    uint32_t push_size, uint64_t self, void *out));
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* mali_cmd_draw.c                                                         */
 

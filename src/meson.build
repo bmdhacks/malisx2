@@ -256,9 +256,10 @@ malisx2_vk_v7 = static_library(
   _vk_jm_files,
   # The Bifrost draws (a Vertex and a Tiler job each, in place of v9's
   # mali_jm_cmd_draw.c); the descriptor tables and the copy jobs, shared by
-  # the v7 draws and dispatches; the Bifrost descriptor lowering.
+  # the v7 draws and dispatches; the Bifrost descriptor lowering and the
+  # clamped form of bounds-checked storage buffer loads.
   files('vk/mali_jm_cmd_draw_v7.c', 'vk/mali_jm_desc_v7.c',
-        'vk/mali_nir_lower_descriptors_v7.c'),
+        'vk/mali_nir_lower_bounded_loads.c', 'vk/mali_nir_lower_descriptors_v7.c'),
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,

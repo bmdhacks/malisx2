@@ -161,16 +161,18 @@ enum mali_meta_shader {
    MALI_META_QUERY_COPY,  /* vkCmdCopyQueryPoolResults, one invocation per query */
    MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
                               * counters (v7 occlusion: one per shader core) */
-   MALI_META_INDIRECT_DISPATCH, /* v7 vkCmdDispatchIndirect: patches the Compute job */
+   MALI_META_INDIRECT_DISPATCH, /* v7 and v9 vkCmdDispatchIndirect: patches the Compute job */
    MALI_META_COUNT,
 };
 
-/* Push constants of MALI_META_INDIRECT_DISPATCH (v7, mali_jm_cmd_dispatch.c):
- * the VkDispatchIndirectCommand, the Compute job's header and Invocation
- * section, and the FAU addresses of num_work_groups.xyz (0 where the
- * shader does not read one). inv0 and inv1 are the Invocation words with
- * the workgroup size packed and the counts left out; wgx_shift is where
- * the counts start. */
+/* Push constants of MALI_META_INDIRECT_DISPATCH (mali_jm_cmd_dispatch.c):
+ * the VkDispatchIndirectCommand, the Compute job's header, the place the
+ * counts go in the job, and the FAU addresses of num_work_groups.xyz (0
+ * where the shader does not read one). On v7 inv is the Invocation
+ * section, whose words inv0 and inv1 have the workgroup size packed and
+ * the counts left out, and wgx_shift is where the counts start. On v9 inv
+ * is the first of the three Workgroup count words of the Compute payload,
+ * and the other three fields are not used. */
 struct mali_meta_indirect_push {
    uint64_t cmd;
    uint64_t job;

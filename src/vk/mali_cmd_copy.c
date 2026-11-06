@@ -223,11 +223,13 @@ MALI_PER_ARCH(build_query_copy_nir)(struct mali_device *dev, unsigned reports)
    return b.shader;
 }
 
+#if PAN_ARCH < 10
 #define IPUSH(b, field, bits)                                                  \
    nir_load_push_constant(b, 1, bits,                                          \
                           nir_imm_int(b, offsetof(struct mali_meta_indirect_push, field)), \
                           .base = 0, .range = sizeof(struct mali_meta_indirect_push))
 
+#if PAN_ARCH < 9
 /* ceil(log2(v)) for v >= 1, as util_logbase2_ceil. */
 static nir_def *
 nir_logbase2_ceil(nir_builder *b, nir_def *v)
@@ -235,14 +237,16 @@ nir_logbase2_ceil(nir_builder *b, nir_def *v)
    nir_def *msb = nir_iadd_imm(b, nir_ufind_msb(b, nir_iadd_imm(b, v, -1)), 1);
    return nir_bcsel(b, nir_uge_imm(b, v, 2), msb, nir_imm_int(b, 0));
 }
+#endif
 
 /*
- * v7 vkCmdDispatchIndirect (panlib_indirect_dispatch, for the job
- * manager): one invocation reads the VkDispatchIndirectCommand and makes
- * the dispatch's Compute job a Null job when a count is 0, else writes
- * the counts into its Invocation section (mali_v7_pack_invocation, with
- * the size half done on the CPU) and into the FAU words of
- * num_work_groups the shader reads. The job's type is written on every
+ * vkCmdDispatchIndirect on the job manager (panlib_indirect_dispatch): one
+ * invocation reads the VkDispatchIndirectCommand and makes the dispatch's
+ * Compute job a Null job when a count is 0, else writes the counts into
+ * the job and into the FAU words of num_work_groups the shader reads. v7
+ * writes them into the Invocation section (mali_v7_pack_invocation, with
+ * the size half done on the CPU); v9 into the three Workgroup count words
+ * of the Compute payload, at push.inv. The job's type is written on every
  * run, so a re-submitted command buffer is patched again.
  */
 static nir_shader *
@@ -272,6 +276,12 @@ build_indirect_dispatch_nir(struct mali_device *dev)
 
    nir_push_if(&b, nir_inot(&b, none));
    {
+#if PAN_ARCH >= 9
+      nir_def *counts = IPUSH(&b, inv, 64);
+      for (unsigned i = 0; i < 3; i++)
+         nir_store_global(&b, n[i], nir_iadd_imm(&b, counts, 4 * i), .write_mask = 1,
+                          .align_mul = 4);
+#else
       nir_def *s3 = IPUSH(&b, wgx_shift, 32);
       nir_def *s4 = nir_iadd(&b, s3, nir_logbase2_ceil(&b, n[0]));
       nir_def *s5 = nir_iadd(&b, s4, nir_logbase2_ceil(&b, n[1]));
@@ -284,6 +294,7 @@ build_indirect_dispatch_nir(struct mali_device *dev)
                               nir_ior(&b, nir_ishl_imm(&b, s4, 16), nir_ishl_imm(&b, s5, 22)));
       nir_store_global(&b, nir_vec2(&b, inv0, inv1), IPUSH(&b, inv, 64),
                        .write_mask = 0x3, .align_mul = 8);
+#endif
 
       for (unsigned i = 0; i < 3; i++) {
          nir_def *a = nir_load_push_constant(
@@ -297,6 +308,7 @@ build_indirect_dispatch_nir(struct mali_device *dev)
    nir_pop_if(&b, NULL);
    return b.shader;
 }
+#endif /* PAN_ARCH < 10 */
 
 /* The counters per query of the device's occlusion pools that have more than
  * one (v7: one per shader core ID, mali_query.c query_pool_alloc). */
@@ -317,8 +329,10 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
       const unsigned reports = m == MALI_META_QUERY_COPY_SUM ? query_copy_reports(dev) : 1;
       nir_shader *nir = m == MALI_META_QUERY_COPY || m == MALI_META_QUERY_COPY_SUM
                            ? MALI_PER_ARCH(build_query_copy_nir)(dev, reports)
+#if PAN_ARCH < 10
                         : m == MALI_META_INDIRECT_DISPATCH
                            ? build_indirect_dispatch_nir(dev)
+#endif
                            : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 

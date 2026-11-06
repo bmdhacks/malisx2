@@ -133,6 +133,24 @@ static_assert(sizeof(struct mali_graphics_sysvals) % MALI_FAU_WORD_SIZE == 0,
 static_assert(sizeof(struct mali_compute_sysvals) % MALI_FAU_WORD_SIZE == 0,
               "sysvals are whole FAU words");
 
+#if PAN_ARCH < 9
+/* The colour attachment that fragment output location `loc` feeds
+ * (VkRenderingAttachmentLocationInfoKHR, fixed at pipeline creation), or
+ * MESA_VK_ATTACHMENT_UNUSED; `loc` itself when the pipeline state is not
+ * known. */
+static uint8_t
+location_attachment(const struct vk_graphics_pipeline_state *state, unsigned loc)
+{
+   if (!state || !state->cal || !state->rp)
+      return loc;
+   for (uint32_t i = 0; i < state->rp->color_attachment_count && i < MALI_MAX_RTS; i++) {
+      if (state->cal->color_map[i] == loc)
+         return i;
+   }
+   return MESA_VK_ATTACHMENT_UNUSED;
+}
+#endif
+
 struct lower_sysvals_ctx {
    const struct vk_graphics_pipeline_state *state;
 };
@@ -212,10 +230,25 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
 #if PAN_ARCH < 9
-   case nir_intrinsic_load_blend_descriptor_pan:
+   case nir_intrinsic_load_blend_descriptor_pan: {
       /* Bifrost reads the Blend descriptors from its blend FAU slots
-       * (BIR_FAU_BLEND_0 + rt): the backend handles the intrinsic. */
-      return false;
+       * (BIR_FAU_BLEND_0 + n), which the hardware loads from the
+       * descriptors behind the RSD, one per colour attachment
+       * (mali_jm_cmd_draw_v7.c emit_blend_descs); the backend handles the
+       * intrinsic. The blend unit looks a descriptor up by its RT index,
+       * so the descriptors stay in attachment order, and the BLEND of an
+       * output location reads the slot of the attachment the location
+       * feeds. panvk pushes the descriptors' shader half by location
+       * instead (panvk_vX_blend.c), which would take the FAU words v7
+       * gives the set addresses. Outputs that feed no attachment are gone
+       * (drop_unmapped_color_output). */
+      const unsigned loc = nir_intrinsic_base(intr);
+      const uint8_t att = location_attachment(ctx->state, loc);
+      if (att == MESA_VK_ATTACHMENT_UNUSED || att == loc)
+         return false;
+      nir_intrinsic_set_base(intr, att);
+      return true;
+   }
 #else
    case nir_intrinsic_load_blend_descriptor_pan:
       val = load_sysval(b, graphics, bit_size, fs.blend_descs[nir_intrinsic_base(intr)]);
@@ -1180,6 +1213,30 @@ drop_dual_source_output(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *
    nir_instr_remove(&intr->instr);
    return true;
 }
+
+#if PAN_ARCH < 9
+/*
+ * A colour output whose location feeds no attachment writes nothing. On v9
+ * and v11 its BLEND reads a disabled descriptor (mali_gfx_blend); v7 has
+ * no such descriptor to point it at (lower_sysvals), so the BLEND goes.
+ * Run after pan_nir_lower_fs_outputs: the ATEST before it still takes its
+ * alpha from location 0 for alpha to coverage, mapped or not.
+ */
+static bool
+drop_unmapped_color_output(UNUSED nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct vk_graphics_pipeline_state *state = data;
+
+   if (intr->intrinsic != nir_intrinsic_blend_pan && intr->intrinsic != nir_intrinsic_blend2_pan)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location - FRAG_RESULT_DATA0;
+   if (location_attachment(state, loc) != MESA_VK_ATTACHMENT_UNUSED)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+#endif
 
 static bool
 is_const_integral(nir_alu_instr *alu, unsigned src)
@@ -2216,6 +2273,11 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       const bool atest = fs_needs_atest(nir, state, s->fs.input_attachment_read, info->meta);
       s->fs.no_atest = !atest;
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, !atest, 0);
+#if PAN_ARCH < 9
+      if (nir_shader_intrinsics_pass(nir, drop_unmapped_color_output,
+                                     nir_metadata_control_flow, (void *)state))
+         NIR_PASS(_, nir, nir_opt_dce);
+#endif
       if (atest && !alpha_to_coverage_possible(state) &&
           !(nir->info.outputs_written & (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
                                          BITFIELD64_BIT(FRAG_RESULT_STENCIL) |

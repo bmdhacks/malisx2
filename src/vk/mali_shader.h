@@ -527,6 +527,11 @@ bool mali_nir_lower_descriptors_v7(nir_shader *nir,
                                    const struct vk_pipeline_layout *layout,
                                    struct mali_shader_desc_info *desc_info,
                                    struct mali_v7_shader_desc *v7);
+/* v7 (mali_nir_lower_bounded_loads.c): load_global_bounded, which
+ * nir_lower_explicit_io emits for a robust storage buffer load in a shader
+ * whose options have has_load_global_bounded, as a load whose offset is
+ * clamped into the buffer. */
+bool mali_nir_lower_bounded_loads(nir_shader *nir);
 bool mali_nir_lower_input_attachment_loads(nir_shader *nir, unsigned arch,
                                            const struct vk_graphics_pipeline_state *state,
                                            uint32_t *input_attachment_read);

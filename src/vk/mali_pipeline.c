@@ -179,8 +179,9 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
     * expansion reads vertex BaseVertex + n - 1, which wraps to 2^32 - 1
     * when BaseVertex and n are 0, and the unchecked load there faults the
     * GPU context. Vertex shaders get bounds-checked storage buffer loads,
-    * as with robustBufferAccess; the hash below keeps them apart in the
-    * caches. */
+    * as with robustBufferAccess (the loads are clamped, not branched
+    * around: mali_nir_lower_bounded_loads.c); the hash below keeps them
+    * apart in the caches. */
    if (info->stage == VK_SHADER_STAGE_VERTEX_BIT &&
        st->rs.storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       st->rs.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;

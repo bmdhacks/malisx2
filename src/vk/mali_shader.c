@@ -60,6 +60,7 @@
 #include "panfrost/compiler/pan_nir.h"
 #include "util/blob.h"
 #include "util/log.h"
+#include "util/u_call_once.h"
 #include "util/u_dynarray.h"
 
 #include "vk_graphics_state.h"
@@ -778,9 +779,32 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
 /* ---------------------------------------------------------------------- */
 /* Options and lowering                                                    */
 
+#if PAN_ARCH < 9
+/* v7 vertex shaders get the backend's options with has_load_global_bounded:
+ * nir_lower_explicit_io then emits a load_global_bounded for each
+ * bounds-checked storage buffer load of a robust shader instead of a branch
+ * around the load, and mali_nir_lower_bounded_loads turns that into a
+ * clamped load (lower_nir). The other stages keep the branchy checks. */
+static struct nir_shader_compiler_options v7_vs_nir_options;
+static util_once_flag v7_vs_nir_options_once = UTIL_ONCE_FLAG_INIT;
+
+static void
+v7_vs_nir_options_init(void)
+{
+   v7_vs_nir_options = *pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_VERTEX, false);
+   v7_vs_nir_options.has_load_global_bounded = true;
+}
+#endif
+
 const struct nir_shader_compiler_options *
 MALI_PER_ARCH(shader_nir_options)(struct mali_device *dev, mesa_shader_stage stage)
 {
+#if PAN_ARCH < 9
+   if (stage == MESA_SHADER_VERTEX) {
+      util_call_once(&v7_vs_nir_options_once, v7_vs_nir_options_init);
+      return &v7_vs_nir_options;
+   }
+#endif
    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
 }
 
@@ -1058,7 +1082,10 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
    }
 #else
    /* With the bounded global format, nir_lower_explicit_io bounds-checks
-    * storage buffer accesses itself. */
+    * storage buffer accesses itself: stores and atomics with a branch
+    * around them, and, in a vertex shader (v7_vs_nir_options), loads as
+    * load_global_bounded, which becomes a clamped load here. */
+   NIR_PASS(_, nir, mali_nir_lower_bounded_loads);
 #endif
 
    if (allow_merging_workgroups) {

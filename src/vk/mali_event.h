@@ -9,17 +9,17 @@
  * HOST_VISIBLE | HOST_COHERENT. Nonzero means set.
  *
  *  - The host resets it with a store (vkResetEvent) and reads it for
- *    vkGetEventStatus. vkSetEvent stores 1; on the job manager it then
- *    tells the kernel (SOFT_EVENT_UPDATE), so that GPU work waiting on the
- *    event goes on (mali_event.c).
+ *    vkGetEventStatus. vkSetEvent stores 1 and then tells the kernel, so
+ *    that GPU work waiting on the event goes on: SOFT_EVENT_UPDATE on the
+ *    job manager, CS_EVENT_SIGNAL on the command-stream frontend
+ *    (mali_event.c).
  *  - The device writes it in queue order, after everything recorded before
- *    the command (vkCmdSetEvent2, vkCmdResetEvent2): on v11 with a
- *    command-stream sync instruction (mali_cmd_event.c), on the job manager
- *    (v7, v9) with kbase soft atoms (EVENT_SET, EVENT_RESET), which also
- *    wait for it (EVENT_WAIT, vkCmdWaitEvents2; mali_jm_event.c). The job
+ *    the command (vkCmdSetEvent2, vkCmdResetEvent2), and waits for it
+ *    (vkCmdWaitEvents2): on v11 with command-stream sync instructions
+ *    (mali_cmd_event.c), on the job manager (v7, v9) with kbase soft atoms
+ *    (EVENT_SET, EVENT_RESET, EVENT_WAIT; mali_jm_event.c). The job
  *    manager's kernel reads and writes only the word's first byte, which is
- *    the whole value in little-endian order. On v11 vkCmdWaitEvents2 is
- *    the pipeline barrier of its dependency infos (mali_cmd_event.c).
+ *    the whole value in little-endian order.
  *
  * VK_EVENT_CREATE_DEVICE_ONLY_BIT needs synchronization2, which every arch
  * offers; the creation flags are not looked at: every event is

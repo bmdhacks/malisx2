@@ -86,7 +86,9 @@ mali_DestroyEvent(VkDevice _device, VkEvent _event, const VkAllocationCallbacks 
  * kernel: on the job manager an EVENT_WAIT soft atom waits in the kernel
  * and only SOFT_EVENT_UPDATE (or an EVENT_SET atom) completes it; a CPU
  * store alone leaves it waiting until the kernel's soft-job timeout
- * cancels it. */
+ * cancels it. On the command-stream frontend a stream in a sync wait on
+ * the word is looked at again when the kernel is signalled
+ * (CS_EVENT_SIGNAL). */
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_SetEvent(VkDevice _device, VkEvent _event)
 {
@@ -98,6 +100,8 @@ mali_SetEvent(VkDevice _device, VkEvent _event)
           MALI_KBASE_SUCCESS)
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "SOFT_EVENT_UPDATE failed: GPU work waiting on the event is not woken");
+   } else {
+      mali_kbase_event_signal(dev->kbase);
    }
    return VK_SUCCESS;
 }

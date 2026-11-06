@@ -1232,9 +1232,6 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
-#if PAN_ARCH < 9
-   jd->v7_gpu_desc_copy = mali_debug_flag("gpudesccopy");
-#endif
 
    dev->jm = jd;
    dev->fe = jd;

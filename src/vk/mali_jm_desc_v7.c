@@ -21,19 +21,25 @@
  *    dummy sampler, and the bound sets' addresses;
  *  - mali_v7_desc_copy fills the entries that come from the sets (uniform
  *    buffers, textures, samplers, images and texel buffers, in the order of
- *    the shader's copy map) with one small Compute job in the same chain.
- *    The job that reads the tables depends on it: the Vertex job on the
+ *    the shader's copy map). Usually on the CPU, as the command is
+ *    recorded, from the sets' host copies (desc_fill_cpu). Otherwise with
+ *    one small Compute job in the same chain, as panvk does: for a set
+ *    laid out for update after bind, whose entries must be those of the
+ *    moment the command buffer executes, and for the image table. The job
+ *    that reads the tables depends on that job: the Vertex job on the
  *    vertex shader's, the dispatch on the compute shader's. A fragment
  *    shader's tables are read by the fragment job, which starts only once
  *    the whole vtc atom is done, so the Tiler job needs no dependency on
  *    that copy job (panvk adds none either);
  *  - storage buffers and size queries are not copied: the shader reads the
  *    set itself through the set addresses in its system values
- *    (mali_v7_desc_sysvals).
+ *    (mali_v7_desc_sysvals);
+ *  - a stage whose textures and samplers all come from one set laid out
+ *    for update after bind reads that set as its Texture and Sampler
+ *    tables, with nothing copied (mali_nir_lower_descriptors_v7.c).
  *
- * The copy runs on the GPU, as panvk's does, so the tables hold the sets as
- * they are when the command buffer executes; a copy on the CPU would read
- * set memory, which is CPU-uncached, one entry at a time.
+ * The host copy exists because set memory is CPU-uncached: reading a set
+ * back entry by entry would be slow.
  */
 
 #include "mali_cmd_state.h"
@@ -227,23 +233,22 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    if (!s->desc.used_set_mask && !v7->map_count && !s->desc.dyn_bufs.count)
       return true;
 
-   /* Every bound set: the copy shader's sources (panvk passes them all). */
-   out->cpu_fill = !cmd->dev->jm->v7_gpu_desc_copy;
+   /* Every bound set: the copy shader's sources (panvk passes them all).
+    * The tables are filled on the CPU only if every set the map copies
+    * from has a host copy: a set without one (a pool or a layout for
+    * update after bind) is read by the GPU as it is when the draw
+    * executes, so only a copy job sees what is written after the bind. A
+    * bound set the map does not read, a direct set nothing else copies
+    * from included, does not matter. */
+   out->cpu_fill = !v7->count[MALI_V7_DESC_TABLE_IMG];
    for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
       out->set_host[i] = set ? set->host : NULL;
-      /* A direct set nothing is copied from (mali_v7_shader_desc) is read
-       * when the draw runs, by the GPU, as written by then. */
-      const bool direct_only = (int)i == v7->direct_set && v7->direct_exclusive;
-      if (set && set->gpu && !direct_only &&
-          (!set->host ||
-           (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)))
+      if (set && set->gpu && !set->host && (v7->copy_set_mask & BITFIELD_BIT(i)))
          out->cpu_fill = false;
    }
-   if (v7->count[MALI_V7_DESC_TABLE_IMG])
-      out->cpu_fill = false;
 
    for (unsigned t = 0; t < MALI_V7_DESC_TABLE_COUNT; t++) {
       const uint32_t regular = v7->count[t];
@@ -792,10 +797,10 @@ mali_v7_desc_finish(struct mali_device *dev)
  * zeros). The draw then has no copy job, and its Vertex job no dependency
  * on one: on the G52 each copy job is a small dispatch the Vertex job has
  * to wait for, and hakuX binds a new set for most draws. Valid because a
- * set not laid out for update after bind may not change while a command
- * buffer that bound it is recorded and run; the image table (storage
- * images, texel buffers), whose entries the copy rewrites, keeps the
- * job.
+ * set of a pool that is not for update after bind may not change while a
+ * command buffer that bound it is recorded and run; the image table
+ * (storage images, texel buffers), whose entries the copy rewrites, keeps
+ * the job.
  */
 static void
 desc_fill_cpu(const struct mali_shader *s, const struct mali_v7_desc_tables *t)

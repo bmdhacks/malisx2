@@ -899,7 +899,7 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
    v7->direct_set = -1;
    v7->direct_slots = 0;
    v7->direct_sampler_base = 0;
-   v7->direct_exclusive = false;
+   v7->copy_set_mask = 0;
 
    ctx.ht = _mesa_hash_table_u64_create(NULL);
 
@@ -952,16 +952,14 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
    free(table);
 
    v7->needs_set_addrs = ctx.needs_set_addrs;
+   /* The sets the copy map reads. The direct set is among them only when
+    * another table copies from it (its uniform buffers or images). */
+   for (uint32_t i = 0; i < v7->map_count; i++)
+      v7->copy_set_mask |= BITFIELD_BIT(MALI_COPY_DESC_HANDLE_SET(v7->map[i]));
    if (ok && ctx.direct_set >= 0) {
       v7->direct_set = ctx.direct_set;
       v7->direct_slots = ctx.set_layouts[ctx.direct_set]->desc_count;
       v7->direct_sampler_base = ctx.direct_sampler_slot;
-      /* Whether another table copies from the set (its uniform buffers or
-       * images): then its descriptors are still copied when the draw runs. */
-      v7->direct_exclusive = true;
-      for (uint32_t i = 0; i < v7->map_count; i++)
-         if (MALI_COPY_DESC_HANDLE_SET(v7->map[i]) == (uint32_t)ctx.direct_set)
-            v7->direct_exclusive = false;
    }
    _mesa_hash_table_u64_destroy(ctx.ht);
 

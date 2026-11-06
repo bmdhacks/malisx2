@@ -2327,7 +2327,7 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    blob_write_uint32(blob, (uint32_t)s->v7.direct_set);
    blob_write_uint32(blob, s->v7.direct_slots);
    blob_write_uint32(blob, s->v7.direct_sampler_base);
-   blob_write_uint32(blob, s->v7.direct_exclusive);
+   blob_write_uint32(blob, s->v7.copy_set_mask);
    blob_write_uint32(blob, s->v7.map_count);
    blob_write_bytes(blob, s->v7.map, s->v7.map_count * sizeof(uint32_t));
    blob_write_uint32(blob, s->v7.data_size);
@@ -2398,7 +2398,7 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    s->v7.direct_set = (int32_t)blob_read_uint32(blob);
    s->v7.direct_slots = blob_read_uint32(blob);
    s->v7.direct_sampler_base = blob_read_uint32(blob);
-   s->v7.direct_exclusive = blob_read_uint32(blob);
+   s->v7.copy_set_mask = blob_read_uint32(blob);
    s->v7.map_count = blob_read_uint32(blob);
    const void *map = blob_read_bytes(blob, s->v7.map_count * sizeof(uint32_t));
    s->v7.data_size = blob_read_uint32(blob);

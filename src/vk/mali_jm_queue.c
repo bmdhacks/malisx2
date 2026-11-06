@@ -1276,6 +1276,9 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
+#if PAN_ARCH < 9
+   list_inithead(&jd->idraw_arenas);
+#endif
 
    dev->jm = jd;
    dev->fe = jd;
@@ -1299,6 +1302,7 @@ MALI_PER_ARCH(device_finish)(struct mali_device *dev)
    mali_jm_heap_finish(jd);
 #if PAN_ARCH < 9
    mali_v7_desc_finish(dev);
+   mali_v7_idraw_arenas_finish(dev);
 #endif
 
    dev->vk.check_status = NULL;

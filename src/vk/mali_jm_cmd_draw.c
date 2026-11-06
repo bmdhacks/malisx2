@@ -70,6 +70,7 @@
 #endif
 
 #include "util/log.h"
+#include "vk_buffer.h"
 #include "vk_log.h"
 
 #if PAN_ARCH != 9
@@ -431,6 +432,262 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    r->verts += (uint64_t)di->count * di->instance_count;
 #endif
    cmd->draws++;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Indirect draws                                                          */
+
+/*
+ * vkCmdDrawIndirect, vkCmdDrawIndexedIndirect and their indirect count
+ * forms. The job manager cannot read a draw's counts from memory, so each
+ * draw of the call (drawCount of them, or maxDrawCount for the count forms)
+ * is a Malloc Vertex job built as a direct draw of one vertex and one
+ * instance would be, with a patch job in front (mali_jm_idraw_nir.c). The
+ * patch job reads the command and writes the counts, the base vertex
+ * offset and the index pointer into the job, the vertex shader's
+ * first_vertex and base_instance into its own FAU block, and the
+ * per-instance attributes' offsets into its own copy of the vertex
+ * shader's resource table, or makes the job a Null job when the draw draws
+ * nothing or is past the draw count. The draw's job goes into the chain as
+ * a Not Started job that depends on the patch job (Dependency 1), on the
+ * tiler side as every Malloc Vertex job (Dependency 2 the previous one),
+ * and the patch job has Suppress Prefetch, so the job manager reads the
+ * draw's job after the patch job is done.
+ *
+ * The parameters are read when the patch job runs, in the vtc chain: a
+ * barrier whose destination stage is DRAW_INDIRECT orders that read as it
+ * orders the vertex shading of a pass (mali_jm_cmd_buffer.c).
+ */
+struct idraw_call {
+   uint64_t cmd;        /* the first draw's command */
+   uint32_t stride;
+   uint32_t draws;      /* drawCount, or maxDrawCount */
+   uint64_t count;      /* the draw count, 0 for the plain forms */
+   bool indexed;
+};
+
+static_assert(MALI_MAX_VS_ATTRIBS <= MALI_IDRAW_MAX_ATTRIBS, "every attribute fits the record");
+
+/* The vertex attributes of the bound vertex input whose offset grows with
+ * the base instance (mali_gfx_pack_attrib). */
+static uint32_t
+inst_attr_mask(const struct mali_gfx_draw_state *d)
+{
+   const struct vk_vertex_input_state *vi = d->vi;
+   uint32_t m = 0;
+   u_foreach_bit(a, vi->attributes_valid) {
+      if (a < MALI_MAX_VS_ATTRIBS &&
+          vi->bindings[vi->attributes[a].binding].input_rate == VK_VERTEX_INPUT_RATE_INSTANCE)
+         m |= BITFIELD_BIT(a);
+   }
+   return m;
+}
+
+static void
+draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32_t i)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   uint32_t *w = t->w;
+   uint32_t *const pos_env = &w[TW_POS_ENV];
+
+   const struct mali_draw_info di = {.count = 1, .instance_count = 1, .indexed = call->indexed};
+   if (!prepare_draw(cmd, &di))
+      goto oom;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct mali_gfx_bind *bd = &p->bind;
+
+   struct mali_ptr rp = mali_cmd_alloc(cmd, sizeof(struct mali_jm_idraw_rec), 8);
+   struct mali_ptr job = mali_cmd_alloc(cmd, pan_size(MALLOC_VERTEX_JOB), 128);
+   if (!rp.cpu || !job.cpu)
+      return;
+   struct mali_jm_idraw_rec rec = {
+      .cmd = call->cmd + (uint64_t)i * call->stride,
+      .count = call->count,
+      .draw_index = i,
+      .max_draws = call->draws,
+      .indexed = call->indexed,
+      .index_shift = call->indexed ? util_logbase2(d->ib.index_size) : 0,
+      .indices = call->indexed ? d->ib.addr : 0,
+      .job = job.gpu,
+   };
+
+   /* The draw's own FAU block when the vertex shader reads first_vertex or
+    * base_instance (built as for a draw with both 0; the patch job writes
+    * them), and the next draw builds another. */
+   if (bd->vs_first_vertex || bd->vs_base_instance) {
+      struct mali_graphics_sysvals sv;
+      uint64_t v;
+      mali_gfx_fill_sysvals(cmd, &sv);
+      if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
+         goto oom;
+      env_set_fau(pos_env, v);
+      const uint64_t fau = v & BITFIELD64_MASK(56);
+      const int fv = mali_compute_fau_sysval_offset(
+         p->vs, offsetof(struct mali_graphics_sysvals, vs.first_vertex));
+      const int bi = mali_compute_fau_sysval_offset(
+         p->vs, offsetof(struct mali_graphics_sysvals, vs.base_instance));
+      rec.first_vertex = fv >= 0 ? fau + fv : 0;
+      rec.base_instance = bi >= 0 ? fau + bi : 0;
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   }
+   /* Its own resource table when attributes are per instance: their
+    * offsets (built for base instance 0) take firstInstance x stride. */
+   const uint32_t inst = inst_attr_mask(d);
+   if (inst) {
+      uint64_t drv;
+      const uint64_t srt = mali_gfx_vs_srt_drv(cmd, &drv);
+      if (!srt)
+         goto oom;
+      tset64(pos_env, ENV_RESOURCES, srt);
+      rec.attribs = drv;
+      rec.inst_attr_mask = inst;
+      u_foreach_bit(a, inst) {
+         const struct vk_vertex_attribute_state *at = &d->vi->attributes[a];
+         rec.attr_base[a] = at->offset;
+         rec.attr_stride[a] = d->vi_strides[at->binding];
+      }
+      d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+   }
+   if (t->secondary) {
+      /* The varying environment takes the position one's (prepare_draw). */
+      uint32_t *var_env = &w[TW_VAR_ENV];
+      var_env[ENV_FAU_COUNT] = pos_env[ENV_FAU_COUNT];
+      memcpy(&var_env[ENV_RESOURCES], &pos_env[ENV_RESOURCES], 8);
+      memcpy(&var_env[ENV_TSD], &pos_env[ENV_TSD], 16);   /* TSD, FAU */
+   }
+   memcpy(rp.cpu, &rec, sizeof(rec));
+
+   /* The counts and pointers the patch job writes: those of a draw of one
+    * vertex and one instance until it does. */
+   const uint32_t index_type =
+      call->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
+   w[TW_PRIM] = t->prim0 | index_type << 8;
+   w[TW_PRIM + 1] = 0;
+   w[TW_PRIM + 3] = 1;
+   w[TW_INSTANCES] = 1;
+   tset64(w, TW_INDICES, call->indexed ? d->ib.addr : 0);
+
+   /* The patch job, then the job: one chain, taken once (a pass split
+    * between them would leave the dependency in the closed chain). */
+   struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
+   const uint64_t push = rp.gpu;
+   const uint32_t one[3] = {1, 1, 1};
+   uint16_t patch;
+   if (!MALI_PER_ARCH(jm_cmd_meta_job)(cmd, c, MALI_META_INDIRECT_DRAW, &push, sizeof(push),
+                                       one, false, 0, 0, &patch))
+      return;
+   if (c->index >= UINT16_MAX - 2) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   const uint16_t index = ++c->index;
+   w[TW_HDR_TYPE_INDEX] = (t->hdr4 & ~0xfeu) | (uint32_t)index << 16;   /* Not Started */
+   w[TW_HDR_DEPS] = patch | (uint32_t)c->tiler_dep << 16;
+   copy_job(job.cpu, w);
+   mali_jm_chain_link(c, job, index, true);
+   if (unlikely(cmd->jm.resubmit)) {
+      mali_jm_cmd_note_reset(cmd, job.cpu, NULL, 16);
+      mali_jm_cmd_note_reset(cmd, (uint8_t *)job.cpu + TW_VARRAY * 4, &w[TW_VARRAY], 12);
+   }
+
+   /* Heap use: not known here; a guess of a few thousand vertices. */
+   mali_jm_cmd_heap_use(cmd, 4096ull * (t->packet_stride + 16));
+   cmd->jm.cur.draws++;
+   cmd->gfx.render.draws++;
+   cmd->draws++;
+   return;
+
+oom:
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static void
+draw_indirect_call(struct mali_cmd_buffer *cmd, const struct idraw_call *call)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+
+   if (!call->draws)
+      return;
+   if (!cmd->gfx.render.active || !d->pipeline || !d->pipeline->vs) {
+      vk_logw(VK_LOG_OBJS(cmd), "malisx2: draw outside a render pass or without a pipeline");
+      return;
+   }
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+   /* No index buffer: valid only if every draw is empty. */
+   if (call->indexed && !d->ib.size)
+      return;
+   if (mali_gfx_discards(cmd))
+      return;
+   for (uint32_t i = 0; i < call->draws && !vk_command_buffer_has_error(&cmd->vk); i++)
+      draw_indirect(cmd, call, i);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                               VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = drawCount,
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                      VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = drawCount,
+      .indexed = true,
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndirectCount)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                    VkDeviceSize offset, VkBuffer countBuffer,
+                                    VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                    uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   VK_FROM_HANDLE(vk_buffer, cbuf, countBuffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = maxDrawCount,
+      .count = vk_buffer_address(cbuf, countBufferOffset),
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                           VkDeviceSize offset, VkBuffer countBuffer,
+                                           VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                           uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   VK_FROM_HANDLE(vk_buffer, cbuf, countBuffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = maxDrawCount,
+      .count = vk_buffer_address(cbuf, countBufferOffset),
+      .indexed = true,
+   };
+   draw_indirect_call(cmd, &call);
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -603,9 +603,10 @@ mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *str
 
 /* Vertex stage resource table. Table 0: 16 attributes, the dummy sampler,
  * the dynamic buffers, then one Buffer per vertex binding (panvk
- * prepare_vs_driver_set). 0 on failure. */
+ * prepare_vs_driver_set). 0 on failure. *drv (when not NULL): table 0's
+ * address, where attribute i's descriptor is the i-th. */
 static inline uint64_t
-mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct mali_shader *vs = d->pipeline->vs;
@@ -648,7 +649,15 @@ mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
          pan_cast_and_pack(o, NULL_DESCRIPTOR, cfg);
       }
    }
+   if (drv)
+      *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+static inline uint64_t
+mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+{
+   return mali_gfx_vs_srt_drv(cmd, NULL);
 }
 
 /* Fragment varyings read with LD_VAR (panvk emit_varying_descs). */

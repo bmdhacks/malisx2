@@ -39,6 +39,10 @@
  * in behind it as a Not Started job that depends on it, and the patch job
  * has Suppress Prefetch set so the job manager reads the Compute job only
  * after the patch wrote it.
+ *
+ * The indirect draws (mali_jm_cmd_draw.c, mali_jm_cmd_draw_v7.c) put their
+ * internal jobs in with mali_jm_cmd_meta_job: the job of an internal
+ * shader on a chain the caller picked, with the dependencies it names.
  */
 
 #include "mali_cmd_state.h"
@@ -432,6 +436,74 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    if (unlikely(mh))
       mali_jm_measure_end(cmd, mh, c);
 #endif /* PAN_ARCH >= 9 */
+}
+
+bool
+MALI_PER_ARCH(jm_cmd_meta_job)(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, unsigned m,
+                               const void *push, uint32_t push_size, const uint32_t groups[3],
+                               bool barrier, uint16_t dep1, uint16_t dep2, uint16_t *index)
+{
+   const struct mali_shader *cs = MALI_PER_ARCH(cmd_meta_shader)(cmd, m);
+   if (!cs || !cs->spd[MALI_SPD_MAIN])
+      return false;
+   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+   const uint32_t base[3] = {0, 0, 0};
+
+#if PAN_ARCH < 9
+   struct mali_v7_desc_tables tables;
+   if (!mali_v7_desc_prepare(cmd, cs, NULL, true, &tables))
+      return false;
+   const uint64_t fau =
+      mali_compute_fau(cmd, cs, &tables, push, push_size, base, groups) & BITFIELD64_MASK(56);
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (cs->fau.total_count && !fau))
+      return false;
+   /* An internal shader reads no descriptor set: nothing to copy. */
+   assert(!cs->desc.used_set_mask && !cs->v7.map_count);
+   struct mali_ptr job =
+      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), barrier, dep1);
+   if (!job.cpu)
+      return false;
+   mali_v7_compute_invocation(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION),
+                              cs->cs.local_size, groups);
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = mali_v7_compute_task_split(cs->cs.local_size);
+   }
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = cs->spd[MALI_SPD_MAIN];
+      cfg.attributes = tables.img_attribs;
+      cfg.attribute_buffers = tables.tables[MALI_V7_DESC_TABLE_IMG];
+      cfg.thread_storage = tsd;
+      cfg.uniform_buffers = tables.tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.push_uniforms = fau;
+      cfg.textures = tables.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = tables.tables[MALI_V7_DESC_TABLE_SAMPLER];
+   }
+#else
+   const uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
+   const uint64_t srt = mali_compute_res_table(cmd, cs, NULL, NULL, 0);
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   if (vk_command_buffer_has_error(&cmd->vk) || !srt || !tsd || (cs->fau.total_count && !fau))
+      return false;
+   unsigned axis, inc;
+   mali_compute_task_axis(&tp, cs, groups, &axis, &inc);
+   struct mali_ptr job =
+      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), barrier, dep1);
+   if (!job.cpu)
+      return false;
+   pack_compute_payload(job, cs, srt, fau, tsd, groups, axis, inc);
+#endif
+   /* Suppress Prefetch, and Dependency 2 (a Compute job is not a tiler-side
+    * job, so the chain left it 0). */
+   suppress_prefetch(job.cpu);
+   if (dep2) {
+      uint32_t w;
+      memcpy(&w, (uint8_t *)job.cpu + 20, sizeof(w));
+      w = (w & 0xffff) | (uint32_t)dep2 << 16;
+      memcpy((uint8_t *)job.cpu + 20, &w, sizeof(w));
+   }
+   *index = c->index;
+   return true;
 }
 
 void

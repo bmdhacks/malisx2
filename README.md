@@ -21,6 +21,7 @@ this repository's `mesa-glue/` builds the parts the driver needs.
     git init mesa
     git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git <mesa_commit>
     git -C mesa checkout FETCH_HEAD
+    git -C mesa am ../patches/mesa/*.patch
 
 Host (Linux):
 

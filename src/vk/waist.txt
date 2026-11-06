@@ -188,7 +188,7 @@ c vkCmdCopyMemoryToAccelerationStructureKHR
 c vkCmdCopyQueryPoolResults nonnull
 c vkCmdDispatchBase
 c vkCmdDispatchBaseKHR
-c vkCmdDispatchIndirect nonnull
+b vkCmdDispatchIndirect nonnull
 c vkCmdDrawIndexedIndirect nonnull
 c vkCmdDrawIndexedIndirectCount
 c vkCmdDrawIndexedIndirectCountKHR
@@ -326,8 +326,8 @@ c vkResetQueryPoolEXT
 c vkSubmitDebugUtilsMessageEXT
 c vkTrimCommandPool
 c vkTrimCommandPoolKHR
-c vkUpdateDescriptorSetWithTemplate
-c vkUpdateDescriptorSetWithTemplateKHR
+b vkUpdateDescriptorSetWithTemplate
+b vkUpdateDescriptorSetWithTemplateKHR
 
 d vkBindBufferMemory2 nonnull
 d vkBindBufferMemory2KHR

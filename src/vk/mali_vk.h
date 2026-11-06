@@ -161,7 +161,25 @@ enum mali_meta_shader {
    MALI_META_QUERY_COPY,  /* vkCmdCopyQueryPoolResults, one invocation per query */
    MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
                               * counters (v7 occlusion: one per shader core) */
+   MALI_META_INDIRECT_DISPATCH, /* v7 vkCmdDispatchIndirect: patches the Compute job */
    MALI_META_COUNT,
+};
+
+/* Push constants of MALI_META_INDIRECT_DISPATCH (v7, mali_jm_cmd_dispatch.c):
+ * the VkDispatchIndirectCommand, the Compute job's header and Invocation
+ * section, and the FAU addresses of num_work_groups.xyz (0 where the
+ * shader does not read one). inv0 and inv1 are the Invocation words with
+ * the workgroup size packed and the counts left out; wgx_shift is where
+ * the counts start. */
+struct mali_meta_indirect_push {
+   uint64_t cmd;
+   uint64_t job;
+   uint64_t inv;
+   uint64_t nwg[3];
+   uint32_t inv0;
+   uint32_t inv1;
+   uint32_t wgx_shift;
+   uint32_t pad;
 };
 
 /* A fault as the kernel described it, for vkGetDeviceFaultInfoEXT. code

@@ -43,6 +43,7 @@
 #define mali_jm_build_join_all MALI_PER_ARCH(jm_build_join_all)
 #define mali_jm_cmd_add_batch MALI_PER_ARCH(jm_cmd_add_batch)
 #define mali_jm_cmd_add_job MALI_PER_ARCH(jm_cmd_add_job)
+#define mali_jm_cmd_add_job_at MALI_PER_ARCH(jm_cmd_add_job_at)
 #define mali_jm_cmd_barrier MALI_PER_ARCH(jm_cmd_barrier)
 #define mali_jm_cmd_batch MALI_PER_ARCH(jm_cmd_batch)
 #define mali_jm_cmd_batch_close MALI_PER_ARCH(jm_cmd_batch_close)

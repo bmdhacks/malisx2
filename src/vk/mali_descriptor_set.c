@@ -43,6 +43,7 @@
 #include "util/u_math.h"
 #include "vk_alloc.h"
 #include "vk_descriptors.h"
+#include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_util.h"
@@ -467,6 +468,72 @@ MALI_PER_ARCH(UpdateDescriptorSets)(VkDevice _device, uint32_t descriptorWriteCo
    }
    for (uint32_t i = 0; i < descriptorCopyCount; i++)
       copy_descriptors(&pDescriptorCopies[i]);
+}
+
+/*
+ * Template updates (Granite, i.e. parallel-RDP, writes every set this way).
+ * Each element is written alone: the template's stride need not match the
+ * Vulkan info structs', as in CmdPushDescriptorSetWithTemplate2KHR
+ * (mali_cmd_state.c). An inline uniform block entry is one byte range.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(UpdateDescriptorSetWithTemplate)(VkDevice _device, VkDescriptorSet descriptorSet,
+                                               VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                               const void *pData)
+{
+   VK_FROM_HANDLE(mali_descriptor_set, set, descriptorSet);
+   VK_FROM_HANDLE(vk_descriptor_update_template, template, descriptorUpdateTemplate);
+
+   for (uint32_t i = 0; i < template->entry_count; i++) {
+      const struct vk_descriptor_template_entry *e = &template->entries[i];
+      const uint8_t *base = (const uint8_t *)pData + e->offset;
+
+      if (e->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         const VkWriteDescriptorSetInlineUniformBlock iub = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK,
+            .dataSize = e->array_count,
+            .pData = base,
+         };
+         const VkWriteDescriptorSet w = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = &iub,
+            .dstBinding = e->binding,
+            .dstArrayElement = e->array_element,
+            .descriptorCount = e->array_count,
+            .descriptorType = e->type,
+         };
+         write_descriptors(set, &w);
+         continue;
+      }
+
+      for (uint32_t j = 0; j < e->array_count; j++) {
+         const void *src = base + (size_t)j * e->stride;
+         VkWriteDescriptorSet w = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = e->binding,
+            .dstArrayElement = e->array_element + j,
+            .descriptorCount = 1,
+            .descriptorType = e->type,
+         };
+         switch (e->type) {
+         case VK_DESCRIPTOR_TYPE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+            w.pImageInfo = src;
+            break;
+         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            w.pTexelBufferView = src;
+            break;
+         default:
+            w.pBufferInfo = src;
+            break;
+         }
+         write_descriptors(set, &w);
+      }
+   }
 }
 
 /* ---------------------------------------------------------------------- */

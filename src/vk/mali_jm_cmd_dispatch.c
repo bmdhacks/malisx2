@@ -33,15 +33,125 @@
 #include "mali_cmd_state.h"
 
 #include "mali_measure.h"
+#include "vk_buffer.h"
 #if PAN_ARCH < 9
 #include "mali_rsd_v7.h"
+#endif
+
+#if PAN_ARCH < 9
+static void dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                     const struct mali_desc_state *desc, const void *push, uint32_t push_size,
+                     const uint32_t base[3], const uint32_t groups[3],
+                     const uint32_t (*textures)[8], unsigned texture_count, bool xfer,
+                     uint64_t indirect);
+
+/* GPU address of the 32-bit field `off` bytes into struct
+ * mali_compute_sysvals in a dispatch's FAU block at fau (the used sysval
+ * words first, in order: mali_compute_fau), 0 if the shader reads none. */
+static uint64_t
+fau_sysval_addr(const struct mali_shader *cs, uint64_t fau, unsigned off)
+{
+   const unsigned w = off / MALI_FAU_WORD_SIZE;
+   if (!fau || w >= MALI_MAX_SYSVAL_FAUS || !BITSET_TEST(cs->fau.used_sysvals, w))
+      return 0;
+   unsigned rank = 0;
+   for (unsigned i = 0; i < w; i++)
+      rank += BITSET_TEST(cs->fau.used_sysvals, i);
+   return fau + rank * MALI_FAU_WORD_SIZE + off % MALI_FAU_WORD_SIZE;
+}
+
+/*
+ * The jobs of a v7 vkCmdDispatchIndirect, as panvk_v7's cmd_dispatch:
+ * the dispatch's Compute job is allocated first and given to a patch job
+ * (MALI_META_INDIRECT_DISPATCH, mali_cmd_copy.c), which waits for the
+ * descriptor copy job (copy_dep) and has Suppress Prefetch set, so the
+ * job manager reads the Compute job only after the patch wrote it. The
+ * Compute job goes in behind it, Not Started until patched, depending on
+ * it. fau is the FAU block's address, built with counts of 1.
+ */
+static void
+dispatch_indirect(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                  const struct mali_shader *cs, uint64_t rsd,
+                  const struct mali_v7_desc_tables *tables, uint64_t fau, uint64_t tsd,
+                  uint16_t copy_dep, uint64_t indirect)
+{
+   const struct mali_shader *pc =
+      MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_INDIRECT_DISPATCH);
+   struct mali_ptr job = mali_cmd_alloc(cmd, pan_size(COMPUTE_JOB), 128);
+   if (!pc || !job.cpu)
+      return;
+
+   const uint32_t one[3] = {1, 1, 1};
+   struct mali_invocation_packed inv;
+   mali_v7_compute_invocation(&inv, cs->cs.local_size, one);
+   uint32_t inv_words[2];
+   memcpy(inv_words, &inv, sizeof(inv_words));
+   unsigned wgx_shift = 0;
+   for (unsigned i = 0; i < 3; i++)
+      wgx_shift += util_logbase2_ceil(cs->cs.local_size[i]);
+
+   struct mali_meta_indirect_push push = {
+      .cmd = indirect,
+      .job = job.gpu,
+      .inv = job.gpu + pan_section_offset(COMPUTE_JOB, INVOCATION),
+      /* Counts of 1 pack as zero bits, so word 0 is the size half. */
+      .inv0 = inv_words[0],
+      .inv1 = inv_words[1] & ~((0x3fu << 16) | (0x3fu << 22)),
+      .wgx_shift = wgx_shift,
+   };
+   for (unsigned i = 0; i < 3; i++)
+      push.nwg[i] = fau_sysval_addr(
+         cs, fau, offsetof(struct mali_compute_sysvals, num_work_groups) + 4 * i);
+
+   const uint16_t before = c->index;
+   const uint32_t zero[3] = {0, 0, 0};
+   dispatch(cmd, pc, NULL, &push, sizeof(push), zero, one, NULL, 0, false, 0);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+   /* The patch job is the chain's newest job, in the same batch. */
+   if (c->index <= before || !c->prev_next) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   const uint16_t patch_index = c->index;
+   uint8_t *patch_hdr = (uint8_t *)c->prev_next - 24;
+   uint32_t w;
+   memcpy(&w, patch_hdr + 16, sizeof(w));
+   w |= 1u << 11; /* Suppress Prefetch */
+   memcpy(patch_hdr + 16, &w, sizeof(w));
+   if (copy_dep) {
+      memcpy(&w, patch_hdr + 20, sizeof(w));
+      if (!(w & 0xffff)) {
+         w |= copy_dep; /* Dependency 1 */
+         memcpy(patch_hdr + 20, &w, sizeof(w));
+      }
+   }
+
+   memcpy(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), &inv, sizeof(inv));
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = mali_v7_compute_task_split(cs->cs.local_size);
+   }
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = rsd;
+      cfg.attributes = tables->img_attribs;
+      cfg.attribute_buffers = tables->tables[MALI_V7_DESC_TABLE_IMG];
+      cfg.thread_storage = tsd;
+      cfg.uniform_buffers = tables->tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.push_uniforms = fau;
+      cfg.textures = tables->tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = tables->tables[MALI_V7_DESC_TABLE_SAMPLER];
+   }
+   if (!mali_jm_cmd_add_job_at(cmd, c, job, MALI_JOB_TYPE_NOT_STARTED, false, patch_index))
+      return;
+   cmd->dispatches++;
+}
 #endif
 
 static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
          const struct mali_desc_state *desc, const void *push, uint32_t push_size,
          const uint32_t base[3], const uint32_t groups[3], const uint32_t (*textures)[8],
-         unsigned texture_count, bool xfer)
+         unsigned texture_count, bool xfer, uint64_t indirect)
 {
    if (!cs || !cs->spd[MALI_SPD_MAIN])
       return;
@@ -97,7 +207,10 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    }
    const uint64_t fau =
       mali_compute_fau(cmd, cs, &tables, push, push_size, base, groups) & BITFIELD64_MASK(56);
-   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   /* An indirect dispatch's count is not known here: size the WLS for
+    * the most instances (mali_compute_tsd caps them per core). */
+   const uint32_t wls_groups[3] = {1024, 1024, 1024};
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? wls_groups : groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (cs->fau.total_count && !fau))
       return;
    /* The RSD's preload.uniform_count is the shader's FAU word count; the
@@ -111,6 +224,11 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    uint16_t copy_dep = 0;
    if (!mali_v7_desc_copy(cmd, c, cs, &tables, 0, &copy_dep))
       return;
+
+   if (indirect) {
+      dispatch_indirect(cmd, c, cs, rsd, &tables, fau, tsd, copy_dep, indirect);
+      return;
+   }
 
    /* Timing. */
    uint32_t mh = 0;
@@ -216,7 +334,7 @@ MALI_PER_ARCH(cmd_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mal
                                    uint32_t push_size, const uint32_t base[3],
                                    const uint32_t groups[3])
 {
-   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, true);
+   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, true, 0);
 }
 
 void
@@ -225,7 +343,7 @@ MALI_PER_ARCH(cmd_dispatch_meta)(struct mali_cmd_buffer *cmd, const struct mali_
                                  const uint32_t (*textures)[8], unsigned texture_count)
 {
    const uint32_t base[3] = {0, 0, 0};
-   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, true);
+   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, true, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -238,5 +356,20 @@ MALI_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer, uint32_t baseGroup
    const uint32_t base[3] = {baseGroupX, baseGroupY, baseGroupZ};
    const uint32_t groups[3] = {groupCountX, groupCountY, groupCountZ};
    dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
-            sizeof(cmd->push_constants), base, groups, NULL, 0, false);
+            sizeof(cmd->push_constants), base, groups, NULL, 0, false, 0);
 }
+
+#if PAN_ARCH < 9
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+                                   VkDeviceSize offset)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buffer, _buffer);
+   const uint32_t base[3] = {0, 0, 0};
+   const uint32_t groups[3] = {1, 1, 1};
+   dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
+            sizeof(cmd->push_constants), base, groups, NULL, 0, false,
+            vk_buffer_address(buffer, offset));
+}
+#endif

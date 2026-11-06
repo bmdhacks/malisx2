@@ -762,20 +762,23 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    set->cpu = gpu ? (uint8_t *)pool->bo.cpu + (gpu - pool->bo.gpu_va) : NULL;
    set->host = gpu && pool->host ? pool->host + (gpu - pool->bo.gpu_va) : NULL;
 
+#if PAN_ARCH < 9
    /* A texel fetch in a v7 stage that reads this set as its tables reads
     * the set's first sampler slot (mali_desc_set_first_sampler_slot): a
     * sampler until the application writes its own there, else the GPU
-    * faults on whatever the slot holds. Immutable samplers replace it. */
-   const struct mali_physical_device *pdev =
-      container_of(dev->vk.physical, struct mali_physical_device, vk);
-   const int fetch_sampler = mali_desc_set_first_sampler_slot(layout);
-   if (gpu && pdev->arch == 7 && fetch_sampler >= 0 &&
-       (layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)) {
-      uint8_t dummy[MALI_DESCRIPTOR_SIZE];
-      mali_arch_dispatch(pdev->arch, pack_dummy_sampler, dummy);
-      set_store(set, (uint8_t *)set->cpu + (size_t)fetch_sampler * MALI_DESCRIPTOR_SIZE, dummy,
-                sizeof(dummy));
+    * faults on whatever the slot holds. Only a set laid out for update
+    * after bind can be read that way. Immutable samplers, written next,
+    * replace it. */
+   if (gpu && (layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)) {
+      const int fetch_sampler = mali_desc_set_first_sampler_slot(layout);
+      if (fetch_sampler >= 0) {
+         uint8_t dummy[MALI_DESCRIPTOR_SIZE];
+         MALI_PER_ARCH(pack_dummy_sampler)(dummy);
+         set_store(set, (uint8_t *)set->cpu + (size_t)fetch_sampler * MALI_DESCRIPTOR_SIZE, dummy,
+                   sizeof(dummy));
+      }
    }
+#endif
    init_fixed_slots(set);
 
    *out = set;

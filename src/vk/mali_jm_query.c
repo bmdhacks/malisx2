@@ -5,8 +5,9 @@
 
 /*
  * Query commands on the job manager (v7 and v9): vkCmdResetQueryPool,
- * vkCmdWriteTimestamp, and the occlusion queries' vkCmdBeginQuery and
- * vkCmdEndQuery. The pool object and the host reads are in mali_query.c.
+ * vkCmdWriteTimestamp2 (vkCmdWriteTimestamp calls it), and the occlusion
+ * queries' vkCmdBeginQuery and vkCmdEndQuery. The pool object and the host
+ * reads are in mali_query.c.
  * ARMSX2 turns GPU timing on for any device whose name is not
  * "Mali-G615", so the G57 and G52 builds need the timestamp commands; the
  * G615 build has its own (mali_cmd_query.c).
@@ -107,16 +108,18 @@ stage_is_vtc_only(VkPipelineStageFlags2 stage)
    return stage && !(stage & ~vtc_only);
 }
 
+/* The stage is a 64-bit mask (VK_KHR_synchronization2): the stages that
+ * only exist in it (copy, blit, index input, pre-rasterization shaders, ...)
+ * pick the chain like the 32-bit ones do. */
 VKAPI_ATTR void VKAPI_CALL
-MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage,
-                                 VkQueryPool _pool, uint32_t query)
+MALI_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
+                                  VkQueryPool _pool, uint32_t query)
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
 
-   struct mali_jm_chain *c = stage_is_vtc_only((VkPipelineStageFlags2)pipelineStage)
-                                ? mali_jm_cmd_vtc_value(cmd)
-                                : mali_jm_cmd_frag(cmd, false);
+   struct mali_jm_chain *c = stage_is_vtc_only(stage) ? mali_jm_cmd_vtc_value(cmd)
+                                                      : mali_jm_cmd_frag(cmd, false);
    if (!c)
       return;
    if (!mali_jm_cmd_write_value(cmd, c, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
@@ -126,17 +129,14 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
                            mali_query_avail_va(pool, query), 1, true);
 }
 
-/* synchronization2's form (VK_KHR_synchronization2 on v7): the same
- * choice of chain, made on the 64-bit stage mask. */
+/* The 1.0 form. A VkPipelineStageFlagBits value is the same bits as the
+ * low half of the 64-bit mask. */
 VKAPI_ATTR void VKAPI_CALL
-MALI_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
-                                  VkQueryPool _pool, uint32_t query)
+MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage,
+                                 VkQueryPool pool, uint32_t query)
 {
-   MALI_PER_ARCH(CmdWriteTimestamp)(commandBuffer,
-                                    stage_is_vtc_only(stage)
-                                       ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
-                                       : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                    _pool, query);
+   MALI_PER_ARCH(CmdWriteTimestamp2)(commandBuffer, (VkPipelineStageFlags2)pipelineStage, pool,
+                                     query);
 }
 
 /* ---------------------------------------------------------------------- */

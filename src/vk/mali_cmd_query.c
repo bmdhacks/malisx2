@@ -5,8 +5,8 @@
 
 /*
  * Query commands on the command-stream frontend (v11): vkCmdResetQueryPool,
- * vkCmdWriteTimestamp, and the occlusion queries' vkCmdBeginQuery and
- * vkCmdEndQuery. (The job manager's are in mali_jm_query.c; the
+ * vkCmdWriteTimestamp2 (vkCmdWriteTimestamp calls it), and the occlusion
+ * queries' vkCmdBeginQuery and vkCmdEndQuery. (The job manager's are in mali_jm_query.c; the
  * pool object and the host reads are in mali_query.c.)
  *
  * A timestamp is two deferred instructions on one subqueue's stream:
@@ -108,15 +108,16 @@ MALI_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool _poo
     VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |                                  \
     VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT)
 
+/* The stage is a 64-bit mask (VK_KHR_synchronization2): the stages that
+ * only exist in it (copy, blit, index input, pre-rasterization shaders, ...)
+ * pick the stream like the 32-bit ones do. */
 VKAPI_ATTR void VKAPI_CALL
-MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer,
-                                 VkPipelineStageFlagBits pipelineStage, VkQueryPool _pool,
-                                 uint32_t query)
+MALI_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
+                                  VkQueryPool _pool, uint32_t query)
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
    const struct mali_csf_device *csf = cmd->dev->csf;
-   const VkPipelineStageFlags2 stage = (VkPipelineStageFlags2)pipelineStage;
 
    const bool top = stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ||
                     stage == VK_PIPELINE_STAGE_2_NONE;
@@ -137,6 +138,17 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer,
    cs_move64_to(b, one, 1);
    cs_sync64_set(b, false, MALI_CS_SYNC_SCOPE_SYSTEM, one, addr,
                  cs_defer(MALI_SB_MASK(MALI_SB_DEFERRED_FLUSH), MALI_SB_DEFERRED_SYNC));
+}
+
+/* The 1.0 form. A VkPipelineStageFlagBits value is the same bits as the
+ * low half of the 64-bit mask. */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer,
+                                 VkPipelineStageFlagBits pipelineStage, VkQueryPool pool,
+                                 uint32_t query)
+{
+   MALI_PER_ARCH(CmdWriteTimestamp2)(commandBuffer, (VkPipelineStageFlags2)pipelineStage, pool,
+                                     query);
 }
 
 /* ---------------------------------------------------------------------- */

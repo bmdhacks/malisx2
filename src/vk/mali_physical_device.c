@@ -900,9 +900,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
 
-      /* VK_MALISX2_descriptor_indexing (get_features): update-after-bind
-       * limits are the ordinary ones. */
+      /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
+       * the ordinary ones; per-stage ones are raised below. A non-uniform
+       * index must be uniform within a fragment quad even for explicit
+       * level of detail, which quadDivergentImplicitLod does not cover
+       * (mali_vk.h). */
       props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
+      props->quadDivergentImplicitLod = false;
       props->shaderSampledImageArrayNonUniformIndexingNative = false;
       props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
       props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
@@ -927,21 +931,38 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
       props->maxDescriptorSetUpdateAfterBindInputAttachments =
          props->maxDescriptorSetInputAttachments;
-      /* A stage whose textures and samplers all come from one update-after-
-       * bind set reads that set as its tables (mali_nir_lower_descriptors_v7.c
-       * direct sets): bindless arrays cost nothing per draw. Tables have
-       * 16-bit counts: a set of up to 16384 images and 1024 samplers (hakuX
-       * asks 3 x 4096 and 256, and then drops its per-draw sets: about a
-       * third of the driver's time per draw on the Mali-G52). Debug switch
-       * nobindless: the ordinary limits. */
-      if (!mali_debug_flag("nobindless")) {
-         props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
-         props->maxDescriptorSetUpdateAfterBindSampledImages = 16384;
-         props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
-         props->maxDescriptorSetUpdateAfterBindSamplers = 1024;
-         props->maxPerStageUpdateAfterBindResources =
-            MAX2(props->maxPerStageUpdateAfterBindResources, 16384 + 1024 + 256);
-      }
+
+      /*
+       * VK_MALISX2_descriptor_indexing (get_features). An update-after-bind
+       * limit counts the descriptors of sets with and without the
+       * update-after-bind bit, so none is below its ordinary counterpart:
+       * per set they are the ordinary limits.
+       *
+       * Per stage, a stage whose textures and samplers all come from one
+       * update-after-bind set reads that set as its tables
+       * (mali_nir_lower_descriptors_v7.c direct sets), so a bindless array
+       * costs nothing per draw there. The tables have 16-bit counts, so the
+       * set must have fewer than 65536 slots: up to 16384 images and 1024
+       * samplers (hakuX asks for 3 x 4096 and 256, and then drops its
+       * per-draw sets: about a third of the driver's time per draw on the
+       * Mali-G52).
+       *
+       * The sampled image limit counts uniform texel buffers too, and those
+       * are not read through the Texture table: each takes an entry of the
+       * stage's image table, which storage images and storage texel buffers
+       * share and which holds MALI_V7_MAX_STAGE_IMG_ENTRIES whatever the
+       * limits say. A pipeline whose stage needs more fails to be created
+       * with VK_ERROR_FEATURE_NOT_PRESENT (mali_shader.c v7_fixup_info).
+       */
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+      props->maxPerStageUpdateAfterBindResources =
+         props->maxPerStageDescriptorUpdateAfterBindSamplers +
+         props->maxPerStageDescriptorUpdateAfterBindUniformBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindStorageBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindSampledImages +
+         props->maxPerStageDescriptorUpdateAfterBindStorageImages +
+         props->maxPerStageDescriptorUpdateAfterBindInputAttachments;
    }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);

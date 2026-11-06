@@ -421,7 +421,16 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
  *   one index a quad, and the per-invocation loop that makes a non-uniform
  *   index uniform leaves the inactive invocations' index stale, so a quad
  *   with two indices reads its first invocation's texture in all four.
- *   (hakuX indexes per draw, which a quad never straddles.)
+ *   That holds for every operation of the texture unit, texelFetch,
+ *   explicit level of detail and gather included, so it is wider than
+ *   what the reported quadDivergentImplicitLod (false) excuses, which is
+ *   only implicit level of detail. (hakuX indexes per draw, which a quad
+ *   never straddles.)
+ * - A stage can use at most 240 storage images, storage texel buffers and
+ *   uniform texel buffers together (the image table), whatever
+ *   maxPerStageDescriptorUpdateAfterBindSampledImages says of the last
+ *   kind; pipeline creation fails with VK_ERROR_FEATURE_NOT_PRESENT past
+ *   that.
  *
  * VK_EXT_descriptor_indexing itself is not offered on v7 and cannot be
  * enabled (mali_physical_device.c, mali_device.c).

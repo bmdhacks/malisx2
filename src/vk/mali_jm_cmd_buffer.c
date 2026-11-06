@@ -513,6 +513,7 @@ static struct mali_jm_chain *
 vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
 {
    struct mali_jm_batch *b = mali_jm_cmd_batch(cmd);
+#if PAN_ARCH < 9
    /* A copy into a fresh image (mali_image::fresh): no earlier work read
     * or wrote the image or its memory, so of the transfer-only
     * requirements it needs only those of buffer and global barriers (its
@@ -521,6 +522,7 @@ vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
    const bool fresh = xfer && cmd->jm.xfer_fresh && !cmd->jm.xvtc_buf;
    if (fresh)
       xfer = false;
+#endif
    const uint16_t req = vtc_req(cmd->jm.req, xfer);
 
    /* Outside a render pass, a full batch closes before the next job. */
@@ -556,13 +558,17 @@ vtc_chain(struct mali_cmd_buffer *cmd, bool xfer)
       else if (req & REQ_VTC_AFTER_FRAG_XFER)
          met |= REQ_XVTC_AFTER_FRAG_XFER;
       cmd->jm.req &= ~met;
+#if PAN_ARCH < 9
       if (!(cmd->jm.req & REQ_XVTC_ALL))
          cmd->jm.xvtc_buf = false;
+#endif
    }
    if (xfer)
       b->vtc_xfer = true;
+#if PAN_ARCH < 9
    if (fresh)
       b->vtc_fresh = true;
+#endif
    return &b->vtc;
 }
 
@@ -754,9 +760,11 @@ mali_jm_cmd_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stage
    (void)src_access;
    const uint16_t req = barrier_req(src_stages, dst_stages, dst_access);
    cmd->jm.req |= req;
+#if PAN_ARCH < 9
    /* Not known to be about images only (mali_jm_cmd::xvtc_buf). */
    if (req & REQ_XVTC_ALL)
       cmd->jm.xvtc_buf = true;
+#endif
 }
 
 #if PAN_ARCH < 9
@@ -1022,9 +1030,9 @@ MALI_PER_ARCH(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
     * buffer pending twice at once (SIMULTANEOUS_USE) runs its submissions
     * one after the other: one chain cannot run twice at the same time. */
    cmd->jm.resubmit = !(info->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+#if PAN_ARCH < 9
    cmd->jm.xvtc_buf = false;
    cmd->jm.xfer_fresh = false;
-#if PAN_ARCH < 9
    cmd->jm.idx_hint.set = false;
 #endif
    return VK_SUCCESS;
@@ -1060,11 +1068,13 @@ MALI_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
    }
    if (req & REQ_FRAG_AFTER_VTC)
       cmd->jm.end_req |= MALI_JM_REQ_FRAG_AFTER_VTC;
+#if PAN_ARCH < 9
    if (cmd->jm.xvtc_buf &&
        (cmd->jm.end_req & (MALI_JM_REQ_XVTC_AFTER_FRAG | MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)))
       cmd->jm.end_req |= MALI_JM_REQ_XVTC_BUF;
-   cmd->jm.req = 0;
    cmd->jm.xvtc_buf = false;
+#endif
+   cmd->jm.req = 0;
    return vk_command_buffer_end(&cmd->vk);
 }
 

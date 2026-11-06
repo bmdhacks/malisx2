@@ -966,14 +966,20 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
              * by any vtc atom that waits for as much anyway (later vtc
              * atoms follow it in the slot order). */
             if (q->xvtc_frag) {
+#if PAN_ARCH < 9
                /* A copy into a fresh image owes only a buffer barrier's. */
                if (bt->vtc_xfer || (bt->vtc_fresh && q->xvtc_buf)) {
+#else
+               if (bt->vtc_xfer) {
+#endif
                   req = newer(req, q->xvtc_frag);
                   why_note(jd, q, MALI_JM_WHY_XVTC, q->xvtc_frag);
                }
                if (req && newer(req, q->xvtc_frag) == req) {
                   q->xvtc_frag = 0;
+#if PAN_ARCH < 9
                   q->xvtc_buf = false;
+#endif
                }
             }
             if (unlikely(q->why_on))
@@ -1018,8 +1024,10 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          q->xvtc_frag = newer(q->xvtc_frag, q->last[MALI_JM_SLOT_FRAG]);
       else if (cmd->jm.end_req & MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)
          q->xvtc_frag = newer(q->xvtc_frag, q->last_frag_xfer);
+#if PAN_ARCH < 9
       if (cmd->jm.end_req & MALI_JM_REQ_XVTC_BUF)
          q->xvtc_buf = true;
+#endif
    }
    return VK_SUCCESS;
 }

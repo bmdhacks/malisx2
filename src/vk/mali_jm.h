@@ -135,10 +135,12 @@ struct mali_jm_batch {
                                copy, fill or update): it meets a transfer-
                                only requirement carried from an earlier
                                command buffer (mali_jm_queue::xvtc_frag) */
+#if PAN_ARCH < 9
    bool vtc_fresh;          /* its vtc chain has a copy into a fresh image
                                (mali_image::fresh): it meets such a
                                requirement only when a buffer barrier
                                asked for it (MALI_JM_REQ_XVTC_BUF) */
+#endif
    uint32_t passes, draws;
    uint64_t est_heap_bytes; /* estimated tiler heap use, for batch closing */
    uint64_t heap_desc;      /* the Tiler Heap descriptor every pass of the
@@ -312,13 +314,15 @@ struct mali_jm_cmd {
     * the end of the command buffer (MALI_JM_REQ_*), for the queue. */
    uint16_t req;
    uint8_t end_req;
+#if PAN_ARCH < 9
    /* req's transfer-only requirements (REQ_XVTC_*) include some of a
     * buffer or global barrier, not only of image barriers. */
    bool xvtc_buf;
    /* The transfer being recorded writes only a fresh image
-    * (mali_jm_cmd_xfer_fresh): its vtc jobs skip the image-only barriers'
+    * (mali_image::fresh): its vtc jobs skip the image-only barriers'
     * transfer requirements. */
    bool xfer_fresh;
+#endif
 
    /* Re-submission: command buffers recorded without ONE_TIME_SUBMIT
     * note every GPU-written word, and submit restores them before every
@@ -1039,9 +1043,11 @@ struct mali_jm_queue {
     * transfers, up to the end of the command buffer that asked); 0 when
     * nothing is owed. */
    mali_jm_ref xvtc_frag;
+#if PAN_ARCH < 9
    /* Part of what xvtc_frag owes came from a buffer or global barrier
     * (MALI_JM_REQ_XVTC_BUF): copies into fresh images wait for it too. */
    bool xvtc_buf;
+#endif
    /* Debug switch vtcwhy: per reason, the vtc atoms whose dependency on
     * the fragment slot named an atom still running (build_submit), logged
     * about once a second. */

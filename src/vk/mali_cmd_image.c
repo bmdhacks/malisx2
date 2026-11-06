@@ -516,7 +516,9 @@ MALI_PER_ARCH(CmdCopyImage2)(VkCommandBuffer commandBuffer, const VkCopyImageInf
    VK_FROM_HANDLE(mali_image, src, info->srcImage);
    VK_FROM_HANDLE(mali_image, dst, info->dstImage);
 
+#if PAN_ARCH < 9
    dst->fresh = false;
+#endif
 
    for (uint32_t i = 0; i < info->regionCount; i++) {
       if (copy_touches_crc(dst, &info->pRegions[i].dstSubresource)) {
@@ -593,8 +595,8 @@ MALI_PER_ARCH(CmdCopyBufferToImage2)(VkCommandBuffer commandBuffer, const VkCopy
     * it redefines a new image of its own memory; the copy then no longer
     * waits for all the fragment work before it. */
    cmd->jm.xfer_fresh = img->fresh && !mali_image_is_afbc(img);
-#endif
    img->fresh = false;
+#endif
 
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkBufferImageCopy2 *r = &info->pRegions[i];
@@ -686,7 +688,9 @@ MALI_PER_ARCH(CmdClearColorImage)(VkCommandBuffer commandBuffer, VkImage image,
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_image, img, image);
+#if PAN_ARCH < 9
    img->fresh = false;
+#endif
    const enum pipe_format format = img->planes[0].format;
 
    if (cmd->gfx.render.active)
@@ -723,7 +727,9 @@ MALI_PER_ARCH(CmdClearDepthStencilImage)(VkCommandBuffer commandBuffer, VkImage 
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_image, img, image);
+#if PAN_ARCH < 9
    img->fresh = false;
+#endif
 
    if (cmd->gfx.render.active)
       return;
@@ -999,7 +1005,9 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(mali_image, src, info->srcImage);
    VK_FROM_HANDLE(mali_image, dst, info->dstImage);
+#if PAN_ARCH < 9
    dst->fresh = false;
+#endif
 
    if (cmd->gfx.render.active)
       return;

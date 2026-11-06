@@ -65,7 +65,8 @@ struct mali_device_memory {
     * freed when the type is not host-coherent. */
    uint64_t mapped_lo, mapped_hi;
 
-   /* Buffers and images bound to it so far (mali_image::fresh). */
+   /* Buffers and images bound to it so far (mali_image::fresh); updated
+    * atomically, binds can come from any thread. */
    uint32_t binds;
 };
 

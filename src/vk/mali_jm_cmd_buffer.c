@@ -615,6 +615,22 @@ mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd)
 struct mali_jm_chain *
 mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd)
 {
+#if PAN_ARCH < 9
+   /* The tiling of a pass does not wait for an image barrier's
+    * requirement, but it still starts a new batch when the open one has
+    * the fragment work that requirement is about: a batch's fragment atoms
+    * wait for all of its tiling, and the next batch's tiling runs while
+    * they shade. This is where a plain requirement would have closed the
+    * batch, so the batches are the ones such a barrier always made, minus
+    * the wait. Once per barrier (REQ_IVTC_SPLIT): later passes go into the
+    * batch as usual. */
+   if (cmd->jm.req & REQ_IVTC_SPLIT) {
+      cmd->jm.req &= ~REQ_IVTC_SPLIT;
+      if (cmd->jm.open &&
+          vtc_req_closes(cmd, vtc_req(cmd->jm.req & REQ_IVTC_ALL, VTC_JOB_IMAGE)))
+         mali_jm_cmd_batch_close(cmd);
+   }
+#endif
    return vtc_chain(cmd, VTC_JOB_PLAIN);
 }
 

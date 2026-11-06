@@ -511,7 +511,9 @@ struct mali_jm_chain *mali_jm_cmd_vtc_transfer(struct mali_cmd_buffer *cmd);
  * a dispatch or a transfer waits for what image barriers asked of vtc work
  * (mali_jm_cmd_buffer.c, image_barrier_req); a pass's draws do not, unless
  * their vertex shader can touch images or memory
- * (mali_jm_cmd_pass_images). On v9 the two are the same.
+ * (mali_jm_cmd_pass_images); but the pass starts a new batch when an image
+ * barrier's requirement is about fragment work in the open one. On v9 the
+ * two are the same.
  */
 struct mali_jm_chain *mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd);
 

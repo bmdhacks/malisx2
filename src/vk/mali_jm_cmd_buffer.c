@@ -954,7 +954,9 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
  * pipeline per barrier: hakuX's cockpit passes have about 22 of them, and
  * with every draw scissored to one pixel such a 640x720 pass still took
  * 4.1 ms of fragment time on the G52. Storage and other memory accesses
- * keep the barrier.
+ * keep the barrier, and so does a barrier that orders execution only (no
+ * access in either scope): its masks say nothing about what it orders, so
+ * the draw stays.
  */
 #define TILE_SRC_ACCESS                                                        \
    (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | \
@@ -963,11 +965,28 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
 #define TILE_DST_ACCESS                                                        \
    (TILE_SRC_ACCESS | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT)
 
+#if PAN_ARCH < 9
+/* A barrier with no access in either scope, once the masks are filtered for
+ * its stages: an execution dependency only. */
+static bool
+execution_only(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineStageFlags2 dst,
+               VkAccessFlags2 dsta)
+{
+   src = vk_expand_src_stage_flags2(src);
+   dst = vk_expand_dst_stage_flags2(dst);
+   return !vk_filter_src_access_flags2(src, srca) && !vk_filter_dst_access_flags2(dst, dsta);
+}
+#endif
+
+/* The masks are the unions over the call's barriers; exec_only says whether
+ * any one of those barriers orders execution only. */
 static bool
 tile_ordered_barrier(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineStageFlags2 dst,
-                     VkAccessFlags2 dsta)
+                     VkAccessFlags2 dsta, bool exec_only)
 {
 #if PAN_ARCH < 9
+   if (exec_only)
+      return false;
    src = vk_expand_src_stage_flags2(src);
    dst = vk_expand_dst_stage_flags2(dst);
    srca = vk_filter_src_access_flags2(src, srca);
@@ -978,6 +997,7 @@ tile_ordered_barrier(VkPipelineStageFlags2 src, VkAccessFlags2 srca, VkPipelineS
    (void)srca;
    (void)dst;
    (void)dsta;
+   (void)exec_only;
    return false;
 #endif
 }
@@ -990,8 +1010,13 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 
    VkPipelineStageFlags2 src = 0, dst = 0;
    VkAccessFlags2 srca = 0, dsta = 0;
+   bool exec_only = false;   /* some barrier of the call orders execution only */
    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
       const VkMemoryBarrier2 *m = &info->pMemoryBarriers[i];
+#if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+#endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -1002,6 +1027,10 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * and foreign ones. */
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
       const VkBufferMemoryBarrier2 *m = &info->pBufferMemoryBarriers[i];
+#if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+#endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
@@ -1012,14 +1041,14 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * is the image), for ubo_copy_dep. */
    const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
    const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
-#endif
-#if PAN_ARCH < 9
    VkPipelineStageFlags2 img_src = 0, img_dst = 0;
    VkAccessFlags2 img_dsta = 0;
 #endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
 #if PAN_ARCH < 9
+      exec_only |=
+         execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
       img_src |= m->srcStageMask;
       img_dst |= m->dstStageMask;
       img_dsta |= m->dstAccessMask;
@@ -1042,7 +1071,7 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       const VkPipelineStageFlags2 fs = FRAG_RENDER_STAGES;
       if ((info->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
           (vk_expand_src_stage_flags2(src) & fs) && (vk_expand_dst_stage_flags2(dst) & fs) &&
-          !tile_ordered_barrier(src, srca, dst, dsta))
+          !tile_ordered_barrier(src, srca, dst, dsta, exec_only))
          MALI_PER_ARCH(cmd_fb_barrier)(cmd);
       return;
    }

@@ -611,6 +611,16 @@ int mali_kbase_jm_poll(struct mali_kbase *kb, int timeout_ms);
 enum mali_kbase_result mali_kbase_jm_post_term(struct mali_kbase *kb);
 
 /*
+ * SOFT_EVENT_UPDATE: the kernel writes the event byte at gpu_va (1 for set,
+ * 0 for reset) and, on a set, completes every EVENT_WAIT soft atom of this
+ * context that waits on that address. A store from the CPU writes the byte
+ * too, but only this wakes the waiting atoms (otherwise they stay until the
+ * kernel's soft-job timeout cancels them).
+ */
+enum mali_kbase_result mali_kbase_jm_soft_event_update(struct mali_kbase *kb, uint64_t gpu_va,
+                                                       bool set);
+
+/*
  * STREAM_CREATE: a new sync-file timeline fd, the stream_fd a
  * FENCE_TRIGGER soft atom's base_fence names. name is copied in, truncated
  * to 31 bytes plus a NUL as the kernel requires;

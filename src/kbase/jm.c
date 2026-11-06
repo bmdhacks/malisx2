@@ -297,6 +297,21 @@ mali_kbase_jm_post_term(struct mali_kbase *kb)
    return MALI_KBASE_SUCCESS;
 }
 
+enum mali_kbase_result
+mali_kbase_jm_soft_event_update(struct mali_kbase *kb, uint64_t gpu_va, bool set)
+{
+   struct kb_jm_soft_event_update u = {
+      .event = gpu_va,
+      .new_status = set ? 1 : 0,
+   };
+   long ret = kb_ioctl(kb, KB_JM_IOCTL_SOFT_EVENT_UPDATE, &u);
+   if (ret < 0) {
+      KB_LOG(kb, "SOFT_EVENT_UPDATE failed: %s", strerror((int)-ret));
+      return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
+   }
+   return MALI_KBASE_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Sync-file streams                                                       */
 

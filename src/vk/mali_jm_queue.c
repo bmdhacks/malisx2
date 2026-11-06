@@ -63,10 +63,36 @@
  * that ran out of numbers. One thread at a time polls (the reader); the
  * others sleep on the device condition variable, which it broadcasts.
  *
+ * VkEvent commands (mali_jm_event.c) are batches without chains, each one
+ * soft atom (build_event):
+ *
+ *   set/reset: EVENT_SET or EVENT_RESET, joins slot 0's order
+ *            pre_dep[0] the previous atom in slot 0's order
+ *            pre_dep[1] the newest atom in slot 1's order
+ *            so it runs after everything submitted before it, later
+ *            fragment atoms and the submission's tracker follow it, and a
+ *            reset after a set (or a set after a wait) stays behind it;
+ *   wait:    EVENT_WAIT, joins the order of slot 1 when its destination
+ *            stages include vtc-slot stages, else slot 0's
+ *            pre_dep[0] the previous atom in that order
+ *            Later atoms of that order follow it. When the stages need both
+ *            slots it is in slot 1's order, and the next fragment atom
+ *            without a vtc atom of its own is told to wait for the newest
+ *            vtc atom (the carried MALI_JM_REQ_FRAG_AFTER_VTC); fragment
+ *            atoms with one follow their vtc atom. The kernel completes it
+ *            when the word is set (an EVENT_SET atom, or SOFT_EVENT_UPDATE
+ *            from vkSetEvent), and cancels it after its soft-job timeout if
+ *            that does not happen.
+ *
+ * Command buffers without events have no event batches: their atoms are
+ * the ones described above, unchanged.
+ *
  * Device loss: any event code other than DONE, except a FENCE_WAIT
  * cancelled because the waited fence signalled an error, makes the device
  * lost, sticky, reported at the next submit, wait or status query.
- * Nothing is masked, TERMINATED included; that may be revisited later.
+ * Nothing is masked, TERMINATED included; that may be revisited later. An
+ * EVENT_WAIT cancelled by the timeout is device loss too: the work behind
+ * it (DATA dependencies) did not run.
  */
 
 #ifndef _GNU_SOURCE
@@ -166,6 +192,8 @@ atom_kind_name(unsigned kind)
    case MALI_JM_ATOM_JOIN: return "dependency-only";
    case MALI_JM_ATOM_FENCE_WAIT: return "fence wait";
    case MALI_JM_ATOM_FENCE_TRIGGER: return "fence trigger";
+   case MALI_JM_ATOM_EVENT: return "event set/reset";
+   case MALI_JM_ATOM_EVENT_WAIT: return "event wait";
    default: return "unknown";
    }
 }
@@ -222,6 +250,16 @@ process_event(struct mali_device *dev, const struct kb_jm_event *ev)
          jd->stats.fence_wait_errors++;
          mesa_logw("malisx2: a waited sync file signalled an error (submission %llu); "
                    "continuing", (unsigned long long)ev->udata[0]);
+      } else if (kind == MALI_JM_ATOM_EVENT_WAIT &&
+                 ev->event_code == KB_JM_EVENT_JOB_CANCELLED) {
+         /* The kernel's soft-job timeout (3 s by default) ran out before
+          * the event was set; the work behind the wait failed with it. */
+         record_fault(dev, ev, "event wait timed out: the event was not set");
+         jm_set_fault(jd,
+                      "vkCmdWaitEvents (submission %llu, command buffer %u) waited longer "
+                      "than the kernel's soft-job timeout for an event that was not set; "
+                      "the work after it was cancelled",
+                      (unsigned long long)ev->udata[0], MALI_JM_UDATA_CMD(u));
       } else {
          char what[VK_MAX_DESCRIPTION_SIZE];
          snprintf(what, sizeof(what), "%s: %s atom %u (submission %llu)",
@@ -851,6 +889,29 @@ chain_req(const struct mali_jm_chain *c)
 #endif
 }
 
+/* The soft atom of an event batch (file comment). 0 with *result set on
+ * failure. */
+static mali_jm_ref
+build_event(struct mali_device *dev, struct mali_jm_queue *q, const struct mali_jm_batch *bt,
+            uint64_t ud, VkResult *result)
+{
+   if (bt->event_op != MALI_JM_EVENT_WAIT) {
+      const uint32_t req = bt->event_op == MALI_JM_EVENT_SET ? KB_JM_REQ_SOFT_EVENT_SET
+                                                             : KB_JM_REQ_SOFT_EVENT_RESET;
+      return mali_jm_build_atom(dev, MALI_JM_ATOM_EVENT, MALI_JM_SLOT_FRAG, req, bt->event_addr,
+                                NULL, ud, q->last[MALI_JM_SLOT_FRAG], q->last[MALI_JM_SLOT_VTC],
+                                result);
+   }
+   const unsigned gate = stage_gate(bt->event_stages);
+   const uint8_t slot = (gate & GATE_VTC) ? MALI_JM_SLOT_VTC : MALI_JM_SLOT_FRAG;
+   const mali_jm_ref w =
+      mali_jm_build_atom(dev, MALI_JM_ATOM_EVENT_WAIT, slot, KB_JM_REQ_SOFT_EVENT_WAIT,
+                         bt->event_addr, NULL, ud, q->last[slot], 0, result);
+   if (w && gate == (GATE_FRAG | GATE_VTC))
+      q->carry |= MALI_JM_REQ_FRAG_AFTER_VTC;
+   return w;
+}
+
 /* The atom graph of the submit's waits and command buffers (file
  * comment). With dev->lock held and the build begun. batch_frag has room
  * for the largest command buffer's batch count, allocated before the
@@ -918,6 +979,13 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          const struct mali_jm_batch *bt = &batches[k];
          const uint64_t ud = udata_of(c, k);
          mali_jm_ref vtc = 0;
+
+         if (unlikely(bt->event_op)) {
+            if (!build_event(dev, q, bt, ud, &result))
+               return result;
+            batch_frag[k] = q->last[MALI_JM_SLOT_FRAG];
+            continue;
+         }
 
          if (bt->vtc.first) {
             mali_jm_ref req = frag_req;

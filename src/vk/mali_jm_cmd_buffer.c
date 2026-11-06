@@ -782,6 +782,47 @@ mali_jm_cmd_add_batch(struct mali_cmd_buffer *cmd, const struct mali_jm_batch *b
    return true;
 }
 
+/*
+ * An event operation is a batch of its own, between the batches recorded
+ * before it and those after, so each side's work is in other atoms than the
+ * event's: closing the open batch is what lets the set's atom wait for the
+ * work before it, and lets the work after a wait be held by the wait's
+ * atom. A Write Value job in the vtc chain could not set the word: the
+ * batch's fragment atoms run after its vtc atom, and the job's store is not
+ * ordered against the cache clean the kernel does when an atom completes.
+ *
+ * Inside a render pass (a wait: a set or reset is not valid there) the pass
+ * is split at the wait: its tiling so far is one vtc atom, the wait's atom
+ * comes next, and the rest of the pass goes on in a new batch with the
+ * same tiler heap. That batch's fragment work, which reads all of the
+ * pass's polygon lists, must follow the first vtc atom even when the batch
+ * gets no vtc job of its own after the wait: frag_after_vtc.
+ */
+bool
+mali_jm_cmd_event(struct mali_cmd_buffer *cmd, uint8_t op, uint64_t addr,
+                  VkPipelineStageFlags2 stages)
+{
+   const bool split = cmd->gfx.render.active && cmd->jm.open;
+   if (split)
+      mali_jm_cmd_pass_split(cmd);
+   else
+      mali_jm_cmd_batch_close(cmd);
+   struct mali_jm_batch *slot = util_dynarray_grow(&cmd->jm.batches, struct mali_jm_batch, 1);
+   if (!slot) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return false;
+   }
+   *slot = (struct mali_jm_batch){
+      .heap_slot = -1,
+      .event_op = op,
+      .event_addr = addr,
+      .event_stages = stages,
+   };
+   if (split)
+      cmd->jm.cur.frag_after_vtc = true;
+   return true;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Barriers                                                                */
 
@@ -978,6 +1019,17 @@ image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *m)
    return m->srcQueueFamilyIndex != m->dstQueueFamilyIndex &&
           (m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_EXTERNAL ||
            m->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT);
+}
+
+void
+mali_jm_cmd_dep_crc(struct mali_cmd_buffer *cmd, const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
+      if (image_barrier_invalidates_crc(m))
+         MALI_PER_ARCH(cmd_crc_invalidate)(cmd, container_of(vk_image_from_handle(m->image),
+                                                             struct mali_image, vk));
+   }
 }
 
 /*

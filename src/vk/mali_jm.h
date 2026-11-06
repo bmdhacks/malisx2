@@ -152,7 +152,18 @@ struct mali_jm_batch {
    uint64_t est_heap_bytes; /* estimated tiler heap use, for batch closing */
    uint64_t heap_desc;      /* the Tiler Heap descriptor every pass of the
                                batch tiles through (0 until one tiles) */
+   /* An event batch (mali_jm_cmd_event) has no chains: it is one kbase soft
+    * atom on the VkEvent word at event_addr. A wait holds the work after it
+    * that runs in event_stages (its destination stages). */
+   uint8_t event_op;        /* MALI_JM_EVENT_*; NONE for every other batch */
+   uint64_t event_addr;
+   uint64_t event_stages;
 };
+
+#define MALI_JM_EVENT_NONE  0
+#define MALI_JM_EVENT_SET   1
+#define MALI_JM_EVENT_RESET 2
+#define MALI_JM_EVENT_WAIT  3
 
 /*
  * Batch limits. A batch is closed before a job that would take its vtc
@@ -608,6 +619,23 @@ mali_jm_chain_link(struct mali_jm_chain *c, struct mali_ptr job, uint16_t index,
 void mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep);
 #endif
 
+/*
+ * An event operation after everything recorded so far: vkCmdSetEvent2 and
+ * vkCmdResetEvent2 (op SET, RESET; outside a render pass) and
+ * vkCmdWaitEvents2 (op WAIT, one per event; stages: the wait's destination
+ * stages). Closes the open batch, or inside a render pass splits the pass
+ * there (mali_jm_cmd_pass_split), and adds an event batch, which submit
+ * turns into a kbase soft atom (mali_jm_queue.c). False on allocation
+ * failure, with the command buffer's error set.
+ */
+bool mali_jm_cmd_event(struct mali_cmd_buffer *cmd, uint8_t op, uint64_t addr,
+                       VkPipelineStageFlags2 stages);
+
+/* The image layout transitions of info that make an image's CRCs stale
+ * (as vkCmdPipelineBarrier2 handles them): for the event commands, which
+ * take a dependency info but are not barriers here. */
+void mali_jm_cmd_dep_crc(struct mali_cmd_buffer *cmd, const VkDependencyInfo *info);
+
 /* A Write Value job on chain c (timestamps, availability, tests). */
 bool mali_jm_cmd_write_value(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                              enum mali_write_value_type type, uint64_t addr, uint64_t value,
@@ -898,6 +926,8 @@ enum mali_jm_atom_kind {
    MALI_JM_ATOM_JOIN,           /* dependency-only (core_req 0) */
    MALI_JM_ATOM_FENCE_WAIT,     /* soft: waits for an imported sync file */
    MALI_JM_ATOM_FENCE_TRIGGER,  /* soft: signals a sync file we hand out */
+   MALI_JM_ATOM_EVENT,          /* soft: sets or resets a VkEvent (mali_event.h) */
+   MALI_JM_ATOM_EVENT_WAIT,     /* soft: waits until a VkEvent is set */
 };
 
 /* udata[1] of every atom: its kind, flags, and where it came from (for

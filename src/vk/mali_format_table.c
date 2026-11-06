@@ -103,9 +103,9 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
     * hakuX asks per format (BC1-3), Dolphin for the feature, and then they
     * upload their BC textures as they are, a quarter to an eighth of the
     * BGRA8 they decode them to otherwise. Not on v9/v11, where the earlier
-    * noise was seen. The debug switch nobc answers no again.
+    * noise was seen.
     */
-   if (is_bc_format(format) && (PAN_ARCH != 7 || mali_debug_flag("nobc")))
+   if (is_bc_format(format) && PAN_ARCH != 7)
       return 0;
 
    enum pipe_format planes[MALI_IMAGE_MAX_PLANES];

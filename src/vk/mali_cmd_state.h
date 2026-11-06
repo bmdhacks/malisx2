@@ -301,7 +301,11 @@ mali_cmd_tls_size_field(const struct mali_cmd_buffer *cmd)
 
 /* Local Storage descriptor of a dispatch (pan_emit_tls): the command
  * buffer's TLS buffer and, for shaders with shared memory, a per-dispatch
- * WLS buffer. 0 on failure. */
+ * WLS buffer. 0 on failure. groups NULL is an indirect dispatch, whose
+ * count is not known yet: its WLS gets as many instances as the cores can
+ * hold at once (as panvk's pan_calc_wls_instances), which is also the most
+ * any dispatch gets, so the buffer is sized by the hardware's thread
+ * limits and the shader, not by a workgroup count. */
 static inline uint64_t
 mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                  const struct mali_thread_props *tp, const uint32_t groups[3])
@@ -323,7 +327,8 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       unsigned wg_per_task =
          DIV_ROUND_UP(tp->max_threads_per_core / tp->max_tasks_per_core, threads_per_wg);
       unsigned max_per_core = util_next_power_of_two(wg_per_task * tp->max_tasks_per_core);
-      unsigned dispatch = util_next_power_of_two(groups[0]) *
+      unsigned dispatch = !groups ? max_per_core :
+                          util_next_power_of_two(groups[0]) *
                           util_next_power_of_two(groups[1]) *
                           util_next_power_of_two(groups[2]);
       wls_instances = MIN2(dispatch, max_per_core);

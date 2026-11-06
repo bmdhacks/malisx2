@@ -515,6 +515,13 @@ struct mali_ptr mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_
                                     enum mali_job_type type, unsigned size, bool barrier,
                                     uint16_t dep1);
 
+/* mali_jm_cmd_add_job for a job the caller allocated (and may already
+ * have given to a GPU-side writer, as v7 indirect dispatch does). false
+ * on failure, with the command buffer's error set. */
+bool mali_jm_cmd_add_job_at(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                            struct mali_ptr job, enum mali_job_type type, bool barrier,
+                            uint16_t dep1);
+
 /*
  * The link half of mali_jm_cmd_add_job, for writers that pack the header
  * themselves (the draws copy whole jobs from a cached template): job, whose

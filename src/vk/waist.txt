@@ -16,6 +16,10 @@
 #
 # A stub is generated for every name here, whatever its class: an a/b
 # entry point that is not implemented yet behaves like c/d until it is.
+# The class says who calls the command (the loader, ARMSX2, nobody), not
+# whether a back half implements it: vkCmdDispatchIndirect and
+# vkUpdateDescriptorSetWithTemplate stay c although some architectures
+# implement them.
 # "nonnull" marks the 49 out-of-waist names that must resolve because the
 # Android loader or ARMSX2 requires a non-NULL pointer; every name here
 # resolves anyway.
@@ -398,3 +402,30 @@ d vkSignalSemaphoreKHR
 d vkWaitSemaphores
 d vkWaitSemaphoresKHR
 d vkWriteAccelerationStructuresPropertiesKHR
+
+# Forward targets of Mesa's common entry points. Mesa implements a number of
+# commands as a function that builds a *2 / *3 form of the same command and
+# calls it through the device's dispatch table (vk_common_CmdDrawIndirect
+# calls vkCmdDrawIndirect2KHR). When a back half neither implements the
+# command nor the *2 form, Mesa's function is what the table holds and the
+# call ends in a NULL slot. These are the *2 forms that no back half
+# implements, so that the call ends in a stub that logs it (aborts in a
+# measurement build) instead. A host test reads the forwards out of Mesa's
+# sources and checks that the target of each one that is in effect resolves,
+# so a Mesa update that adds a forward fails it until the target is listed
+# here or implemented.
+c vkCmdBeginConditionalRendering2EXT
+c vkCmdBeginTransformFeedback2EXT
+c vkCmdBindDescriptorBufferEmbeddedSamplers2EXT
+c vkCmdBindTransformFeedbackBuffers2EXT
+c vkCmdDispatchIndirect2KHR
+c vkCmdDrawIndexedIndirect2KHR
+c vkCmdDrawIndexedIndirectCount2KHR
+c vkCmdDrawIndirect2KHR
+c vkCmdDrawIndirectByteCount2EXT
+c vkCmdDrawIndirectCount2KHR
+c vkCmdDrawMeshTasksIndirect2EXT
+c vkCmdDrawMeshTasksIndirectCount2EXT
+c vkCmdEndTransformFeedback2EXT
+c vkCmdSetDescriptorBufferOffsets2EXT
+c vkCmdWriteMarkerToMemoryAMD

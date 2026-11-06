@@ -223,6 +223,81 @@ MALI_PER_ARCH(build_query_copy_nir)(struct mali_device *dev, unsigned reports)
    return b.shader;
 }
 
+#define IPUSH(b, field, bits)                                                  \
+   nir_load_push_constant(b, 1, bits,                                          \
+                          nir_imm_int(b, offsetof(struct mali_meta_indirect_push, field)), \
+                          .base = 0, .range = sizeof(struct mali_meta_indirect_push))
+
+/* ceil(log2(v)) for v >= 1, as util_logbase2_ceil. */
+static nir_def *
+nir_logbase2_ceil(nir_builder *b, nir_def *v)
+{
+   nir_def *msb = nir_iadd_imm(b, nir_ufind_msb(b, nir_iadd_imm(b, v, -1)), 1);
+   return nir_bcsel(b, nir_uge_imm(b, v, 2), msb, nir_imm_int(b, 0));
+}
+
+/*
+ * v7 vkCmdDispatchIndirect (panlib_indirect_dispatch, for the job
+ * manager): one invocation reads the VkDispatchIndirectCommand and makes
+ * the dispatch's Compute job a Null job when a count is 0, else writes
+ * the counts into its Invocation section (mali_v7_pack_invocation, with
+ * the size half done on the CPU) and into the FAU words of
+ * num_work_groups the shader reads. The job's type is written on every
+ * run, so a re-submitted command buffer is patched again.
+ */
+static nir_shader *
+build_indirect_dispatch_nir(struct mali_device *dev)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_indirect_dispatch");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *cmd = IPUSH(&b, cmd, 64);
+   nir_def *job = IPUSH(&b, job, 64);
+   nir_def *n[3];
+   for (unsigned i = 0; i < 3; i++)
+      n[i] = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, cmd, 4 * i), .align_mul = 4);
+   nir_def *none = nir_ior(&b, nir_ieq_imm(&b, n[0], 0),
+                           nir_ior(&b, nir_ieq_imm(&b, n[1], 0), nir_ieq_imm(&b, n[2], 0)));
+
+   /* Job Header word 4: Type is bits 1-7 (Null 1, Compute 4). */
+   nir_def *hdr = nir_iadd_imm(&b, job, 16);
+   nir_def *w4 = nir_load_global(&b, 1, 32, hdr, .align_mul = 4);
+   nir_def *type = nir_bcsel(&b, none, nir_imm_int(&b, 1 << 1), nir_imm_int(&b, 4 << 1));
+   nir_store_global(&b, nir_ior(&b, nir_iand_imm(&b, w4, ~0xfeu), type), hdr,
+                    .write_mask = 1, .align_mul = 4);
+
+   nir_push_if(&b, nir_inot(&b, none));
+   {
+      nir_def *s3 = IPUSH(&b, wgx_shift, 32);
+      nir_def *s4 = nir_iadd(&b, s3, nir_logbase2_ceil(&b, n[0]));
+      nir_def *s5 = nir_iadd(&b, s4, nir_logbase2_ceil(&b, n[1]));
+      nir_def *inv0 = IPUSH(&b, inv0, 32);
+      inv0 = nir_ior(&b, inv0, nir_ishl(&b, nir_iadd_imm(&b, n[0], -1), s3));
+      inv0 = nir_ior(&b, inv0, nir_ishl(&b, nir_iadd_imm(&b, n[1], -1), s4));
+      inv0 = nir_ior(&b, inv0, nir_ishl(&b, nir_iadd_imm(&b, n[2], -1), s5));
+      /* Workgroups Y shift at bit 16, Workgroups Z shift at bit 22. */
+      nir_def *inv1 = nir_ior(&b, IPUSH(&b, inv1, 32),
+                              nir_ior(&b, nir_ishl_imm(&b, s4, 16), nir_ishl_imm(&b, s5, 22)));
+      nir_store_global(&b, nir_vec2(&b, inv0, inv1), IPUSH(&b, inv, 64),
+                       .write_mask = 0x3, .align_mul = 8);
+
+      for (unsigned i = 0; i < 3; i++) {
+         nir_def *a = nir_load_push_constant(
+            &b, 1, 64, nir_imm_int(&b, offsetof(struct mali_meta_indirect_push, nwg) + 8 * i),
+            .base = 0, .range = sizeof(struct mali_meta_indirect_push));
+         nir_push_if(&b, nir_ine_imm(&b, a, 0));
+         nir_store_global(&b, n[i], a, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
 /* The counters per query of the device's occlusion pools that have more than
  * one (v7: one per shader core ID, mali_query.c query_pool_alloc). */
 static unsigned
@@ -242,6 +317,8 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
       const unsigned reports = m == MALI_META_QUERY_COPY_SUM ? query_copy_reports(dev) : 1;
       nir_shader *nir = m == MALI_META_QUERY_COPY || m == MALI_META_QUERY_COPY_SUM
                            ? MALI_PER_ARCH(build_query_copy_nir)(dev, reports)
+                        : m == MALI_META_INDIRECT_DISPATCH
+                           ? build_indirect_dispatch_nir(dev)
                            : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 
@@ -274,6 +351,12 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
    if (!s)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    return s;
+}
+
+const struct mali_shader *
+MALI_PER_ARCH(cmd_meta_shader)(struct mali_cmd_buffer *cmd, unsigned m)
+{
+   return get_meta(cmd, m);
 }
 
 void

@@ -414,6 +414,20 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_dynamic_rendering = true,
    .KHR_depth_stencil_resolve = true,
    .KHR_create_renderpass2 = true,
+
+   /* Reads of the bound colour and depth/stencil attachments inside a
+    * dynamic rendering pass, and the maps that decide which output location
+    * feeds which attachment and which input index reads which. Every arch
+    * has the three parts it needs: input attachments are tile reads
+    * (mali_nir_lower_input_attachments.c, panvk's scheme), where the maps
+    * are the pipeline's (VkRenderingAttachmentLocationInfo and
+    * VkRenderingInputAttachmentIndexInfo, kept by the runtime, which also
+    * implements the two vkCmdSetRendering* commands); a blend descriptor
+    * and the BLEND of an output location go with the attachment the
+    * location feeds (mali_pipeline_state.c pack_blend; v7 in mali_shader.c
+    * lower_sysvals); and a by-region barrier inside a pass is a draw with a
+    * primitive barrier (cmd_fb_barrier). */
+   .KHR_dynamic_rendering_local_read = true,
 };
 
 /*
@@ -434,15 +448,6 @@ device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
    if (arch == 7) {
-      /* Reads of the bound colour and depth attachments inside a dynamic
-       * rendering pass: input attachments are tile reads already
-       * (mali_nir_lower_input_attachments.c, panvk's scheme, with the
-       * input attachment map from the runtime's
-       * vkCmdSetRenderingInputAttachmentIndices), a by-region barrier
-       * inside a pass is a draw with a primitive barrier
-       * (mali_jm_cmd_buffer.c), and an output location blends into the
-       * attachment it feeds (mali_shader.c lower_sysvals). */
-      ext.KHR_dynamic_rendering_local_read = true;
       /* What v7 has of what Vulkan 1.3 made core: synchronization2 (the
        * driver's barrier and submit are the 2 forms; the runtime has the
        * 1.0 ones), the dynamic states of VK_EXT_extended_dynamic_state
@@ -644,11 +649,13 @@ get_features(struct vk_features *f, uint32_t arch)
        * whose only rendering path on a 1.1 device is vkCmdBeginRendering
        * and which requires all three names. */
       .dynamicRendering = true,
+
+      /* VK_KHR_dynamic_rendering_local_read (the table above). */
+      .dynamicRenderingLocalRead = true,
    };
 
    /* The extensions of device_extensions_for_arch on v7. */
    if (arch == 7) {
-      f->dynamicRenderingLocalRead = true;
       f->synchronization2 = true;
       f->privateData = true;
       f->shaderDemoteToHelperInvocation = true;
@@ -950,6 +957,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * per pipeline (panvk reports the same). */
       .provokingVertexModePerPipeline = false,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+
+      /* VK_KHR_dynamic_rendering_local_read (get_features): depth and
+       * stencil are tile reads like colour; rendering is single-sampled
+       * (MALI_SUPPORTED_SAMPLE_COUNTS), so there is no multisampled
+       * attachment to read. */
+      .dynamicRenderingLocalReadDepthStencilAttachments = true,
+      .dynamicRenderingLocalReadMultisampledAttachments = false,
    };
 
    /*
@@ -990,11 +1004,6 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetSampledImages = UINT16_MAX;
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
-
-      /* Local read (get_features): depth/stencil reads are tile reads too;
-       * rendering is single-sampled. */
-      props->dynamicRenderingLocalReadDepthStencilAttachments = true;
-      props->dynamicRenderingLocalReadMultisampledAttachments = false;
 
       /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
        * the ordinary ones; per-stage ones are raised below. A non-uniform

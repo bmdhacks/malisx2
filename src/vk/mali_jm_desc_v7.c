@@ -176,7 +176,7 @@ mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       if (t->sets[i] != (set ? set->gpu : 0) ||
-          t->set_desc_counts[i] != (set ? set->layout->desc_count : 0))
+          t->set_desc_counts[i] != (set ? set->desc_count : 0))
          return false;
    }
 
@@ -244,7 +244,7 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    for (unsigned i = 0; i < MALI_MAX_SETS; i++) {
       const struct mali_descriptor_set *set = desc ? desc->sets[i] : NULL;
       out->sets[i] = set ? set->gpu : 0;
-      out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
+      out->set_desc_counts[i] = set ? set->desc_count : 0;
       out->set_host[i] = set ? set->host : NULL;
       if (set && set->gpu && !set->host && (v7->copy_set_mask & BITFIELD_BIT(i)))
          out->cpu_fill = false;

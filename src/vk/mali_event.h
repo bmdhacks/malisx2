@@ -23,9 +23,9 @@
  * The job-manager GPUs (v7, v9) have no events: their entry points are
  * waist stubs.
  *
- * VK_EVENT_CREATE_DEVICE_ONLY_BIT needs synchronization2, which v11 does
- * not expose (v7 does, but has no events), so the creation flags are not
- * looked at: every event is host-visible.
+ * VK_EVENT_CREATE_DEVICE_ONLY_BIT needs synchronization2, which every arch
+ * offers; the creation flags are not looked at: every event is
+ * host-visible, which a device-only event may also be.
  */
 
 #ifndef MALI_EVENT_H

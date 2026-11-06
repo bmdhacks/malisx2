@@ -419,6 +419,16 @@ static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+   if (arch == 7) {
+      /* Descriptor indexing, the part hakuX uses (get_features), offered to
+       * applications only as malisx2's own VK_MALISX2_descriptor_indexing
+       * (mali_vk.h): v7 cannot meet VK_EXT_descriptor_indexing's required
+       * features and update-after-bind limits. Mesa's runtime keys the
+       * descriptor indexing feature structs and SPIR-V capabilities on the
+       * EXT, so it is supported here and hidden from applications
+       * (mali_EnumerateDeviceExtensionProperties, mali_CreateDevice). */
+      ext.EXT_descriptor_indexing = true;
+   }
    return ext;
 }
 
@@ -561,6 +571,18 @@ get_features(struct vk_features *f, uint32_t arch)
        * and which requires all three names. */
       .dynamicRendering = true,
    };
+
+   if (arch == 7) {
+      /* VK_MALISX2_descriptor_indexing (device_extensions_for_arch). v7
+       * copies a stage's descriptors from the sets into its tables by a
+       * copy job when the draw runs, so writes after the bind are what it
+       * copies; unwritten descriptors are copied but not read; non-uniform
+       * indices are lowered to loops (mali_shader.c). */
+      f->runtimeDescriptorArray = true;
+      f->descriptorBindingPartiallyBound = true;
+      f->descriptorBindingSampledImageUpdateAfterBind = true;
+      f->shaderSampledImageArrayNonUniformIndexing = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -877,6 +899,49 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetSampledImages = UINT16_MAX;
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
+
+      /* VK_MALISX2_descriptor_indexing (get_features): update-after-bind
+       * limits are the ordinary ones. */
+      props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
+      props->shaderSampledImageArrayNonUniformIndexingNative = false;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
+      props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+         props->maxPerStageDescriptorUniformBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+         props->maxPerStageDescriptorStorageBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages =
+         props->maxPerStageDescriptorSampledImages;
+      props->maxPerStageDescriptorUpdateAfterBindStorageImages =
+         props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageDescriptorUpdateAfterBindInputAttachments =
+         props->maxPerStageDescriptorInputAttachments;
+      props->maxPerStageUpdateAfterBindResources = props->maxPerStageResources;
+      props->maxDescriptorSetUpdateAfterBindSamplers = props->maxDescriptorSetSamplers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffers = props->maxDescriptorSetUniformBuffers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+         props->maxDescriptorSetUniformBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffers = props->maxDescriptorSetStorageBuffers;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+         props->maxDescriptorSetStorageBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindSampledImages = props->maxDescriptorSetSampledImages;
+      props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
+      props->maxDescriptorSetUpdateAfterBindInputAttachments =
+         props->maxDescriptorSetInputAttachments;
+      /* A stage whose textures and samplers all come from one update-after-
+       * bind set reads that set as its tables (mali_nir_lower_descriptors_v7.c
+       * direct sets): bindless arrays cost nothing per draw. Tables have
+       * 16-bit counts: a set of up to 16384 images and 1024 samplers (hakuX
+       * asks 3 x 4096 and 256, and then drops its per-draw sets: about a
+       * third of the driver's time per draw on the Mali-G52). Debug switch
+       * nobindless: the ordinary limits. */
+      if (!mali_debug_flag("nobindless")) {
+         props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
+         props->maxDescriptorSetUpdateAfterBindSampledImages = 16384;
+         props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+         props->maxDescriptorSetUpdateAfterBindSamplers = 1024;
+         props->maxPerStageUpdateAfterBindResources =
+            MAX2(props->maxPerStageUpdateAfterBindResources, 16384 + 1024 + 256);
+      }
    }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);
@@ -903,6 +968,38 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
 
 /* ---------------------------------------------------------------------- */
 /* Queries we implement ourselves                                          */
+
+/* Mesa's list, with VK_EXT_descriptor_indexing (supported only for the
+ * runtime, device_extensions_for_arch) shown as malisx2's own
+ * VK_MALISX2_descriptor_indexing (mali_vk.h). */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                        const char *pLayerName,
+                                        uint32_t *pPropertyCount,
+                                        VkExtensionProperties *pProperties)
+{
+   VK_FROM_HANDLE(mali_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkExtensionProperties, out, pProperties, pPropertyCount);
+
+   for (int i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++) {
+      if (!pdev->vk.supported_extensions.extensions[i])
+         continue;
+#ifdef ANDROID_STRICT
+      if (!vk_android_allowed_device_extensions.extensions[i])
+         continue;
+#endif
+      vk_outarray_append_typed(VkExtensionProperties, &out, prop) {
+         *prop = vk_device_extensions[i];
+         if (!strcmp(prop->extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+            snprintf(prop->extensionName, sizeof(prop->extensionName), "%s",
+                     VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+            prop->specVersion = VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION;
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
 
 VKAPI_ATTR void VKAPI_CALL
 mali_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,

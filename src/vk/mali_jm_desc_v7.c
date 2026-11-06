@@ -234,7 +234,10 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
       out->sets[i] = set ? set->gpu : 0;
       out->set_desc_counts[i] = set ? set->layout->desc_count : 0;
       out->set_host[i] = set ? set->host : NULL;
-      if (set && set->gpu &&
+      /* A direct set nothing is copied from (mali_v7_shader_desc) is read
+       * when the draw runs, by the GPU, as written by then. */
+      const bool direct_only = (int)i == v7->direct_set && v7->direct_exclusive;
+      if (set && set->gpu && !direct_only &&
           (!set->host ||
            (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)))
          out->cpu_fill = false;
@@ -272,6 +275,16 @@ mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
             return false;
          out->img_attribs = a.gpu;
       }
+   }
+
+   /* A direct set is the stage's Texture and Sampler table: its slots,
+    * indexed as laid out, the Sampler table from the set's first sampler
+    * (mali_nir_lower_descriptors_v7.c). */
+   if (v7->direct_set >= 0) {
+      const uint64_t set = out->sets[v7->direct_set];
+      out->tables[MALI_V7_DESC_TABLE_TEXTURE] = set;
+      out->tables[MALI_V7_DESC_TABLE_SAMPLER] =
+         set ? set + (uint64_t)v7->direct_sampler_base * MALI_DESCRIPTOR_SIZE : 0;
    }
 
    /* A shader with textures and no sampler of its own gets one: texel

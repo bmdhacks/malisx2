@@ -138,6 +138,22 @@ mali_desc_index(const struct mali_descriptor_set_binding_layout *b,
    return b->desc_idx + elem * mali_desc_stride(b) + mali_subdesc_offset(b, sub);
 }
 
+/* Slot of the layout's first sampler (of its lowest sampler or combined
+ * image sampler binding), -1 if it has none: what a texel fetch reads in a
+ * v7 stage that reads the set as its tables (mali_nir_lower_descriptors_v7.c
+ * choose_direct_set). */
+static inline int
+mali_desc_set_first_sampler_slot(const struct mali_descriptor_set_layout *l)
+{
+   for (uint32_t i = 0; i < l->binding_count; i++) {
+      const struct mali_descriptor_set_binding_layout *b = &l->bindings[i];
+      if (b->desc_count && (b->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                            b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
+         return mali_desc_index(b, 0, MALI_SUBDESC_SAMPLER);
+   }
+   return -1;
+}
+
 /* Slots an inline uniform block of size bytes takes. */
 static inline uint32_t
 mali_iub_desc_count(uint32_t size)

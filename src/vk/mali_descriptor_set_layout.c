@@ -205,7 +205,8 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
 
 /* The checks of vkCreateDescriptorSetLayout without creating anything. The
  * variable-count query is answered with 0: variable descriptor counts are
- * not supported (descriptor indexing is not exposed). */
+ * not supported (descriptorBindingVariableDescriptorCount is false where
+ * descriptor indexing is offered, on v7). */
 VKAPI_ATTR void VKAPI_CALL
 mali_GetDescriptorSetLayoutSupport(VkDevice _device,
                                    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,

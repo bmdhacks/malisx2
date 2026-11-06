@@ -221,6 +221,8 @@ _vk_jm_files = files(
   'vk/mali_jm_cmd_render.c', 'vk/mali_jm_event.c', 'vk/mali_jm_heap.c',
   'vk/mali_jm_query.c',
   'vk/mali_jm_queue.c', 'vk/mali_jm_sync_file.c', 'vk/mali_query.c', 'vk/mali_sync.c',
+  # The internal shaders of indirect draws.
+  'vk/mali_jm_idraw_nir.c',
   'vk/mali_wsi.c',
   # Timing and command-stream capture on the job manager (MALISX2_MEASURE):
   # their own implementation of what touches struct mali_cmd_buffer

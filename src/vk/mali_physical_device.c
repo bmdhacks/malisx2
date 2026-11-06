@@ -495,15 +495,29 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
 }
 
 /*
- * Indirect draws with more than one command, a first instance taken from
- * the command, and VK_KHR_draw_indirect_count. v11 runs the commands in a
- * command-stream loop (mali_cmd_draw.c). v7 and v9 have no indirect draws
- * (their vkCmdDraw*Indirect* are logging stubs) and report one draw.
+ * Indirect draws with more than one command (multiDrawIndirect), a first
+ * instance taken from the command (drawIndirectFirstInstance), and the
+ * indirect count forms (VK_KHR_draw_indirect_count). v11 runs the commands
+ * in a command-stream loop (mali_cmd_draw_indirect.c). On the job manager
+ * (v7, v9) each draw of a call is its own jobs behind a patch job that
+ * reads its parameters (mali_jm_idraw_nir.c), so maxDrawCount draws are
+ * recorded for an indirect count call whatever the count turns out to be.
  */
 static bool
 draw_indirect_for_arch(uint32_t arch)
 {
-   return arch == 11;
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+/* maxDrawIndirectCount. v11: the stream compares the count as a signed
+ * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
+ * which bounds what one call records. */
+static uint32_t
+max_draw_indirect_count_for_arch(uint32_t arch)
+{
+   if (!draw_indirect_for_arch(arch))
+      return 1;
+   return arch == 11 ? INT32_MAX : UINT16_MAX;
 }
 
 static struct vk_device_extension_table
@@ -639,6 +653,8 @@ get_features(struct vk_features *f, uint32_t arch)
       .logicOp = false,
       .multiDrawIndirect = draw_indirect_for_arch(arch),
       .drawIndirectFirstInstance = draw_indirect_for_arch(arch),
+      /* Vulkan 1.2's name for VK_KHR_draw_indirect_count. */
+      .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
       /* v7 and v11 (not v9): clip distances are varyings the fragment
@@ -903,8 +919,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .mipmapPrecisionBits = 8,
       .lineSubPixelPrecisionBits = 8,     /* same as panvk on this hardware */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      /* The stream compares the count as a signed word. */
-      .maxDrawIndirectCount = draw_indirect_for_arch(pdev->arch) ? INT32_MAX : 1,
+      .maxDrawIndirectCount = max_draw_indirect_count_for_arch(pdev->arch),
       .maxSamplerLodBias = 126.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,

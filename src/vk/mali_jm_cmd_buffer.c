@@ -246,6 +246,87 @@ oom:
    return (struct mali_ptr){0};
 }
 
+#if PAN_ARCH < 9
+/* ---------------------------------------------------------------------- */
+/* The varying arena of indirect draws (mali_jm.h)                         */
+
+struct mali_cmd_slab *
+mali_v7_idraw_arena(struct mali_cmd_buffer *cmd)
+{
+   if (cmd->jm.idraw_arena)
+      return cmd->jm.idraw_arena;
+   struct mali_device *dev = cmd->dev;
+   struct mali_jm_device *jd = dev->jm;
+   struct mali_cmd_slab *s = NULL;
+
+   simple_mtx_lock(&dev->slab_lock);
+   if (!list_is_empty(&jd->idraw_arenas)) {
+      s = list_first_entry(&jd->idraw_arenas, struct mali_cmd_slab, link);
+      list_del(&s->link);
+      jd->idraw_arena_count--;
+   }
+   simple_mtx_unlock(&dev->slab_lock);
+   if (!s)
+      s = slab_new(dev, MALI_V7_IDRAW_ARENA_SIZE, false);
+   if (!s) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return NULL;
+   }
+   memset(s->bo.cpu, 0, sizeof(struct mali_jm_idraw_arena_hdr));
+   mali_jm_cmd_note_reset(cmd, s->bo.cpu, NULL, sizeof(struct mali_jm_idraw_arena_hdr));
+   cmd->jm.idraw_arena = s;
+   return s;
+}
+
+void
+mali_v7_idraw_arena_release(struct mali_cmd_buffer *cmd)
+{
+   struct mali_cmd_slab *s = cmd->jm.idraw_arena;
+   if (!s)
+      return;
+   cmd->jm.idraw_arena = NULL;
+   struct mali_device *dev = cmd->dev;
+   struct mali_jm_device *jd = dev->jm;
+
+   /* The command buffer is not pending (a reset or a destruction): the
+    * count is its last run's. */
+   struct mali_jm_idraw_arena_hdr h;
+   memcpy(&h, s->bo.cpu, sizeof(h));
+   bool keep = false, say = false;
+   if (jd) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (h.dropped && !jd->idraw_dropped_said)
+         say = jd->idraw_dropped_said = true;
+      if (jd->idraw_arena_count < MALI_V7_IDRAW_ARENAS_KEPT) {
+         list_add(&s->link, &jd->idraw_arenas);
+         jd->idraw_arena_count++;
+         keep = true;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+   }
+   if (say)
+      mesa_logw("malisx2: %u indirect draws were skipped: their varyings did not fit the "
+                "command buffer's %u MiB of varying memory for indirect draws",
+                h.dropped, MALI_V7_IDRAW_ARENA_SIZE >> 20);
+   if (!keep) {
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+}
+
+void
+mali_v7_idraw_arenas_finish(struct mali_device *dev)
+{
+   struct mali_jm_device *jd = dev->jm;
+   list_for_each_entry_safe(struct mali_cmd_slab, s, &jd->idraw_arenas, link) {
+      list_del(&s->link);
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+   jd->idraw_arena_count = 0;
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Re-submission                                                           */
 
@@ -308,12 +389,12 @@ job_is_tiler_side(enum mali_job_type type)
 #endif
 }
 
-/* Header and link of a job at job (size bytes, from command memory). */
+/* Header and link of a job at job (size bytes, from command memory), on
+ * the tiler side or not. */
 static inline void
-link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
-         enum mali_job_type type, bool barrier, uint16_t dep1)
+link_job_side(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
+              enum mali_job_type type, bool barrier, uint16_t dep1, bool tiler_side)
 {
-   const bool tiler_side = job_is_tiler_side(type);
    const uint16_t index = ++c->index;
 
    pan_cast_and_pack(job.cpu, JOB_HEADER, h) {
@@ -325,6 +406,13 @@ link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr j
    }
    mali_jm_chain_link(c, job, index, tiler_side);
    mali_jm_cmd_note_reset(cmd, job.cpu, NULL, 16);
+}
+
+static inline void
+link_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c, struct mali_ptr job,
+         enum mali_job_type type, bool barrier, uint16_t dep1)
+{
+   link_job_side(cmd, c, job, type, barrier, dep1, job_is_tiler_side(type));
 }
 
 /* Room for one more job in the chain's 16-bit index space, with a Cache
@@ -352,12 +440,18 @@ mali_v7_link_tilers(struct mali_cmd_buffer *cmd, unsigned keep)
    for (unsigned i = 0; i < n; i++) {
       if (!chain_has_room(cmd, c))
          break;
-      link_job(cmd, c, jm->pend_tiler[i], MALI_JOB_TYPE_TILER, false, jm->pend_tiler_dep1[i]);
+      /* An indirect draw's Tiler job: Not Started until its patch job
+       * writes the type, a tiler-side job all the same. */
+      const bool ns = jm->pend_tiler_ns & BITFIELD_BIT(i);
+      link_job_side(cmd, c, jm->pend_tiler[i],
+                    ns ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_TILER, false,
+                    jm->pend_tiler_dep1[i], true);
    }
    for (unsigned i = 0; i < keep; i++) {
       jm->pend_tiler[i] = jm->pend_tiler[n + i];
       jm->pend_tiler_dep1[i] = jm->pend_tiler_dep1[n + i];
    }
+   jm->pend_tiler_ns >>= n;
    jm->pend_tilers = keep;
 }
 #endif
@@ -1267,7 +1361,9 @@ cmd_clear(struct mali_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->jm.oq_done);
    cmd->jm.open = false;
 #if PAN_ARCH < 9
+   mali_v7_idraw_arena_release(cmd);
    cmd->jm.pend_tilers = 0;
+   cmd->jm.pend_tiler_ns = 0;
    cmd->jm.tiler_defer = false;
    cmd->jm.copy_tsd = 0;
    util_dynarray_clear(&cmd->jm.buf_writes);
@@ -1341,6 +1437,9 @@ cmd_destroy(struct vk_command_buffer *vk_cmd)
 {
    struct mali_cmd_buffer *cmd = container_of(vk_cmd, struct mali_cmd_buffer, vk);
    mali_jm_measure_cmd_destroy(cmd);
+#if PAN_ARCH < 9
+   mali_v7_idraw_arena_release(cmd);
+#endif
    release_memory(cmd);
    util_dynarray_fini(&cmd->jm.batches);
    util_dynarray_fini(&cmd->jm.frags);

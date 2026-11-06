@@ -669,9 +669,10 @@ mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
 }
 
 /* Vertex stage resource table: table 0 is the driver set
- * (mali_gfx_pack_vs_drv). 0 on failure. */
+ * (mali_gfx_pack_vs_drv). 0 on failure. *drv (when not NULL): table 0's
+ * address, where attribute i's descriptor is the i-th. */
 static inline uint64_t
-mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct mali_shader *vs = d->pipeline->vs;
@@ -682,7 +683,15 @@ mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
    if (!p.cpu)
       return 0;
    mali_gfx_pack_vs_drv(cmd, vs, vi, p.cpu, vb_offset, vb_count);
+   if (drv)
+      *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+static inline uint64_t
+mali_gfx_vs_srt(struct mali_cmd_buffer *cmd)
+{
+   return mali_gfx_vs_srt_drv(cmd, NULL);
 }
 
 /* Fragment varyings read with LD_VAR (panvk emit_varying_descs). */

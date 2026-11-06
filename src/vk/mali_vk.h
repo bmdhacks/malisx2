@@ -162,6 +162,8 @@ enum mali_meta_shader {
    MALI_META_QUERY_COPY_SUM, /* the same for pools whose query is a sum of
                               * counters (v7 occlusion: one per shader core) */
    MALI_META_INDIRECT_DISPATCH, /* v7 and v9 vkCmdDispatchIndirect: patches the Compute job */
+   MALI_META_INDIRECT_DRAW,     /* v7 and v9 indirect draws: patches a draw's jobs */
+   MALI_META_INDEX_MINMAX,      /* v7 indirect indexed draws: the indices' range */
    MALI_META_COUNT,
 };
 
@@ -182,6 +184,77 @@ struct mali_meta_indirect_push {
    uint32_t inv1;
    uint32_t wgx_shift;
    uint32_t pad;
+};
+
+/*
+ * One draw of a vkCmdDraw*Indirect* on the job manager (v7 and v9), for its
+ * patch job (MALI_META_INDIRECT_DRAW, mali_jm_idraw_nir.c), which reads it
+ * from command memory through the one 64-bit push constant it has. What
+ * the command buffer knows when it records the draw: where the draw's
+ * parameters and the draw count are, and where in the draw's jobs and
+ * descriptors each value that comes from them goes. Addresses that are 0
+ * name nothing to patch. v9 uses the fields up to attr_stride.
+ */
+#define MALI_IDRAW_MAX_ATTRIBS 16
+struct mali_jm_idraw_rec {
+   uint64_t cmd;            /* the VkDraw(Indexed)IndirectCommand */
+   uint64_t count;          /* the draw count (indirect count draws), else 0 */
+   uint32_t draw_index;     /* this draw's place in the call */
+   uint32_t max_draws;      /* drawCount or maxDrawCount */
+   uint32_t indexed;
+   uint32_t index_shift;    /* log2 of the index size */
+   uint64_t indices;        /* the bound index buffer, its offset applied */
+   uint64_t job;            /* v9: the Malloc Vertex job; v7: the Vertex job */
+   uint64_t tiler_job;      /* v7: the Tiler job, 0 without one */
+   uint64_t first_vertex;   /* FAU words of the vertex shader's system values */
+   uint64_t base_instance;
+   uint64_t raw_vertex_offset;   /* v7 */
+   /* Per-instance attributes: their offset is base + firstInstance x stride.
+    * v9: in the vertex shader's driver table (32-byte Attribute
+    * descriptors, offset in word 2); v7: in the draw's Attribute table
+    * (8-byte descriptors, offset in word 1). */
+   uint64_t attribs;
+   uint32_t inst_attr_mask;
+   uint32_t pad0;
+   uint32_t attr_base[MALI_IDRAW_MAX_ATTRIBS];
+   uint32_t attr_stride[MALI_IDRAW_MAX_ATTRIBS];
+   /* v7 */
+   uint64_t minmax;         /* indexed: the smallest and largest index */
+   uint64_t attrib_bufs;    /* the Attribute Buffer table, two per binding */
+   uint32_t mod_mask;       /* bindings packed 1D Modulus (per vertex) */
+   uint32_t pot_mask;       /* bindings packed 1D POT Divisor (per instance) */
+   uint32_t pot_shift[MALI_IDRAW_MAX_ATTRIBS];   /* log2 of their divisor */
+   uint64_t vary_bufs;      /* the varying Attribute Buffers */
+   uint32_t vary_stride[3];
+   uint32_t vary_max[3];    /* the most vertices that fit the arena at that stride */
+   uint64_t arena;          /* the varying arena: header, then arena_size bytes */
+   uint32_t arena_size;
+   uint32_t prim_verts;     /* vertices per primitive: 1, 2 or 3 */
+   uint32_t inv1;           /* Invocation word 1 without the Workgroups Z shift */
+   uint32_t writes_psiz;
+};
+
+/* The header of a v7 command buffer's varying arena (mali_jm_cmd_draw_v7.c):
+ * the bytes handed out so far, and the draws that did not fit. */
+struct mali_jm_idraw_arena_hdr {
+   uint32_t used;
+   uint32_t dropped;
+};
+#define MALI_IDRAW_ARENA_HDR 64
+
+/* Push constants of MALI_META_INDEX_MINMAX: the smallest and largest of a
+ * VkDrawIndexedIndirectCommand's indices into result[0] and result[1]
+ * (atomic min and max), restart indices left out when restart is set. elems
+ * is the bound index buffer's size in indices; each invocation reads
+ * per_thread of them. */
+struct mali_meta_minmax_push {
+   uint64_t indices;
+   uint64_t cmd;
+   uint64_t result;
+   uint32_t elems;
+   uint32_t per_thread;
+   uint32_t index_shift;
+   uint32_t restart;
 };
 
 /* A fault as the kernel described it, for vkGetDeviceFaultInfoEXT. code

@@ -332,6 +332,12 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
 #if PAN_ARCH < 10
                         : m == MALI_META_INDIRECT_DISPATCH
                            ? build_indirect_dispatch_nir(dev)
+                        : m == MALI_META_INDIRECT_DRAW
+                           ? MALI_PER_ARCH(build_indirect_draw_nir)(dev)
+#endif
+#if PAN_ARCH < 9
+                        : m == MALI_META_INDEX_MINMAX
+                           ? MALI_PER_ARCH(build_index_minmax_nir)(dev)
 #endif
                            : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);

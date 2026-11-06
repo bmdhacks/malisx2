@@ -69,6 +69,7 @@
 #include "util/blend.h"
 #include "util/log.h"
 #include "util/os_time.h"
+#include "vk_buffer.h"
 #include "vk_log.h"
 
 #include "mali_measure.h"
@@ -534,9 +535,16 @@ struct draw_data {
  * Attribute Buffers, plus the empty entry that stops the Bifrost
  * prefetcher.
  */
-static bool
+/*
+ * With rec (an indirect draw, whose counts are not known here): the
+ * descriptors only, with their strides; the patch job takes the buffers
+ * from the varying arena and writes their pointers and sizes
+ * (mali_jm_idraw_nir.c). rec gets where they are.
+ */
+static inline __attribute__((always_inline)) bool
 emit_varying_bufs(struct mali_cmd_buffer *cmd, const struct mali_jm_draw_tmpl *t,
-                  const struct mali_draw_info *di, struct draw_data *dd)
+                  const struct mali_draw_info *di, struct draw_data *dd,
+                  struct mali_jm_idraw_rec *rec)
 {
    struct mali_ptr bufs =
       mali_cmd_alloc(cmd, (MALI_V7_VARY_BUF_COUNT + 1) * pan_size(ATTRIBUTE_BUFFER),
@@ -548,7 +556,13 @@ emit_varying_bufs(struct mali_cmd_buffer *cmd, const struct mali_jm_draw_tmpl *t
    memset(descs, 0, sizeof(descs));
    uint64_t addrs[MALI_V7_VARY_BUF_COUNT] = {0};
    for (unsigned i = 0; i < MALI_V7_VARY_BUF_COUNT; i++) {
-      const uint64_t size = (uint64_t)dd->padded_count * di->instance_count * t->vary_stride[i];
+      const uint64_t size =
+         rec ? 0 : (uint64_t)dd->padded_count * di->instance_count * t->vary_stride[i];
+      if (rec) {
+         rec->vary_stride[i] = t->vary_stride[i];
+         rec->vary_max[i] =
+            t->vary_stride[i] ? MALI_V7_IDRAW_ARENA_DATA / t->vary_stride[i] : UINT32_MAX;
+      }
       if (size) {
          if (size > UINT32_MAX)
             return false;
@@ -564,6 +578,8 @@ emit_varying_bufs(struct mali_cmd_buffer *cmd, const struct mali_jm_draw_tmpl *t
       }
    }
    memcpy(bufs.cpu, descs, sizeof(descs));
+   if (rec)
+      rec->vary_bufs = bufs.gpu;
    dd->vary_bufs = bufs.gpu;
    dd->position = addrs[MALI_V7_VARY_BUF_POSITION];
    dd->psiz = addrs[MALI_V7_VARY_BUF_PSIZ];
@@ -638,6 +654,50 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
 }
 
 /*
+ * A vertex binding of an indirect draw, whose vertex range and instance
+ * count are not known here: the patch job (mali_jm_idraw_nir.c) shades
+ * instances 2^n vertices apart (n its own), so a per-vertex binding is 1D
+ * Modulus by 2^n and a per-instance binding 1D POT Divisor by 2^n times its
+ * divisor; the patch job writes n into the byte both share. A divisor of 0
+ * reads the first element (1D, stride 0), as for a direct draw. False for a
+ * divisor that is not a power of two.
+ */
+static bool
+emit_attrib_buf_indirect(const struct vk_vertex_binding_state *b, uint32_t stride, uint64_t addr,
+                         uint64_t size, unsigned binding, struct mali_jm_idraw_rec *rec,
+                         struct mali_attribute_buffer_packed *desc)
+{
+   const uint64_t base = addr & ~63ull;
+   const uint32_t bsize = (uint32_t)MIN2(size + (addr & 63), UINT32_MAX);
+   const bool per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+
+   if (per_instance && !util_is_power_of_two_or_zero(b->divisor))
+      return false;
+   pan_pack(&desc[0], ATTRIBUTE_BUFFER, cfg) {
+      cfg.pointer = base;
+      cfg.size = bsize;
+      if (!per_instance) {
+         cfg.type = MALI_ATTRIBUTE_TYPE_1D_MODULUS;
+         cfg.stride = stride;
+      } else if (!b->divisor) {
+         cfg.type = MALI_ATTRIBUTE_TYPE_1D;
+         cfg.stride = 0;
+      } else {
+         cfg.type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
+         cfg.stride = stride;
+      }
+   }
+   memset(&desc[1], 0, sizeof(desc[1]));
+   if (!per_instance) {
+      rec->mod_mask |= BITFIELD_BIT(binding);
+   } else if (b->divisor) {
+      rec->pot_mask |= BITFIELD_BIT(binding);
+      rec->pot_shift[binding] = util_logbase2(b->divisor);
+   }
+   return true;
+}
+
+/*
  * panvk_draw_prepare_vs_attribs: the vertex attributes of this draw, one
  * Attribute descriptor per location (unbound locations read a constant
  * zero) and two Attribute Buffer entries per binding plus the empty
@@ -656,9 +716,10 @@ static_assert(2 * (MALI_MAX_VBS + MALI_V7_MAX_STAGE_IMG_ENTRIES) <= MALI_V7_ATTR
               "a vertex shader's image pairs fit behind the vertex buffers' within the "
               "Attribute's buffer index");
 
-static bool
+static inline __attribute__((always_inline)) bool
 emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p,
-                const struct mali_draw_info *di, struct draw_data *dd)
+                const struct mali_draw_info *di, struct draw_data *dd,
+                struct mali_jm_idraw_rec *rec)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    const struct vk_vertex_input_state *vi = d->vi;
@@ -691,8 +752,14 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
 
    for (unsigned b = 0; b < num_vbs; b++) {
       if ((vi->bindings_valid & BITFIELD_BIT(b)) && d->vb[b].addr) {
-         emit_attrib_buf(&vi->bindings[b], strides[b], d->vb[b].addr, d->vb[b].size,
-                         di->instance_count, dd->padded_count, &bdescs[2 * b]);
+         if (rec) {
+            if (!emit_attrib_buf_indirect(&vi->bindings[b], strides[b], d->vb[b].addr,
+                                          d->vb[b].size, b, rec, &bdescs[2 * b]))
+               return false;
+         } else {
+            emit_attrib_buf(&vi->bindings[b], strides[b], d->vb[b].addr, d->vb[b].size,
+                            di->instance_count, dd->padded_count, &bdescs[2 * b]);
+         }
       } else {
          memset(&bdescs[2 * b], 0, 2 * sizeof(bdescs[0]));
       }
@@ -718,6 +785,13 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
          cfg.offset = a->offset + (addr & 63) +
                       (per_instance ? (uint64_t)di->first_instance * strides[a->binding] : 0);
       }
+      /* An indirect draw's per-instance offsets: base + firstInstance x
+       * stride, by the patch job (di->first_instance is 0 here). */
+      if (rec && per_instance) {
+         rec->inst_attr_mask |= BITFIELD_BIT(i);
+         rec->attr_base[i] = a->offset + (addr & 63);
+         rec->attr_stride[i] = strides[a->binding];
+      }
    }
 
    if (!num_imgs) {
@@ -737,6 +811,10 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       memcpy(attrs.cpu, adescs, num_attribs * sizeof(adescs[0]));
    dd->attrib_bufs = bufs.gpu;
    dd->attribs = attrs.gpu;
+   if (rec) {
+      rec->attrib_bufs = bufs.gpu;
+      rec->attribs = attrs.gpu;
+   }
    return true;
 }
 
@@ -941,10 +1019,6 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       t->tiler = mali_jm_pass_tiler(r, 0);
       t->tsd = r->tsd;
    }
-
-   /* Per draw: the vertex attributes and the varying buffers. */
-   if (!emit_attributes(cmd, p, di, dd) || !emit_varying_bufs(cmd, t, di, dd))
-      return false;
 
    d->dirty = 0;
    return true;
@@ -1160,6 +1234,101 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
 /* ---------------------------------------------------------------------- */
 /* The jobs                                                                */
 
+/*
+ * A draw's Tiler job at tj (direct or indirect: an indirect draw's is
+ * patched by its patch job and goes in Not Started, ns). It is written
+ * here, its header and link when it goes into the chain
+ * (mali_v7_link_tilers): behind a later draw's Vertex job, in front of any
+ * other job, or when the batch closes.
+ */
+static inline __attribute__((always_inline)) void
+emit_tiler_job(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
+               const struct draw_data *dd, const struct mali_invocation_packed *invocation,
+               uint32_t instance_size, uint16_t vertex_index, bool defer, struct mali_ptr tj,
+               bool ns)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_render_state *r = &cmd->gfx.render;
+   const struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   memcpy(pan_section_ptr(tj.cpu, TILER_JOB, INVOCATION), invocation, sizeof(*invocation));
+
+   /* panvk_emit_tiler_primitive: the baked flags, this draw's index
+    * type, the pass's provoking vertex, and the counts. */
+   struct mali_primitive_packed prim;
+   pan_pack(&prim, PRIMITIVE, cfg) {
+      cfg.index_count = di->count;
+      if (di->indexed) {
+         cfg.indices = dd->indices;
+         /* Index + base_vertex_offset selects the shaded vertex:
+          * vertexOffset minus the shading range's start (libpan
+          * draw_helper.cl). */
+         cfg.base_vertex_offset = (int64_t)di->vertex_offset - dd->raw_vertex_offset;
+      }
+   }
+   const enum mali_index_type index_type =
+      di->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
+   prim.opaque[0] = (t->prim0 & ~prim_provoking_bit()) | prim_index_type(index_type) |
+                    (r->first_provoking_vertex ? prim_provoking_bit() : 0);
+   memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
+
+   pan_section_pack(tj.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
+      if (t->writes_psiz)
+         cfg.size_array = dd->psiz;
+      else
+         cfg.fixed_sized = t->lines ? dyn->rs.line.width : 1.0f;
+   }
+   pan_section_pack(tj.cpu, TILER_JOB, TILER, cfg) {
+      cfg.address = t->tiler;
+   }
+   pan_section_pack(tj.cpu, TILER_JOB, PADDING, cfg);
+
+   /* panvk_emit_tiler_dcd, with the baked culling bits ORed into word 0. */
+   const uint32_t prims_per_instance =
+      DIV_ROUND_UP(dd->padded_count, mesa_vertices_per_prim(t->prim));
+   struct mali_draw_packed dcd;
+   pan_pack(&dcd, DRAW, cfg) {
+      cfg.position = dd->position;
+      cfg.state = t->fs_rsd;
+      /* The fragment shader's images (panvk_emit_tiler_dcd). */
+      cfg.attributes = t->fs_tab.img_attribs;
+      cfg.attribute_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_IMG];
+      cfg.viewport = t->viewport;
+      cfg.varyings = t->fs_vary;
+      cfg.varying_buffers = t->fs_vary ? dd->vary_bufs : 0;
+      cfg.thread_storage = t->tsd;
+      cfg.offset_start = dd->raw_vertex_offset;
+      cfg.instance_size = instance_size;
+      cfg.instance_primitive_size = padded_vertex_count(MAX2(prims_per_instance, 1));
+      cfg.push_uniforms = t->fs_fau;
+      cfg.uniform_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.textures = t->fs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = t->fs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
+      /* The counters of the query the draw is inside of (panvk:
+       * counter mode for a precise query, "did any sample pass" for the
+       * others). */
+      if (unlikely(d->oq_addr)) {
+         cfg.occlusion_query =
+            d->oq_precise ? MALI_OCCLUSION_MODE_COUNTER : MALI_OCCLUSION_MODE_PREDICATE;
+         cfg.occlusion = d->oq_addr;
+      } else {
+         cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
+      }
+   }
+   dcd.opaque[0] |= t->dcd0;
+   memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
+
+   assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER);
+   cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
+   cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
+   if (ns)
+      cmd->jm.pend_tiler_ns |= BITFIELD_BIT(cmd->jm.pend_tilers);
+   cmd->jm.pend_tilers++;
+   if (!defer)
+      mali_v7_link_tilers(cmd, 0);
+}
+
 static void
 draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
@@ -1216,7 +1385,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       di->instance_count > 1 ? padded_vertex_count(dd.vertex_range) : dd.vertex_range;
 
    const uint64_t t_prep = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
-   const bool prepared = prepare_draw(cmd, di, &dd);
+   /* The draw state, then the vertex attributes and the varying buffers,
+    * which are per draw. */
+   const bool prepared = prepare_draw(cmd, di, &dd) && emit_attributes(cmd, p, di, &dd, NULL) &&
+                         emit_varying_bufs(cmd, t, di, &dd, NULL);
    if (unlikely(t_prep))
       mali_cpuprof_part(MALI_CPUPROF_DRAWPREP, t_prep);
    if (!prepared) {
@@ -1318,86 +1490,10 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
 
    if (tiling) {
-      /* The Tiler job is written here, its header and link when it goes
-       * into the chain (mali_v7_link_tilers): behind a later draw's Vertex
-       * job, in front of any other job, or when the batch closes. */
       struct mali_ptr tj = mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128);
       if (!tj.cpu)
          return;
-
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, INVOCATION), &invocation, sizeof(invocation));
-
-      /* panvk_emit_tiler_primitive: the baked flags, this draw's index
-       * type, the pass's provoking vertex, and the counts. */
-      struct mali_primitive_packed prim;
-      pan_pack(&prim, PRIMITIVE, cfg) {
-         cfg.index_count = di->count;
-         if (di->indexed) {
-            cfg.indices = dd.indices;
-            /* Index + base_vertex_offset selects the shaded vertex:
-             * vertexOffset minus the shading range's start (libpan
-             * draw_helper.cl). */
-            cfg.base_vertex_offset = (int64_t)di->vertex_offset - dd.raw_vertex_offset;
-         }
-      }
-      const enum mali_index_type index_type =
-         di->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
-      prim.opaque[0] = (t->prim0 & ~prim_provoking_bit()) | prim_index_type(index_type) |
-                       (r->first_provoking_vertex ? prim_provoking_bit() : 0);
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
-
-      pan_section_pack(tj.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
-         if (t->writes_psiz)
-            cfg.size_array = dd.psiz;
-         else
-            cfg.fixed_sized = t->lines ? dyn->rs.line.width : 1.0f;
-      }
-      pan_section_pack(tj.cpu, TILER_JOB, TILER, cfg) {
-         cfg.address = t->tiler;
-      }
-      pan_section_pack(tj.cpu, TILER_JOB, PADDING, cfg);
-
-      /* panvk_emit_tiler_dcd, with the baked culling bits ORed into word 0. */
-      const uint32_t prims_per_instance =
-         DIV_ROUND_UP(dd.padded_count, mesa_vertices_per_prim(t->prim));
-      struct mali_draw_packed dcd;
-      pan_pack(&dcd, DRAW, cfg) {
-         cfg.position = dd.position;
-         cfg.state = t->fs_rsd;
-         /* The fragment shader's images (panvk_emit_tiler_dcd). */
-         cfg.attributes = t->fs_tab.img_attribs;
-         cfg.attribute_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_IMG];
-         cfg.viewport = t->viewport;
-         cfg.varyings = t->fs_vary;
-         cfg.varying_buffers = t->fs_vary ? dd.vary_bufs : 0;
-         cfg.thread_storage = t->tsd;
-         cfg.offset_start = dd.raw_vertex_offset;
-         cfg.instance_size = instance_size;
-         cfg.instance_primitive_size = padded_vertex_count(MAX2(prims_per_instance, 1));
-         cfg.push_uniforms = t->fs_fau;
-         cfg.uniform_buffers = t->fs_tab.tables[MALI_V7_DESC_TABLE_UBO];
-         cfg.textures = t->fs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
-         cfg.samplers = t->fs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
-         /* The counters of the query the draw is inside of (panvk:
-          * counter mode for a precise query, "did any sample pass" for the
-          * others). */
-         if (unlikely(d->oq_addr)) {
-            cfg.occlusion_query =
-               d->oq_precise ? MALI_OCCLUSION_MODE_COUNTER : MALI_OCCLUSION_MODE_PREDICATE;
-            cfg.occlusion = d->oq_addr;
-         } else {
-            cfg.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
-         }
-      }
-      dcd.opaque[0] |= t->dcd0;
-      memcpy(pan_section_ptr(tj.cpu, TILER_JOB, DRAW), &dcd, sizeof(dcd));
-
-      assert(cmd->jm.pend_tilers < MALI_V7_TILER_DEFER);
-      cmd->jm.pend_tiler[cmd->jm.pend_tilers] = tj;
-      cmd->jm.pend_tiler_dep1[cmd->jm.pend_tilers] = vertex_index;
-      cmd->jm.pend_tilers++;
-      if (!defer)
-         mali_v7_link_tilers(cmd, 0);
+      emit_tiler_job(cmd, di, &dd, &invocation, instance_size, vertex_index, defer, tj, false);
    }
 
    /* Heap use: polygon-list entries only, the varyings being in command
@@ -1441,6 +1537,334 @@ MALI_PER_ARCH(CmdDrawIndexed)(VkCommandBuffer commandBuffer, uint32_t indexCount
       .indexed = true,
    };
    draw(cmd, &di);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Indirect draws                                                          */
+
+/*
+ * vkCmdDrawIndirect, vkCmdDrawIndexedIndirect and their indirect count
+ * forms. Each draw of the call (drawCount of them, or maxDrawCount) is the
+ * Vertex and Tiler job of a direct draw of one vertex and one instance,
+ * with a patch job in front (MALI_META_INDIRECT_DRAW, mali_jm_idraw_nir.c)
+ * that reads the command when it runs and writes what depends on it: the
+ * vertex range and instance count in both jobs' Invocation and Draw
+ * descriptors, the varying buffers (taken from the command buffer's varying
+ * arena, mali_v7_idraw_arena), the Tiler job's index count, index pointer
+ * and base vertex offset, the vertex buffers' instance divisors and the
+ * per-instance attributes' offsets (emit_attrib_buf_indirect), and the
+ * vertex shader's first_vertex, base_instance and raw_vertex_offset in the
+ * draw's own FAU block; or it makes both jobs Null jobs for a draw that
+ * draws nothing, is past the draw count, or does not fit the arena.
+ *
+ * An indexed draw's vertex range is [min, max] of its indices: a
+ * MALI_META_INDEX_MINMAX job reads them on the GPU in front of the patch
+ * job, so nothing reads them on the CPU and the index buffer may be written
+ * by earlier GPU work (the CPU scan of direct draws cannot see that).
+ *
+ * The jobs, in the open batch's vtc chain: the draw's descriptor and
+ * uniform word copies as for a direct draw; the min/max job (indexed); the
+ * patch job, depending on the vertex shader's copies and on the min/max
+ * job, with Suppress Prefetch; the Vertex job, Not Started, depending on
+ * the patch job; the Tiler job, Not Started, linked later as a direct
+ * draw's (MALI_V7_TILER_DEFER), depending on the Vertex job and the
+ * previous Tiler job. A barrier pending on the chain goes to the first job
+ * that reads the parameters (the min/max or patch job) as well. The
+ * parameters are read in the vtc chain, so a barrier whose destination is
+ * the DRAW_INDIRECT stage orders the read as it orders the pass's vertex
+ * shading (mali_jm_cmd_buffer.c).
+ */
+struct idraw_call {
+   uint64_t cmd;        /* the first draw's command */
+   uint32_t stride;
+   uint32_t draws;      /* drawCount, or maxDrawCount */
+   uint64_t count;      /* the draw count, 0 for the plain forms */
+   bool indexed;
+};
+
+/* The vertex shader's FAU words the patch job writes, if it reads any. */
+static bool
+vs_reads_draw_sysvals(const struct mali_shader *vs)
+{
+   const unsigned fv = offsetof(struct mali_graphics_sysvals, vs.first_vertex);
+   const unsigned bi = offsetof(struct mali_graphics_sysvals, vs.base_instance);
+   const unsigned rvo = offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset);
+   return BITSET_TEST(vs->fau.used_sysvals, fv / MALI_FAU_WORD_SIZE) ||
+          BITSET_TEST(vs->fau.used_sysvals, bi / MALI_FAU_WORD_SIZE) ||
+          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE);
+}
+
+/* The address of a vertex shader system value in its FAU block at fau, 0
+ * when the shader does not read its word. */
+static uint64_t
+vs_sysval_addr(const struct mali_shader *vs, uint64_t fau, unsigned off)
+{
+   const int o = fau ? mali_compute_fau_sysval_offset(vs, off) : -1;
+   return o < 0 ? 0 : fau + o;
+}
+
+static void
+draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32_t i)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   struct mali_jm_draw_tmpl *t = &cmd->jm.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct vk_dynamic_graphics_state *st =
+      p->bind.dynamic ? &cmd->vk.dynamic_graphics_state : &p->state;
+   const struct mali_shader *vs = p->vs;
+
+   /* Placeholders the patch job replaces: one vertex, one instance. */
+   const struct mali_draw_info di = {.count = 1, .instance_count = 1, .indexed = call->indexed};
+   struct draw_data dd;
+   memset(&dd, 0, sizeof(dd));
+   dd.vertex_range = 1;
+   dd.padded_count = 1;
+   if (call->indexed)
+      dd.indices = d->ib.addr;
+
+   /* A FAU block of the draw's own when the vertex shader reads the
+    * values the patch job writes; the next draw builds another. */
+   const bool own_fau = vs_reads_draw_sysvals(vs);
+   if (own_fau)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+
+   struct mali_jm_idraw_rec rec;
+   memset(&rec, 0, sizeof(rec));
+   if (!prepare_draw(cmd, &di, &dd))
+      goto oom;
+   if (own_fau)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   if (!emit_attributes(cmd, p, &di, &dd, &rec)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      MALI_V7_UNSUPPORTED("an indirect draw with a vertex attribute divisor that is not a "
+                          "power of two");
+      return;
+   }
+   if (!emit_varying_bufs(cmd, t, &di, &dd, &rec))
+      goto oom;
+   struct mali_cmd_slab *arena = mali_v7_idraw_arena(cmd);
+   if (!arena)
+      return;
+
+   const bool tiling = !st->rs.rasterizer_discard_enable;
+   struct mali_invocation_packed invocation;
+   const uint32_t one[3] = {1, 1, 1};
+   mali_v7_pack_invocation(&invocation, one, one, true);
+
+   struct mali_ptr rp = mali_cmd_alloc(cmd, sizeof(rec), 8);
+   struct mali_ptr vj = mali_cmd_alloc(cmd, pan_size(COMPUTE_JOB), 128);
+   struct mali_ptr tj = tiling ? mali_cmd_alloc(cmd, pan_size(TILER_JOB), 128) : (struct mali_ptr){0};
+   struct mali_ptr mm = call->indexed ? mali_cmd_alloc(cmd, 8, 8) : (struct mali_ptr){0};
+   if (!rp.cpu || !vj.cpu || (tiling && !tj.cpu) || (call->indexed && !mm.cpu))
+      return;
+
+   rec.cmd = call->cmd + (uint64_t)i * call->stride;
+   rec.count = call->count;
+   rec.draw_index = i;
+   rec.max_draws = call->draws;
+   rec.indexed = call->indexed;
+   rec.index_shift = call->indexed ? util_logbase2(d->ib.index_size) : 0;
+   rec.indices = call->indexed ? d->ib.addr : 0;
+   rec.job = vj.gpu;
+   rec.tiler_job = tj.gpu;
+   rec.first_vertex =
+      vs_sysval_addr(vs, t->vs_fau, offsetof(struct mali_graphics_sysvals, vs.first_vertex));
+   rec.base_instance =
+      vs_sysval_addr(vs, t->vs_fau, offsetof(struct mali_graphics_sysvals, vs.base_instance));
+   rec.raw_vertex_offset = vs_sysval_addr(
+      vs, t->vs_fau, offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset));
+   rec.minmax = mm.gpu;
+   rec.arena = arena->bo.gpu_va;
+   rec.arena_size = MALI_V7_IDRAW_ARENA_DATA;
+   rec.prim_verts = mesa_vertices_per_prim(t->prim);
+   uint32_t inv1;
+   memcpy(&inv1, (const uint8_t *)&invocation + 4, sizeof(inv1));
+   rec.inv1 = inv1 & ~(0x3fu << 22);   /* Workgroups Z shift */
+   rec.writes_psiz = t->writes_psiz;
+   memcpy(rp.cpu, &rec, sizeof(rec));
+
+   if (unlikely(vs->info.writes_global || vs->info.texture_count || vs->info.images_used ||
+                vs->v7.count[MALI_V7_DESC_TABLE_TEXTURE] || vs->v7.count[MALI_V7_DESC_TABLE_IMG]))
+      mali_jm_cmd_pass_images(cmd);
+   struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
+
+   /* As in draw(), with the min/max and patch jobs between the copies and
+    * the Vertex job. */
+   const bool pending = c->pending != 0;
+   const bool defer = !pending;
+   if (!defer)
+      mali_v7_link_tilers(cmd, 0);
+   cmd->jm.tiler_defer = defer;
+   uint16_t vs_copy = 0, fs_copy = 0, fs_ubo = 0;
+   if (dd.vs_copy &&
+       !mali_v7_desc_copy(cmd, c, p->vs, &t->vs_tab, dd.vs_img_buf_offset, &vs_copy))
+      goto fail;
+   uint16_t vs_dep = vs_copy;
+   if (dd.vs_ubo_copy &&
+       !mali_v7_ubo_copy(cmd, c, p->vs, &cmd->gfx.desc, t->vs_fau, vs_copy, &vs_dep))
+      goto fail;
+   if (dd.fs_copy && !mali_v7_desc_copy(cmd, c, p->fs, &t->fs_tab, 0, &fs_copy))
+      goto fail;
+   if (tiling && dd.fs_ubo_copy &&
+       !mali_v7_ubo_copy(cmd, c, p->fs, &cmd->gfx.desc, t->fs_fau, 0, &fs_ubo))
+      goto fail;
+
+   uint16_t minmax = 0;
+   if (call->indexed) {
+      /* The result starts as {~0, 0}, at every run. */
+      const uint32_t init[2] = {UINT32_MAX, 0};
+      memcpy(mm.cpu, init, sizeof(init));
+      mali_jm_cmd_note_reset(cmd, mm.cpu, init, sizeof(init));
+      const uint32_t elems = (uint32_t)MIN2(d->ib.size / d->ib.index_size, UINT32_MAX);
+      /* 1024 indices an invocation, more when the buffer needs more than
+       * 65535 workgroups of 64. */
+      const uint32_t per = MAX2(1024u, DIV_ROUND_UP(elems, 65535u * 64u));
+      const struct mali_meta_minmax_push push = {
+         .indices = d->ib.addr,
+         .cmd = rec.cmd,
+         .result = mm.gpu,
+         .elems = elems,
+         .per_thread = per,
+         .index_shift = rec.index_shift,
+         .restart = st->ia.primitive_restart_enable,
+      };
+      const uint32_t groups[3] = {MAX2(DIV_ROUND_UP(DIV_ROUND_UP(elems, per), 64u), 1u), 1, 1};
+      if (!MALI_PER_ARCH(jm_cmd_meta_job)(cmd, c, MALI_META_INDEX_MINMAX, &push, sizeof(push),
+                                          groups, pending, 0, 0, &minmax))
+         goto fail;
+   }
+   uint16_t patch;
+   const uint64_t push = rp.gpu;
+   if (!MALI_PER_ARCH(jm_cmd_meta_job)(cmd, c, MALI_META_INDIRECT_DRAW, &push, sizeof(push), one,
+                                       pending, vs_dep, minmax, &patch))
+      goto fail;
+   if (!mali_jm_cmd_add_job_at(cmd, c, vj, MALI_JOB_TYPE_NOT_STARTED, false, patch))
+      goto fail;
+   cmd->jm.tiler_defer = false;
+   const uint16_t vertex_index = c->index;
+   if (defer)
+      mali_v7_link_tilers(cmd, MALI_V7_TILER_DEFER - 1);
+
+   memcpy(pan_section_ptr(vj.cpu, COMPUTE_JOB, INVOCATION), &invocation, sizeof(invocation));
+   pan_section_pack(vj.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = 5;
+   }
+   pan_section_pack(vj.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = t->vs_rsd;
+      cfg.attributes = dd.attribs;
+      cfg.attribute_buffers = dd.attrib_bufs;
+      cfg.varyings = t->vs_vary;
+      cfg.varying_buffers = dd.vary_bufs;
+      cfg.thread_storage = t->tsd;
+      cfg.offset_start = 0;
+      cfg.instance_size = 1;
+      cfg.push_uniforms = t->vs_fau;
+      cfg.uniform_buffers = t->vs_tab.tables[MALI_V7_DESC_TABLE_UBO];
+      cfg.textures = t->vs_tab.tables[MALI_V7_DESC_TABLE_TEXTURE];
+      cfg.samplers = t->vs_tab.tables[MALI_V7_DESC_TABLE_SAMPLER];
+   }
+   if (tiling)
+      emit_tiler_job(cmd, &di, &dd, &invocation, 1, vertex_index, defer, tj, true);
+
+   /* Heap use: not known here; a guess of a few thousand vertices. */
+   mali_jm_cmd_heap_use(cmd, 4096ull * 32);
+   cmd->jm.cur.draws++;
+   cmd->gfx.render.draws++;
+   cmd->draws++;
+   return;
+
+fail:
+   cmd->jm.tiler_defer = false;
+   return;
+oom:
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static void
+draw_indirect_call(struct mali_cmd_buffer *cmd, const struct idraw_call *call)
+{
+   const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+
+   if (!call->draws)
+      return;
+   if (!cmd->gfx.render.active || !d->pipeline || !d->pipeline->vs) {
+      vk_logw(VK_LOG_OBJS(cmd), "malisx2: draw outside a render pass or without a pipeline");
+      return;
+   }
+   /* No index buffer: valid only if every draw is empty. */
+   if (call->indexed && !d->ib.size)
+      return;
+   /* vkCmdSetIndexRangeMALISX2 names a direct draw. */
+   cmd->jm.idx_hint.set = false;
+   for (uint32_t i = 0; i < call->draws && !vk_command_buffer_has_error(&cmd->vk); i++)
+      draw_indirect(cmd, call, i);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                               VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = drawCount,
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                      VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = drawCount,
+      .indexed = true,
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndirectCount)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                    VkDeviceSize offset, VkBuffer countBuffer,
+                                    VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                    uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   VK_FROM_HANDLE(vk_buffer, cbuf, countBuffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = maxDrawCount,
+      .count = vk_buffer_address(cbuf, countBufferOffset),
+   };
+   draw_indirect_call(cmd, &call);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                           VkDeviceSize offset, VkBuffer countBuffer,
+                                           VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                           uint32_t stride)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buf, buffer);
+   VK_FROM_HANDLE(vk_buffer, cbuf, countBuffer);
+   const struct idraw_call call = {
+      .cmd = vk_buffer_address(buf, offset),
+      .stride = stride,
+      .draws = maxDrawCount,
+      .count = vk_buffer_address(cbuf, countBufferOffset),
+      .indexed = true,
+   };
+   draw_indirect_call(cmd, &call);
 }
 
 /*

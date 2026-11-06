@@ -385,7 +385,13 @@ struct mali_jm_cmd {
    struct mali_ptr pend_tiler[MALI_V7_TILER_DEFER];
    uint16_t pend_tiler_dep1[MALI_V7_TILER_DEFER];
    uint8_t pend_tilers;          /* pending, oldest first */
+   /* Bit i: pend_tiler[i] is an indirect draw's, linked as a Not Started
+    * job that its patch job makes a Tiler job (or a Null job). */
+   uint8_t pend_tiler_ns;
    bool tiler_defer;
+   /* The varying arena of the indirect draws (mali_jm_cmd_draw_v7.c), from
+    * the first one on; returned to the device at reset. */
+   struct mali_cmd_slab *idraw_arena;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */
@@ -590,6 +596,26 @@ struct mali_ptr mali_jm_cmd_add_job(struct mali_cmd_buffer *cmd, struct mali_jm_
 bool mali_jm_cmd_add_job_at(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
                             struct mali_ptr job, enum mali_job_type type, bool barrier,
                             uint16_t dep1);
+
+/*
+ * The job of internal compute shader m (enum mali_meta_shader) with push
+ * constants push, groups workgroups, on chain c, for the indirect draws:
+ * Barrier `barrier` (or the chain's pending one), Dependency 1 and 2 dep1
+ * and dep2, Suppress Prefetch set, so that the job manager reads the job
+ * behind it only after it is done. *index: its job index. False on
+ * failure, with the command buffer's error set.
+ */
+bool MALI_PER_ARCH(jm_cmd_meta_job)(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+                                    unsigned m, const void *push, uint32_t push_size,
+                                    const uint32_t groups[3], bool barrier, uint16_t dep1,
+                                    uint16_t dep2, uint16_t *index);
+
+/* The indirect draws' internal shaders (mali_jm_idraw_nir.c):
+ * MALI_META_INDIRECT_DRAW, and on v7 MALI_META_INDEX_MINMAX. */
+struct nir_shader *MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev);
+#if PAN_ARCH < 9
+struct nir_shader *MALI_PER_ARCH(build_index_minmax_nir)(struct mali_device *dev);
+#endif
 
 /*
  * The link half of mali_jm_cmd_add_job, for writers that pack the header
@@ -898,6 +924,35 @@ uint64_t mali_v7_meta_viewport(struct mali_cmd_buffer *cmd, uint32_t minx, uint3
  * set.
  */
 void mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t size);
+
+/*
+ * The varying arena of a command buffer's indirect draws: one block, a
+ * struct mali_jm_idraw_arena_hdr in its first MALI_IDRAW_ARENA_HDR bytes,
+ * from which the patch jobs take each draw's varying buffers when it runs
+ * (mali_jm_idraw_nir.c). The vertex count of an indirect draw is not known
+ * when it is recorded, so its varyings cannot be sized then. A draw that
+ * does not fit what is left is skipped and counted. 16 MiB holds, at 64
+ * bytes of varyings per vertex, about 260,000 shaded vertices (vertex range
+ * times instances, rounded up to a power of two for instanced draws) per
+ * command buffer run.
+ */
+#define MALI_V7_IDRAW_ARENA_SIZE (16u << 20)
+#define MALI_V7_IDRAW_ARENA_DATA (MALI_V7_IDRAW_ARENA_SIZE - MALI_IDRAW_ARENA_HDR)
+/* Arenas the device keeps for reuse. */
+#define MALI_V7_IDRAW_ARENAS_KEPT 2
+
+/* The command buffer's arena, taken on first use (from the device's kept
+ * ones, else allocated) with its header zeroed, and restored to zero
+ * before every later run. NULL on failure, with the error set. */
+struct mali_cmd_slab *mali_v7_idraw_arena(struct mali_cmd_buffer *cmd);
+
+/* The command buffer's varying arena of indirect draws (struct
+ * mali_jm_cmd::idraw_arena) goes back to the device for reuse, at reset and
+ * destruction; logs, once per device, when draws were dropped for want of
+ * room in it. */
+void mali_v7_idraw_arena_release(struct mali_cmd_buffer *cmd);
+/* Frees the arenas the device keeps, at device destruction. */
+void mali_v7_idraw_arenas_finish(struct mali_device *dev);
 #endif /* PAN_ARCH < 9 */
 
 /* ---------------------------------------------------------------------- */
@@ -1053,6 +1108,11 @@ struct mali_jm_device {
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;
+   /* Varying arenas of indirect draws that command buffers gave back, for
+    * reuse (mali_jm_cmd_draw_v7.c); under mali_device::slab_lock. */
+   struct list_head idraw_arenas;
+   unsigned idraw_arena_count;
+   bool idraw_dropped_said;
 #endif
 
    /* Set for the duration of one vkQueueSubmit when MALISX2_MEASURE's

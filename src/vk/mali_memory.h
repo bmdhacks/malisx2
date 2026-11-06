@@ -64,6 +64,10 @@ struct mali_device_memory {
    /* The range [lo, hi) ever mapped, invalidated before the memory is
     * freed when the type is not host-coherent. */
    uint64_t mapped_lo, mapped_hi;
+
+   /* Buffers and images bound to it so far (mali_image::fresh); updated
+    * atomically, binds can come from any thread. */
+   uint32_t binds;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_device_memory, vk.base, VkDeviceMemory,

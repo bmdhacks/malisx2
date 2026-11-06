@@ -27,6 +27,7 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_format.h"
 #include "util/log.h"
+#include "util/u_atomic.h"
 #include <string.h>
 #include "vk_format.h"
 #include "vk_util.h"
@@ -483,6 +484,12 @@ mali_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
          image->mem = mem;
          image->mem_offset = pBindInfos[i].memoryOffset;
          image->base = mali_device_memory_gpu_va(mem, pBindInfos[i].memoryOffset);
+         /* Bindings may come from several threads. */
+         const bool first_bind = p_atomic_fetch_add(&mem->binds, 1) == 0;
+         image->fresh = first_bind && !image->wsi_scanout &&
+                        !(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) &&
+                        !(image->vk.usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT |
+                                              VK_IMAGE_USAGE_TRANSFER_DST_BIT));
          crc_init(dev, image);
       } else {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR

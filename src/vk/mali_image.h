@@ -196,6 +196,15 @@ struct mali_image {
     * enable transaction elimination on it; every other write of level 0
     * bumps the seed in the header (mali_cmd_crc_invalidate). */
    uint64_t crc_header;
+
+   /* No GPU work has written it or its memory: bound as the first resource
+    * of its memory, usable only as a sampled image and a transfer
+    * destination, and no transfer has written it yet. Its first copy from
+    * a buffer then waits for no image-only barrier on v7
+    * (mali_jm_cmd_vtc_transfer). Cleared by every transfer into it. Last
+    * in the structure so that the offsets of the other fields do not move
+    * on v9 and v11, which never read it. */
+   bool fresh;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)

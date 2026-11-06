@@ -60,7 +60,7 @@ MALI_PER_ARCH(CmdResetQueryPool)(VkCommandBuffer commandBuffer, VkQueryPool _poo
     * counter and one for the availability word. */
    if ((uint64_t)queryCount * (pool->val_count + 1) <= 2 * MALI_QUERY_RESET_JOBS_MAX) {
       /* Not valid inside a render pass instance (Vulkan). */
-      struct mali_jm_chain *c = mali_jm_cmd_vtc(cmd);
+      struct mali_jm_chain *c = mali_jm_cmd_vtc_value(cmd);
       if (!c)
          return;
       for (uint32_t i = 0; i < queryCount; i++) {
@@ -115,7 +115,7 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
 
    struct mali_jm_chain *c = stage_is_vtc_only((VkPipelineStageFlags2)pipelineStage)
-                                ? mali_jm_cmd_vtc(cmd)
+                                ? mali_jm_cmd_vtc_value(cmd)
                                 : mali_jm_cmd_frag(cmd, false);
    if (!c)
       return;
@@ -202,7 +202,7 @@ MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, u
    const uint64_t counter = mali_query_val_va(pool, query);
    struct mali_jm_chain *c = cmd->gfx.render.active && cmd->gfx.render.tiler
                                 ? mali_jm_cmd_pass_vtc(cmd)
-                                : mali_jm_cmd_vtc(cmd);
+                                : mali_jm_cmd_vtc_value(cmd);
    if (!c)
       return;
    /* No Barrier bit: nothing in the chain reads or writes the counter, and

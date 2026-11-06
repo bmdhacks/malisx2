@@ -1236,6 +1236,14 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    mali_v7_pack_invocation(&invocation, local, groups, true);
    const uint32_t instance_size = di->instance_count > 1 ? dd.padded_count : 1;
 
+   /* A vertex shader that reads textures or images or writes memory waits
+    * for what image barriers asked of vtc work, which the pass's tiling
+    * did not (mali_jm_cmd_pass_images). Before the chain is taken: it may
+    * split the pass. */
+   const struct mali_shader *vs = p->vs;
+   if (unlikely(vs->info.writes_global || vs->info.texture_count || vs->info.images_used ||
+                vs->v7.count[MALI_V7_DESC_TABLE_TEXTURE] || vs->v7.count[MALI_V7_DESC_TABLE_IMG]))
+      mali_jm_cmd_pass_images(cmd);
    struct mali_jm_chain *c = mali_jm_cmd_pass_vtc(cmd);
 
    /* The descriptor copies of the stages whose tables were rebuilt and

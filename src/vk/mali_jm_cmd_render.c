@@ -186,8 +186,9 @@ MALI_PER_ARCH(cmd_render_tiler)(struct mali_cmd_buffer *cmd)
    if (!mali_fb_alloc_tsd(cmd, r))
       return false;
 
-   /* The barriers owed to vtc work; the batch may close here. */
-   if (!mali_jm_cmd_vtc(cmd))
+   /* The barriers owed to vtc work; the batch may close here. Not those
+    * only jobs touching images wait for (mali_jm_cmd_pass_images). */
+   if (!mali_jm_cmd_vtc_draw(cmd))
       return false;
    struct mali_jm_batch *b = &cmd->jm.cur;
    if (b->heap_slot < 0 && !mali_jm_heap_take(cmd, b))

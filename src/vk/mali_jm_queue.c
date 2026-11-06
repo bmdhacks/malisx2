@@ -941,11 +941,30 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
              * by any vtc atom that waits for as much anyway (later vtc
              * atoms follow it in the slot order). */
             if (q->xvtc_frag) {
-               if (bt->vtc_xfer)
+               bool owed = bt->vtc_xfer;
+#if PAN_ARCH < 9
+               /* A copy into a fresh image owes only a buffer barrier's. */
+               owed |= bt->vtc_fresh && q->xvtc_buf;
+#endif
+               if (owed)
                   req = newer(req, q->xvtc_frag);
-               if (req && newer(req, q->xvtc_frag) == req)
+               if (req && newer(req, q->xvtc_frag) == req) {
                   q->xvtc_frag = 0;
+#if PAN_ARCH < 9
+                  q->xvtc_buf = false;
+#endif
+               }
             }
+#if PAN_ARCH < 9
+            /* The same for an image barrier's requirement, owed to the
+             * chains that can touch images. */
+            if (q->ivtc_frag) {
+               if (bt->vtc_img)
+                  req = newer(req, q->ivtc_frag);
+               if (req && newer(req, q->ivtc_frag) == req)
+                  q->ivtc_frag = 0;
+            }
+#endif
             vtc = mali_jm_build_atom(dev, MALI_JM_ATOM_VTC, MALI_JM_SLOT_VTC,
                                      MALI_JM_REQ_VTC | chain_req(&bt->vtc), bt->vtc.first,
                                      NULL, ud, q->last[MALI_JM_SLOT_VTC], req, &result);
@@ -986,6 +1005,14 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          q->xvtc_frag = newer(q->xvtc_frag, q->last[MALI_JM_SLOT_FRAG]);
       else if (cmd->jm.end_req & MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)
          q->xvtc_frag = newer(q->xvtc_frag, q->last_frag_xfer);
+#if PAN_ARCH < 9
+      if (cmd->jm.end_req & MALI_JM_REQ_XVTC_BUF)
+         q->xvtc_buf = true;
+      if (cmd->jm.end_req & MALI_JM_REQ_IVTC_AFTER_FRAG)
+         q->ivtc_frag = newer(q->ivtc_frag, q->last[MALI_JM_SLOT_FRAG]);
+      else if (cmd->jm.end_req & MALI_JM_REQ_IVTC_AFTER_FRAG_XFER)
+         q->ivtc_frag = newer(q->ivtc_frag, q->last_frag_xfer);
+#endif
    }
    return VK_SUCCESS;
 }

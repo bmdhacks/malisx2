@@ -135,6 +135,10 @@ struct mali_jm_batch {
                                copy, fill or update): it meets a transfer-
                                only requirement carried from an earlier
                                command buffer (mali_jm_queue::xvtc_frag) */
+   bool vtc_fresh;          /* its vtc chain has a copy into a fresh image
+                               (mali_image::fresh): it meets such a
+                               requirement only when a buffer barrier
+                               asked for it (MALI_JM_REQ_XVTC_BUF) */
    uint32_t passes, draws;
    uint64_t est_heap_bytes; /* estimated tiler heap use, for batch closing */
    uint64_t heap_desc;      /* the Tiler Heap descriptor every pass of the
@@ -182,6 +186,10 @@ struct mali_jm_batch {
  * (mali_jm_batch::vtc_xfer) waits, not the next frame's tiling. */
 #define MALI_JM_REQ_XVTC_AFTER_FRAG      (1u << 3)
 #define MALI_JM_REQ_XVTC_AFTER_FRAG_XFER (1u << 4)
+/* Some of those came from a buffer or global barrier (or one the driver
+ * made): a copy into a fresh image waits for them too
+ * (mali_jm_batch::vtc_fresh). */
+#define MALI_JM_REQ_XVTC_BUF             (1u << 5)
 
 /* A GPU-written range to restore before a command buffer runs again
  * (mali_jm_cmd::resets): size bytes at dst, from data_off in
@@ -304,6 +312,13 @@ struct mali_jm_cmd {
     * the end of the command buffer (MALI_JM_REQ_*), for the queue. */
    uint16_t req;
    uint8_t end_req;
+   /* req's transfer-only requirements (REQ_XVTC_*) include some of a
+    * buffer or global barrier, not only of image barriers. */
+   bool xvtc_buf;
+   /* The transfer being recorded writes only a fresh image
+    * (mali_jm_cmd_xfer_fresh): its vtc jobs skip the image-only barriers'
+    * transfer requirements. */
+   bool xfer_fresh;
 
    /* Re-submission: command buffers recorded without ONE_TIME_SUBMIT
     * note every GPU-written word, and submit restores them before every
@@ -470,6 +485,27 @@ struct mali_jm_chain *mali_jm_cmd_vtc(struct mali_cmd_buffer *cmd);
  * not in those barriers' second scope, so such a barrier does not close a
  * batch at the next draw. */
 struct mali_jm_chain *mali_jm_cmd_vtc_transfer(struct mali_cmd_buffer *cmd);
+
+/*
+ * A render pass's tiling, at its first tiled job (cmd_render_tiler). On v7
+ * mali_jm_cmd_vtc also waits for what image-only barriers asked of vtc work
+ * (mali_jm_cmd_buffer.c, MALI_JM_IMAGE_BARRIER_NARROW), as a transfer does;
+ * a pass's draws do not, unless their vertex shader can touch images or
+ * memory (mali_jm_cmd_pass_images). On v9 the two are the same.
+ */
+struct mali_jm_chain *mali_jm_cmd_vtc_draw(struct mali_cmd_buffer *cmd);
+
+/* The open batch's vtc chain for Write Value jobs (query counters and
+ * availability words, timestamps): they touch no image, so image-only
+ * barriers do not hold them, on v7 either. */
+struct mali_jm_chain *mali_jm_cmd_vtc_value(struct mali_cmd_buffer *cmd);
+
+/* Before a draw whose vertex shader reads textures or images or writes
+ * memory, in a pass: the image-only barrier requirements a plain pass left
+ * pending apply to it, by a pass split when its batch already has
+ * fragment work. Its batch then counts as one with a transfer job for the
+ * requirements carried from earlier command buffers. */
+void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
 
 /* Would a transfer job on the vtc chain close the open batch now (a
  * recorded barrier makes it wait for this batch's fragment work)? An
@@ -942,6 +978,15 @@ struct mali_jm_device {
    struct mali_shader *v7_desc_copy;
    /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
    struct mali_shader *v7_ubo_copy;
+   /* In-pass by-region barriers between attachment writes and input
+    * attachment reads draw nothing: the tile-buffer reads are pixel
+    * ordered (mali_jm_cmd_buffer.c tile_ordered_barrier). Off with the
+    * debug switch "fbbarrier". */
+   bool v7_tile_ordered_fb_barrier;
+   /* Image-only barriers order only the vtc jobs that can touch images
+    * (MALI_JM_IMAGE_BARRIER_NARROW, mali_jm_cmd_buffer.c); off with the
+    * debug switch "vtcwait". */
+   bool v7_image_barrier_narrow;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;
@@ -957,6 +1002,17 @@ struct mali_jm_device {
       uint64_t atoms, job_submits, events, joins, partial_flushes, number_waits;
       uint64_t fence_waits, fence_triggers, fence_wait_errors;
    } stats;
+};
+
+/* Why a vtc atom waits for the fragment slot (mali_jm_queue::why). */
+enum mali_jm_why {
+   MALI_JM_WHY_BARRIER,      /* a barrier: every earlier fragment atom */
+   MALI_JM_WHY_XFER,         /* a barrier: the fragment-side transfers */
+   MALI_JM_WHY_BATCH,        /* a barrier: an earlier batch of the buffer */
+   MALI_JM_WHY_HEAP,         /* the tiler heap slot's last reader */
+   MALI_JM_WHY_XVTC,         /* a transfer-only requirement */
+   MALI_JM_WHY_WAIT,         /* a semaphore wait */
+   MALI_JM_WHY_COUNT,
 };
 
 struct mali_jm_queue {
@@ -983,6 +1039,16 @@ struct mali_jm_queue {
     * transfers, up to the end of the command buffer that asked); 0 when
     * nothing is owed. */
    mali_jm_ref xvtc_frag;
+   /* Part of what xvtc_frag owes came from a buffer or global barrier
+    * (MALI_JM_REQ_XVTC_BUF): copies into fresh images wait for it too. */
+   bool xvtc_buf;
+   /* Debug switch vtcwhy: per reason, the vtc atoms whose dependency on
+    * the fragment slot named an atom still running (build_submit), logged
+    * about once a second. */
+   bool why_on;
+   uint32_t why[MALI_JM_WHY_COUNT];
+   uint32_t why_vtc;
+   int64_t why_since;
 };
 
 VkResult MALI_PER_ARCH(device_init)(struct mali_device *dev);

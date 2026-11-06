@@ -834,6 +834,41 @@ chain_req(const struct mali_jm_chain *c)
    return c->timestamps ? KB_JM_REQ_PERMON : 0;
 }
 
+/* Debug switch vtcwhy (mali_jm_queue::why): counts a vtc atom's
+ * dependency on fragment atom r, for reason why, when r has not finished
+ * as far as the events read so far tell. */
+static inline void
+why_note(const struct mali_jm_device *jd, struct mali_jm_queue *q, enum mali_jm_why why,
+         mali_jm_ref r)
+{
+   if (unlikely(q->why_on) && r && mali_jm_ref_live(jd, r))
+      q->why[why]++;
+}
+
+static void
+why_log(struct mali_jm_queue *q)
+{
+   static const char *const names[MALI_JM_WHY_COUNT] = {
+      "barrier", "xfer", "batch", "heap", "xvtc", "wait",
+   };
+   const int64_t now = os_time_get_nano();
+   if (!q->why_since) {
+      q->why_since = now;
+      return;
+   }
+   if (now - q->why_since < 1000000000)
+      return;
+   char line[256];
+   int n = snprintf(line, sizeof(line), "malisx2 vtc waits: %u vtc atoms in %.2f s;",
+                    q->why_vtc, (now - q->why_since) / 1e9);
+   for (unsigned i = 0; i < MALI_JM_WHY_COUNT && n > 0 && (size_t)n < sizeof(line); i++)
+      n += snprintf(line + n, sizeof(line) - (size_t)n, " %s %u", names[i], q->why[i]);
+   mesa_logi("%s", line);
+   memset(q->why, 0, sizeof(q->why));
+   q->why_vtc = 0;
+   q->why_since = now;
+}
+
 /* The atom graph of the submit's waits and command buffers (file
  * comment). With dev->lock held and the build begun. batch_frag has room
  * for the largest command buffer's batch count, allocated before the
@@ -904,31 +939,45 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
 
          if (bt->vtc.first) {
             mali_jm_ref req = frag_req;
+            why_note(jd, q, MALI_JM_WHY_WAIT, frag_req);
             if (bt->vtc_after_frag == MALI_JM_AFTER_EARLIER ||
                 (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG)) {
                req = newer(req, q->last[MALI_JM_SLOT_FRAG]);
+               why_note(jd, q, MALI_JM_WHY_BARRIER, q->last[MALI_JM_SLOT_FRAG]);
             } else {
                if (bt->vtc_after_frag == MALI_JM_AFTER_EARLIER_XFER ||
-                   (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG_XFER))
+                   (q->carry & MALI_JM_REQ_VTC_AFTER_FRAG_XFER)) {
                   req = newer(req, q->last_frag_xfer);
+                  why_note(jd, q, MALI_JM_WHY_XFER, q->last_frag_xfer);
+               }
                if (bt->vtc_after_frag && bt->vtc_after_frag < MALI_JM_AFTER_EARLIER_XFER &&
-                   bt->vtc_after_frag - 1u < k)
+                   bt->vtc_after_frag - 1u < k) {
                   req = newer(req, batch_frag[bt->vtc_after_frag - 1u]);
+                  why_note(jd, q, MALI_JM_WHY_BATCH, batch_frag[bt->vtc_after_frag - 1u]);
+               }
             }
             if (bt->heap_slot >= 0 && bt->heap_slot < MALI_JM_HEAP_SLOTS_MAX) {
                req = newer(req, q->heap_last_frag[bt->heap_slot]);
                q->submit_tiled++;
+               why_note(jd, q, MALI_JM_WHY_HEAP, q->heap_last_frag[bt->heap_slot]);
             }
             /* A transfer-only requirement carried from an earlier command
              * buffer: met by the first vtc chain with a transfer job, or
              * by any vtc atom that waits for as much anyway (later vtc
              * atoms follow it in the slot order). */
             if (q->xvtc_frag) {
-               if (bt->vtc_xfer)
+               /* A copy into a fresh image owes only a buffer barrier's. */
+               if (bt->vtc_xfer || (bt->vtc_fresh && q->xvtc_buf)) {
                   req = newer(req, q->xvtc_frag);
-               if (req && newer(req, q->xvtc_frag) == req)
+                  why_note(jd, q, MALI_JM_WHY_XVTC, q->xvtc_frag);
+               }
+               if (req && newer(req, q->xvtc_frag) == req) {
                   q->xvtc_frag = 0;
+                  q->xvtc_buf = false;
+               }
             }
+            if (unlikely(q->why_on))
+               q->why_vtc++;
             vtc = mali_jm_build_atom(dev, MALI_JM_ATOM_VTC, MALI_JM_SLOT_VTC,
                                      MALI_JM_REQ_VTC | chain_req(&bt->vtc), bt->vtc.first,
                                      NULL, ud, q->last[MALI_JM_SLOT_VTC], req, &result);
@@ -969,6 +1018,8 @@ build_submit(struct mali_device *dev, struct vk_queue_submit *submit, mali_jm_re
          q->xvtc_frag = newer(q->xvtc_frag, q->last[MALI_JM_SLOT_FRAG]);
       else if (cmd->jm.end_req & MALI_JM_REQ_XVTC_AFTER_FRAG_XFER)
          q->xvtc_frag = newer(q->xvtc_frag, q->last_frag_xfer);
+      if (cmd->jm.end_req & MALI_JM_REQ_XVTC_BUF)
+         q->xvtc_buf = true;
    }
    return VK_SUCCESS;
 }
@@ -1080,6 +1131,8 @@ MALI_PER_ARCH(queue_submit)(struct vk_queue *vkq, struct vk_queue_submit *submit
    q->submit_tiled = 0;
    result = build_submit(dev, submit, batch_frag);
    free(batch_frag);
+   if (unlikely(q->why_on))
+      why_log(q);
    mali_jm_ref tracker = 0;
    bool built = false;
    if (result == VK_SUCCESS)
@@ -1232,6 +1285,10 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
+#if PAN_ARCH < 9
+   jd->v7_tile_ordered_fb_barrier = !mali_debug_flag("fbbarrier");
+   jd->v7_image_barrier_narrow = !mali_debug_flag("vtcwait");
+#endif
 
    dev->jm = jd;
    dev->fe = jd;
@@ -1322,6 +1379,7 @@ MALI_PER_ARCH(queue_init)(struct mali_device *dev, struct mali_queue *queue)
    if (!q)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    q->dev = dev;
+   q->why_on = mali_debug_flag("vtcwhy");
 
    pthread_mutex_lock(&dev->lock);
    jd->queue = q;

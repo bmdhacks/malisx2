@@ -176,6 +176,13 @@ struct mali_image {
     * out (mali_CreateImage, choose_modifier). */
    bool wsi_scanout;
 
+   /* No GPU work has written it or its memory: bound as the first resource
+    * of its memory, usable only as a sampled image and a transfer
+    * destination, and no transfer has written it yet. Its first copy from
+    * a buffer then waits for no image-only barrier on v7 (mali_jm_cmd::
+    * xfer_fresh). Cleared by every transfer into it. */
+   bool fresh;
+
    uint8_t plane_count;
    struct mali_image_plane planes[MALI_IMAGE_MAX_PLANES];
    uint64_t size;        /* bytes of memory the image needs */

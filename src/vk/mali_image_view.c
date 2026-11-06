@@ -62,7 +62,8 @@
 #if PAN_ARCH >= 9
 
 /* Clump formats that are not raw N-byte texels (pan_texture.c's table,
- * less the YUV formats, which are not supported). */
+ * less the YUV formats, which are not supported). A compressed format
+ * left out of it would be read as raw 64- or 128-bit texels. */
 static enum mali_clump_format
 clump_format(enum pipe_format format)
 {
@@ -89,10 +90,31 @@ clump_format(enum pipe_format format)
    case PIPE_FORMAT_ETC2_R11_SNORM: return MALI_CLUMP_FORMAT_ETC2_R11_SNORM;
    case PIPE_FORMAT_ETC2_RG11_UNORM: return MALI_CLUMP_FORMAT_ETC2_RG11_UNORM;
    case PIPE_FORMAT_ETC2_RG11_SNORM: return MALI_CLUMP_FORMAT_ETC2_RG11_SNORM;
+   /* The BCn formats: sRGB is in the Texture descriptor's format, not in
+    * the clump format. */
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_RGBA:
+   case PIPE_FORMAT_DXT1_SRGB:
+   case PIPE_FORMAT_DXT1_SRGBA: return MALI_CLUMP_FORMAT_BC1_UNORM;
+   case PIPE_FORMAT_DXT3_RGBA:
+   case PIPE_FORMAT_DXT3_SRGBA: return MALI_CLUMP_FORMAT_BC2_UNORM;
+   case PIPE_FORMAT_DXT5_RGBA:
+   case PIPE_FORMAT_DXT5_SRGBA: return MALI_CLUMP_FORMAT_BC3_UNORM;
+   case PIPE_FORMAT_RGTC1_UNORM: return MALI_CLUMP_FORMAT_BC4_UNORM;
+   case PIPE_FORMAT_RGTC1_SNORM: return MALI_CLUMP_FORMAT_BC4_SNORM;
+   case PIPE_FORMAT_RGTC2_UNORM: return MALI_CLUMP_FORMAT_BC5_UNORM;
+   case PIPE_FORMAT_RGTC2_SNORM: return MALI_CLUMP_FORMAT_BC5_SNORM;
+   case PIPE_FORMAT_BPTC_RGB_FLOAT: return MALI_CLUMP_FORMAT_BC6H_SF16;
+   case PIPE_FORMAT_BPTC_RGB_UFLOAT: return MALI_CLUMP_FORMAT_BC6H_UF16;
+   case PIPE_FORMAT_BPTC_RGBA_UNORM:
+   case PIPE_FORMAT_BPTC_SRGBA: return MALI_CLUMP_FORMAT_BC7_UNORM;
    default:
       break;
    }
 
+   /* Raw formats are not compressed (a compressed format that reaches here
+    * has no entry above). */
+   assert(!util_format_is_compressed(format));
    switch (util_format_get_blocksize(format)) {
    case 1: return MALI_CLUMP_FORMAT_RAW8;
    case 2: return MALI_CLUMP_FORMAT_RAW16;

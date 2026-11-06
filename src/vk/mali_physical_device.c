@@ -509,9 +509,9 @@ dual_src_blend_for_arch(uint32_t arch)
 }
 
 /* textureCompressionBC: every BCn format a sampled image, linearly
- * filtered and a blit source (Vulkan's required format support). v7 has
- * that when the GPU has all of BC1-7 (mali_format_table.c); v9 and v11
- * answer no for every BCn format. */
+ * filtered and a blit source (Vulkan's required format support). v7 and v9
+ * have that when the GPU has all of BC1-7 (mali_format_table.c); v11
+ * answers no for every BCn format. */
 static bool
 bc_formats_complete(const struct mali_physical_device *pdev)
 {

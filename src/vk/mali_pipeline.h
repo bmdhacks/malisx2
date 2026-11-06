@@ -178,6 +178,8 @@ struct mali_gfx_bind {
     * per draw). */
    bool vs_first_vertex, vs_base_instance;
    bool dynamic;                  /* baked.uses_dynamic_state */
+   bool discard;                  /* static rasterizer discard (v9, v11: such a
+                                   * draw is dropped); false when dynamic */
    bool lines;                    /* PRIMITIVE_SIZE is the line width */
    bool has_fs;
    /* Copies of the static line width and input attachment map, when

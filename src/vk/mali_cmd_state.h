@@ -1040,6 +1040,22 @@ mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
 }
 #endif
 
+/* Whether a draw reaches the rasterizer. A pipeline with rasterizer discard
+ * (static, or set dynamically) makes a draw that nothing can observe on v9
+ * and v11: the vertex shader writes no memory (vertexPipelineStoresAndAtomics
+ * is off), there is no transform feedback or primitives-generated query, and
+ * no fragment is produced for an occlusion query to count. Such a draw is
+ * dropped before it touches any state, so the dirty bits and staging
+ * registers are as they were for the next draw. (v7 keeps the Vertex job
+ * and drops the Tiler job instead, mali_jm_cmd_draw_v7.c.) */
+static inline bool
+mali_gfx_discards(const struct mali_cmd_buffer *cmd)
+{
+   const struct mali_gfx_bind *bd = &cmd->gfx.draw.pipeline->bind;
+   return unlikely(bd->dynamic ? cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable
+                               : bd->discard);
+}
+
 /* Dynamic states this driver reads at draw time, per dirty group. */
 static inline void
 mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)

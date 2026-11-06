@@ -411,6 +411,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
+   if (mali_gfx_discards(cmd))
+      return;
 
    struct idvs_batch e;
    e.d = d;

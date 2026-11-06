@@ -585,6 +585,7 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->tls_size = bk->tls_size;
    bd->noperspective = p->fs ? p->fs->info.varyings.noperspective : 0;
    bd->dynamic = bk->uses_dynamic_state;
+   bd->discard = !bk->uses_dynamic_state && p->state.rs.rasterizer_discard_enable;
    /* A dynamic topology keeps the point size (mali_cmd_draw.c reads
     * baked.prim only when it is static). */
    bd->lines = bk->prim != MESA_PRIM_COUNT && u_reduced_prim(bk->prim) == MESA_PRIM_LINES;

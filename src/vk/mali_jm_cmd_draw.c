@@ -394,6 +394,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
+   if (mali_gfx_discards(cmd))
+      return;
 
    if (!prepare_draw(cmd, di)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);

@@ -271,7 +271,10 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          if (depth_idx == index || stencil_idx == index) {
             target = MALI_ZS_ATTACHMENT;
          } else {
-            for (unsigned i = 0; i < ial->color_attachment_count; i++) {
+            /* The count is MESA_VK_COLOR_ATTACHMENT_COUNT_UNKNOWN (0xff) when
+             * the pipeline gave no map: the identity map, over every entry. */
+            for (unsigned i = 0; i < ARRAY_SIZE(ial->color_map) &&
+                                 i < ial->color_attachment_count; i++) {
                if (ial->color_map[i] != MESA_VK_ATTACHMENT_UNUSED &&
                    ial->color_map[i] + 1 == index) {
                   target = MALI_COLOR_ATTACHMENT(i);

@@ -1019,12 +1019,11 @@ struct mali_draw_info {
    bool indexed;
 };
 
-#if PAN_ARCH < 9
 /* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
  * any but the viewports, scissors, blend constants and vertex input, which
  * the draw reads through groups of their own. */
 static inline bool
-mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
+mali_gfx_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
 {
    BITSET_DECLARE(d, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
    memcpy(d, dyn->dirty, sizeof(d));
@@ -1038,7 +1037,6 @@ mali_v7_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
    BITSET_CLEAR(d, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
    return !BITSET_IS_EMPTY(d);
 }
-#endif
 
 /* Whether a draw reaches the rasterizer. A pipeline with rasterizer discard
  * (static, or set dynamically) makes a draw that nothing can observe on v9
@@ -1081,13 +1079,11 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
    if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP))
       d->dirty |= MALI_GFX_DIRTY_FS_FAU;
    if (d->pipeline && d->pipeline->bind.dynamic) {
-      /* Words baked from state the pipeline left dynamic: repack. On v7
-       * only when a state the bake reads changed: the runtime marks a
-       * state dirty only when its value changes, and a new pipeline, a
-       * pass and meta operations mark these groups themselves. */
-#if PAN_ARCH < 9
-      if (mali_v7_dyn_bake_dirty(dyn))
-#endif
+      /* Words baked from state the pipeline left dynamic: repack, when a
+       * state the bake reads changed. The runtime marks a state dirty only
+       * when its value changes, and a new pipeline, a pass and meta
+       * operations mark these groups themselves. */
+      if (mali_gfx_dyn_bake_dirty(dyn))
          d->dirty |= MALI_GFX_DIRTY_PIPELINE | MALI_GFX_DIRTY_ZSD | MALI_GFX_DIRTY_BLEND |
                      MALI_GFX_DIRTY_FS_FAU;
    }

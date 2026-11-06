@@ -36,7 +36,9 @@
  * Null) and counted in the arena's header, which the command buffer logs
  * when it is reset. Instanced draws use a power-of-two instance stride
  * (the padded vertex count), so the per-vertex attributes' modulus and the
- * per-instance attributes' divisor are shifts the shader can write.
+ * per-instance attributes' divisor are shifts the shader can write; the
+ * attribute unit adds Offset start to a divided element too, so those
+ * attributes' offsets are base + (firstInstance - Offset start) x stride.
  */
 
 #include "mali_jm.h"
@@ -142,18 +144,26 @@ load_params(nir_builder *b, nir_def *rec, nir_def *indexed)
 
 /* attr_base[a] + first_instance x attr_stride[a] into the per-instance
  * attributes' offsets: `size` bytes per descriptor, the offset at byte
- * `off` of it. */
+ * `off` of it. With raw (v7), the attributes of inst_attr_raw_mask take
+ * (first_instance - raw) x attr_stride[a] instead: the attribute unit adds
+ * Offset start (raw) to the element of a divided buffer as well. */
 static void
-patch_inst_attribs(nir_builder *b, nir_def *rec, nir_def *first_instance, unsigned size,
-                   unsigned off)
+patch_inst_attribs(nir_builder *b, nir_def *rec, nir_def *first_instance, nir_def *raw,
+                   unsigned size, unsigned off)
 {
    nir_def *mask = REC32(b, rec, inst_attr_mask);
    nir_push_if(b, nir_ine_imm(b, mask, 0));
    nir_def *attribs = REC64(b, rec, attribs);
+   nir_def *raw_mask = raw ? REC32(b, rec, inst_attr_raw_mask) : NULL;
    for (unsigned a = 0; a < MALI_IDRAW_MAX_ATTRIBS; a++) {
       nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, mask, 1u << a), 0));
+      nir_def *first = first_instance;
+      if (raw) {
+         first = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, raw_mask, 1u << a), 0),
+                           nir_isub(b, first_instance, raw), first_instance);
+      }
       nir_def *v = nir_iadd(b, REC32_AT(b, rec, attr_base, a),
-                            nir_imul(b, first_instance, REC32_AT(b, rec, attr_stride, a)));
+                            nir_imul(b, first, REC32_AT(b, rec, attr_stride, a)));
       store32(b, v, attribs, a * size + off);
       nir_pop_if(b, NULL);
    }
@@ -205,7 +215,7 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
       store32_if(&b, p.vertex_offset, REC64(&b, rec, first_vertex));
       store32_if(&b, p.first_instance, REC64(&b, rec, base_instance));
       /* Attribute descriptors are 32 bytes, the offset in word 2. */
-      patch_inst_attribs(&b, rec, p.first_instance, MALI_DESCRIPTOR_SIZE, 8);
+      patch_inst_attribs(&b, rec, p.first_instance, NULL, MALI_DESCRIPTOR_SIZE, 8);
    }
    nir_pop_if(&b, NULL);
    NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
@@ -441,7 +451,7 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
       }
       nir_pop_if(&b, NULL);
       /* Attribute descriptors are 8 bytes, the offset in word 1. */
-      patch_inst_attribs(&b, rec, p.first_instance, pan_size(ATTRIBUTE), 4);
+      patch_inst_attribs(&b, rec, p.first_instance, raw, pan_size(ATTRIBUTE), 4);
 
       store32_if(&b, p.vertex_offset, REC64(&b, rec, first_vertex));
       store32_if(&b, p.first_instance, REC64(&b, rec, base_instance));

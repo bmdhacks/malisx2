@@ -658,7 +658,10 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
  * count are not known here: the patch job (mali_jm_idraw_nir.c) shades
  * instances 2^n vertices apart (n its own), so a per-vertex binding is 1D
  * Modulus by 2^n and a per-instance binding 1D POT Divisor by 2^n times its
- * divisor; the patch job writes n into the byte both share. A divisor of 0
+ * divisor; the patch job writes n into the byte both share. The attribute
+ * unit adds the draw's Offset start to a divided buffer's element as well,
+ * so the patch job takes it off the attributes of such a binding
+ * (mali_jm_idraw_rec::inst_attr_raw_mask). A divisor of 0
  * reads the first element (1D, stride 0), as for a direct draw. False for a
  * divisor that is not a power of two.
  */
@@ -778,17 +781,26 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       const struct vk_vertex_binding_state *b = &vi->bindings[a->binding];
       const bool per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
       const uint64_t addr = d->vb[a->binding].addr;
+      /* The attribute unit adds the draw's Offset start to the element of
+       * a divided buffer as it does to a per-vertex one (Mesa's gallium
+       * driver, pan_cmdstream.c), so a per-instance attribute read through
+       * a divisor starts that many elements early. Only an instanced draw
+       * divides (emit_attrib_buf); one instance reads with stride 0. */
+      int64_t first = per_instance ? (int64_t)di->first_instance : 0;
+      if (per_instance && di->instance_count > 1 && b->divisor)
+         first -= dd->raw_vertex_offset;
       pan_pack(&adescs[i], ATTRIBUTE, cfg) {
          cfg.buffer_index = a->binding * 2;
          cfg.offset_enable = true;
          cfg.format = GENX(pan_format_from_pipe_format)(vk_format_to_pipe_format(a->format))->hw;
-         cfg.offset = a->offset + (addr & 63) +
-                      (per_instance ? (uint64_t)di->first_instance * strides[a->binding] : 0);
+         cfg.offset = (int64_t)a->offset + (int64_t)(addr & 63) + first * strides[a->binding];
       }
       /* An indirect draw's per-instance offsets: base + firstInstance x
        * stride, by the patch job (di->first_instance is 0 here). */
       if (rec && per_instance) {
          rec->inst_attr_mask |= BITFIELD_BIT(i);
+         if (b->divisor)
+            rec->inst_attr_raw_mask |= BITFIELD_BIT(i);
          rec->attr_base[i] = a->offset + (addr & 63);
          rec->attr_stride[i] = strides[a->binding];
       }

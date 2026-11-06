@@ -215,7 +215,10 @@ struct mali_jm_idraw_rec {
     * (8-byte descriptors, offset in word 1). */
    uint64_t attribs;
    uint32_t inst_attr_mask;
-   uint32_t pad0;
+   /* v7: of those, the ones whose buffer is a 1D POT Divisor: the attribute
+    * unit adds the draw's Offset start to their element too, so their
+    * offset is base + (firstInstance - Offset start) x stride. */
+   uint32_t inst_attr_raw_mask;
    uint32_t attr_base[MALI_IDRAW_MAX_ATTRIBS];
    uint32_t attr_stride[MALI_IDRAW_MAX_ATTRIBS];
    /* v7 */

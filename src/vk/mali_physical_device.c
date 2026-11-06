@@ -8,6 +8,7 @@
  * the blob's values, including the memory types.
  */
 
+#include "mali_descriptor_set_layout.h"
 #include "mali_image.h"
 #include "mali_queue.h"
 #include "mali_vk.h"
@@ -401,6 +402,17 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * code (mali_descriptor_set.c), so this needs no per-arch gate. */
    .KHR_push_descriptor = true,
 
+   /* Descriptor indexing: the sets are read in place through the resource
+    * tables on v9 and v11, which is what update after bind needs, and v7
+    * copies a stage's descriptors from them when the draw executes
+    * (get_descriptor_indexing_features has what each arch has). v7 cannot
+    * meet the extension's limits for what it does not have, so it is
+    * listed there under malisx2's own name (mali_vk.h): Mesa's runtime keys
+    * the feature structs on this entry, which stays set, and
+    * mali_EnumerateDeviceExtensionProperties and mali_CreateDevice swap the
+    * name (mali_descriptor_indexing_renamed). */
+   .EXT_descriptor_indexing = true,
+
    /* The timeline semaphore type is Mesa's emulated one over our binary
     * sync (mali_sync.c), so the device runs in Mesa's emulated timeline
     * mode. */
@@ -473,16 +485,6 @@ static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
-   if (arch == 7) {
-      /* Descriptor indexing, the part hakuX uses (get_features), offered to
-       * applications only as malisx2's own VK_MALISX2_descriptor_indexing
-       * (mali_vk.h): v7 cannot meet VK_EXT_descriptor_indexing's required
-       * features and update-after-bind limits. Mesa's runtime keys the
-       * descriptor indexing feature structs and SPIR-V capabilities on the
-       * EXT, so it is supported here and hidden from applications
-       * (mali_EnumerateDeviceExtensionProperties, mali_CreateDevice). */
-      ext.EXT_descriptor_indexing = true;
-   }
 
    /* 8- and 16-bit storage (see small_storage_for_arch). */
    if (small_storage_for_arch(arch)) {
@@ -537,6 +539,58 @@ bc_formats_complete(const struct mali_physical_device *pdev)
          return false;
    }
    return true;
+}
+
+/*
+ * VkPhysicalDeviceDescriptorIndexingFeatures (VK_EXT_descriptor_indexing on
+ * v9 and v11, VK_MALISX2_descriptor_indexing on v7: mali_vk.h).
+ *
+ * v9 and v11: a set is read in place through its resource table entry
+ * when a job runs, so a descriptor written after the set is bound, or never
+ * written when the shader does not reach it, needs nothing from the
+ * driver; the variable-count binding is the set's size (mali_descriptor_set.c).
+ * Every kind of array a stage can index is lowered with
+ * nir_lower_non_uniform_access (mali_shader.c). Input attachments are tile
+ * reads with a compile-time attachment (mali_nir_lower_input_attachments.c),
+ * so arrays of them are not offered. Dynamic uniform and storage buffers
+ * are not update-after-bind (a specification rule) and their addresses are
+ * taken when the command is recorded.
+ *
+ * v7: runtime arrays, partially bound bindings, sampled images updated
+ * after bind and non-uniform sampled-image indexing, within what its
+ * descriptor tables, copied by a job when the draw runs, can do: no
+ * variable count, no update after bind of buffers and storage images, no
+ * update while pending.
+ */
+static void
+get_descriptor_indexing_features(struct vk_features *f, uint32_t arch)
+{
+   if (arch == 7) {
+      f->runtimeDescriptorArray = true;
+      f->descriptorBindingPartiallyBound = true;
+      f->descriptorBindingSampledImageUpdateAfterBind = true;
+      f->shaderSampledImageArrayNonUniformIndexing = true;
+      return;
+   }
+
+   f->shaderUniformTexelBufferArrayDynamicIndexing = true;
+   f->shaderStorageTexelBufferArrayDynamicIndexing = true;
+   f->shaderUniformBufferArrayNonUniformIndexing = true;
+   f->shaderSampledImageArrayNonUniformIndexing = true;
+   f->shaderStorageBufferArrayNonUniformIndexing = true;
+   f->shaderStorageImageArrayNonUniformIndexing = true;
+   f->shaderUniformTexelBufferArrayNonUniformIndexing = true;
+   f->shaderStorageTexelBufferArrayNonUniformIndexing = true;
+   f->descriptorBindingUniformBufferUpdateAfterBind = true;
+   f->descriptorBindingSampledImageUpdateAfterBind = true;
+   f->descriptorBindingStorageImageUpdateAfterBind = true;
+   f->descriptorBindingStorageBufferUpdateAfterBind = true;
+   f->descriptorBindingUniformTexelBufferUpdateAfterBind = true;
+   f->descriptorBindingStorageTexelBufferUpdateAfterBind = true;
+   f->descriptorBindingUpdateUnusedWhilePending = true;
+   f->descriptorBindingPartiallyBound = true;
+   f->descriptorBindingVariableDescriptorCount = true;
+   f->runtimeDescriptorArray = true;
 }
 
 /*
@@ -675,18 +729,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .dynamicRenderingLocalRead = true,
    };
 
-   /* The extensions of device_extensions_for_arch on v7. */
-   if (arch == 7) {
-      /* VK_MALISX2_descriptor_indexing (device_extensions_for_arch). v7
-       * copies a stage's descriptors from the sets into its tables by a
-       * copy job when the draw runs, so writes after the bind are what it
-       * copies; unwritten descriptors are copied but not read; non-uniform
-       * indices are lowered to loops (mali_shader.c). */
-      f->runtimeDescriptorArray = true;
-      f->descriptorBindingPartiallyBound = true;
-      f->descriptorBindingSampledImageUpdateAfterBind = true;
-      f->shaderSampledImageArrayNonUniformIndexing = true;
-   }
+   get_descriptor_indexing_features(f, arch);
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -896,20 +939,20 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_push_descriptor. panvk's value; ARMSX2 needs 7 (its TFX
        * texture set). */
       .maxPushDescriptors = 32,
-      .maxPerStageDescriptorSamplers = 1u << 20,
-      .maxPerStageDescriptorUniformBuffers = 1u << 20,
-      .maxPerStageDescriptorStorageBuffers = 1u << 20,
-      .maxPerStageDescriptorSampledImages = 1u << 20,
-      .maxPerStageDescriptorStorageImages = 1u << 20,
+      .maxPerStageDescriptorSamplers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorUniformBuffers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorStorageBuffers = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorSampledImages = MALI_MAX_DESCS_PER_TYPE,
+      .maxPerStageDescriptorStorageImages = MALI_MAX_DESCS_PER_TYPE,
       .maxPerStageDescriptorInputAttachments = 9,
-      .maxPerStageResources = 5 * (1u << 20) + 9,
-      .maxDescriptorSetSamplers = 1u << 20,
-      .maxDescriptorSetUniformBuffers = 1u << 20,
+      .maxPerStageResources = 5 * MALI_MAX_DESCS_PER_TYPE + 9,
+      .maxDescriptorSetSamplers = MALI_MAX_DESCS_PER_TYPE,
+      .maxDescriptorSetUniformBuffers = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetUniformBuffersDynamic = 16,
-      .maxDescriptorSetStorageBuffers = 1u << 20,
+      .maxDescriptorSetStorageBuffers = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetStorageBuffersDynamic = 8,
-      .maxDescriptorSetSampledImages = 1u << 20,
-      .maxDescriptorSetStorageImages = 1u << 20,
+      .maxDescriptorSetSampledImages = MALI_MAX_DESCS_PER_TYPE,
+      .maxDescriptorSetStorageImages = MALI_MAX_DESCS_PER_TYPE,
       .maxDescriptorSetInputAttachments = 9,
       .maxVertexInputAttributes = 16,
       .maxVertexInputBindings = 16,
@@ -973,6 +1016,55 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    };
 
    /*
+    * VK_EXT_descriptor_indexing's properties on v9 and v11 (v7 has its own
+    * below). An update-after-bind limit counts the descriptors of sets with
+    * and without the update-after-bind bit, so none is below its ordinary
+    * limit; with the sets read in place there is no cost to a descriptor
+    * being update-after-bind, so they are the ordinary limits (as panvk's).
+    * No pool-wide count is kept for update-after-bind pools: a pool is as
+    * large as the memory it can allocate.
+    *
+    * No quad-divergent implicit level of detail: an implicit-lod operation
+    * whose image or sampler differs inside a fragment quad is not defined
+    * (nir_lower_non_uniform_access makes the index uniform in the warp, not
+    * in the quad, mali_shader.c), and nothing is native: every non-uniform
+    * index goes through that lowering.
+    */
+   if (p->arch_major != 7) {
+      props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX;
+      props->shaderUniformBufferArrayNonUniformIndexingNative = false;
+      props->shaderSampledImageArrayNonUniformIndexingNative = false;
+      props->shaderStorageBufferArrayNonUniformIndexingNative = false;
+      props->shaderStorageImageArrayNonUniformIndexingNative = false;
+      props->shaderInputAttachmentArrayNonUniformIndexingNative = false;
+      props->robustBufferAccessUpdateAfterBind = true;
+      props->quadDivergentImplicitLod = false;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
+      props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+         props->maxPerStageDescriptorUniformBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+         props->maxPerStageDescriptorStorageBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages =
+         props->maxPerStageDescriptorSampledImages;
+      props->maxPerStageDescriptorUpdateAfterBindStorageImages =
+         props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageDescriptorUpdateAfterBindInputAttachments =
+         props->maxPerStageDescriptorInputAttachments;
+      props->maxPerStageUpdateAfterBindResources = props->maxPerStageResources;
+      props->maxDescriptorSetUpdateAfterBindSamplers = props->maxDescriptorSetSamplers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffers = props->maxDescriptorSetUniformBuffers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+         props->maxDescriptorSetUniformBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffers = props->maxDescriptorSetStorageBuffers;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+         props->maxDescriptorSetStorageBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindSampledImages = props->maxDescriptorSetSampledImages;
+      props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
+      props->maxDescriptorSetUpdateAfterBindInputAttachments =
+         props->maxDescriptorSetInputAttachments;
+   }
+
+   /*
     * The Mali-G52 (v7) has no resource tables and takes panvk_v7's limits:
     * per set, those of the Renderer State's 16-bit sampler and texture
     * counts and 8-bit uniform buffer count, the Uniform Buffer's 12-bit
@@ -1011,11 +1103,11 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetStorageImages = 1u << 8;
       props->subgroupSize = 8;
 
-      /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
-       * the ordinary ones; per-stage ones are raised below. A non-uniform
-       * index must be uniform within a fragment quad even for explicit
-       * level of detail, which quadDivergentImplicitLod does not cover
-       * (mali_vk.h). */
+      /* VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features):
+       * the limits start as the ordinary ones; per-stage ones are raised
+       * below. A non-uniform index must be uniform within a fragment quad
+       * even for explicit level of detail, which quadDivergentImplicitLod
+       * does not cover (mali_vk.h). */
       props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
       props->quadDivergentImplicitLod = false;
       props->shaderSampledImageArrayNonUniformIndexingNative = false;
@@ -1044,10 +1136,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
          props->maxDescriptorSetInputAttachments;
 
       /*
-       * VK_MALISX2_descriptor_indexing (get_features). An update-after-bind
-       * limit counts the descriptors of sets with and without the
-       * update-after-bind bit, so none is below its ordinary counterpart:
-       * per set they are the ordinary limits.
+       * VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features).
+       * An update-after-bind limit counts the descriptors of sets with and
+       * without the update-after-bind bit, so none is below its ordinary
+       * counterpart: per set they are the ordinary limits.
        *
        * Per stage, a stage whose textures and samplers all come from one
        * update-after-bind set reads that set as its tables
@@ -1101,9 +1193,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
 /* ---------------------------------------------------------------------- */
 /* Queries we implement ourselves                                          */
 
-/* Mesa's list, with VK_EXT_descriptor_indexing (supported only for the
- * runtime, device_extensions_for_arch) shown as malisx2's own
- * VK_MALISX2_descriptor_indexing (mali_vk.h). */
+/* Mesa's list, with VK_EXT_descriptor_indexing shown as malisx2's own
+ * VK_MALISX2_descriptor_indexing on v7 (device_extensions_for_arch,
+ * mali_vk.h). */
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
                                         const char *pLayerName,
@@ -1122,7 +1214,8 @@ mali_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
 #endif
       vk_outarray_append_typed(VkExtensionProperties, &out, prop) {
          *prop = vk_device_extensions[i];
-         if (!strcmp(prop->extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+         if (mali_descriptor_indexing_renamed(pdev->arch) &&
+             !strcmp(prop->extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
             snprintf(prop->extensionName, sizeof(prop->extensionName), "%s",
                      VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME);
             prop->specVersion = VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION;

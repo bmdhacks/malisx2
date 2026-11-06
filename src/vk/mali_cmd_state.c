@@ -455,6 +455,8 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
       set->gpu = 0;
    }
    set->layout = layout;
+   set->desc_count = layout->desc_count;   /* push layouts have no variable count */
+   set->variable_count = 0;
    st->sets[idx] = set;
    MALI_PER_ARCH(descriptor_set_init_fixed_slots)(set);
    return true;

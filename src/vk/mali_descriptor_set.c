@@ -171,7 +171,7 @@ slot_ptr(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
 {
    const struct mali_descriptor_set_binding_layout *bl = &set->layout->bindings[binding];
    const uint32_t idx = mali_desc_index(bl, elem, sub);
-   assert(idx < set->layout->desc_count);
+   assert(idx < set->desc_count);
    return (uint8_t *)set->cpu + (size_t)idx * MALI_DESCRIPTOR_SIZE;
 }
 
@@ -385,7 +385,12 @@ init_fixed_slots(struct mali_descriptor_set *set)
       if (bl->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK && bl->desc_count) {
          init_iub(set, b);
       } else if (bl->immutable_samplers) {
-         for (uint32_t e = 0; e < bl->desc_count; e++)
+         /* A variable-count binding has only the elements the set was
+          * allocated with. */
+         const uint32_t count =
+            layout->has_variable_count && b == layout->variable_binding ? set->variable_count :
+                                                                          bl->desc_count;
+         for (uint32_t e = 0; e < count; e++)
             write_slot(set, b, e, sampler_subdesc(bl->type), &bl->immutable_samplers[e]);
       }
    }
@@ -570,6 +575,22 @@ MALI_PER_ARCH(UpdateDescriptorSetWithTemplate)(VkDevice _device, VkDescriptorSet
 /* ---------------------------------------------------------------------- */
 /* Pools and sets                                                          */
 
+/* Descriptors of each type a set of layout takes from its pool when its
+ * variable-count binding has variable_count elements: the layout's counts
+ * (which have that binding at its full size) themselves, or those less the
+ * elements the set does not have, built in scratch. */
+static const uint32_t *
+set_type_counts(const struct mali_descriptor_set_layout *layout, uint32_t variable_count,
+                uint32_t scratch[MALI_DESC_TYPE_COUNT])
+{
+   if (!layout->has_variable_count)
+      return layout->type_counts;
+   const struct mali_descriptor_set_binding_layout *b = &layout->bindings[layout->variable_binding];
+   memcpy(scratch, layout->type_counts, sizeof(layout->type_counts));
+   scratch[mali_desc_type_index(b->type)] -= b->desc_count - variable_count;
+   return scratch;
+}
+
 static void
 pool_release_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
                  struct mali_descriptor_set *set, bool heap_free)
@@ -581,10 +602,12 @@ pool_release_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
 
    struct mali_descriptor_set_layout *layout =
       (struct mali_descriptor_set_layout *)set->layout;
+   uint32_t type_counts[MALI_DESC_TYPE_COUNT];
    if (set->gpu && heap_free)
       util_vma_heap_free(&pool->heap, set->gpu, mali_descriptor_set_size(set));
+   const uint32_t *counts = set_type_counts(layout, set->variable_count, type_counts);
    for (unsigned t = 0; t < MALI_DESC_TYPE_COUNT; t++)
-      pool->avail[t] += layout->type_counts[t];
+      pool->avail[t] += counts[t];
 
    if (set->own_layout_ref)
       vk_descriptor_set_layout_unref(&dev->vk, &layout->vk);
@@ -757,10 +780,11 @@ MALI_PER_ARCH(ResetDescriptorPool)(VkDevice _device, VkDescriptorPool _pool,
  * then each type's remaining descriptors (both
  * VK_ERROR_OUT_OF_POOL_MEMORY), then memory
  * (VK_ERROR_OUT_OF_POOL_MEMORY when too little is free in total,
- * VK_ERROR_FRAGMENTED_POOL when it is free but not contiguous). Variable
- * descriptor counts are not supported, so every set has its layout's
- * size. Set memory is not cleared (neither the blob nor panvk does);
- * immutable samplers and inline-uniform-block headers are written.
+ * VK_ERROR_FRAGMENTED_POOL when it is free but not contiguous). A layout's
+ * variable-count binding takes the pool descriptors and the set memory of
+ * the count the set is allocated with, not of its largest. Set memory is
+ * not cleared (neither the blob nor panvk does); immutable samplers and
+ * inline-uniform-block headers are written.
  */
 /* Takes the pool's reference to a layout, once per layout; false when the
  * pool already holds as many as it keeps. */
@@ -780,17 +804,20 @@ pool_hold_layout(struct mali_descriptor_pool *pool, struct mali_descriptor_set_l
 
 static VkResult
 pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
-               struct mali_descriptor_set_layout *layout,
+               struct mali_descriptor_set_layout *layout, uint32_t variable_count,
                struct mali_descriptor_set **out)
 {
    if (pool->live_sets >= pool->max_sets)
       return VK_ERROR_OUT_OF_POOL_MEMORY;
+   uint32_t type_counts[MALI_DESC_TYPE_COUNT];
+   const uint32_t *counts = set_type_counts(layout, variable_count, type_counts);
    for (unsigned t = 0; t < MALI_DESC_TYPE_COUNT; t++) {
-      if (layout->type_counts[t] > pool->avail[t])
+      if (counts[t] > pool->avail[t])
          return VK_ERROR_OUT_OF_POOL_MEMORY;
    }
 
-   const uint64_t size = (uint64_t)layout->desc_count * MALI_DESCRIPTOR_SIZE;
+   const uint32_t slots = mali_desc_set_slots(layout, variable_count);
+   const uint64_t size = (uint64_t)slots * MALI_DESCRIPTOR_SIZE;
    uint64_t gpu = 0;
    if (pool->linear) {
       /* In order: no heap, no search (mali_descriptor_pool::linear). */
@@ -817,7 +844,7 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    BITSET_CLEAR(pool->free_sets, i);
    pool->live_sets++;
    for (unsigned t = 0; t < MALI_DESC_TYPE_COUNT; t++)
-      pool->avail[t] -= layout->type_counts[t];
+      pool->avail[t] -= counts[t];
 
    vk_object_base_init(&dev->vk, &set->base, VK_OBJECT_TYPE_DESCRIPTOR_SET);
    set->own_layout_ref = !pool_hold_layout(pool, layout);
@@ -825,6 +852,8 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
       vk_descriptor_set_layout_ref(&layout->vk);
    set->pool = pool;
    set->layout = layout;
+   set->desc_count = slots;
+   set->variable_count = layout->has_variable_count ? variable_count : 0;
    set->gpu = gpu;
    set->cpu = gpu ? (uint8_t *)pool->bo.cpu + (gpu - pool->bo.gpu_va) : NULL;
    set->host = gpu && pool->host ? pool->host + (gpu - pool->bo.gpu_va) : NULL;
@@ -863,11 +892,23 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
    /* A linear pool's position, put back if this call fails. */
    const uint32_t next = pool->next;
    const uint64_t bump = pool->bump;
+   /* Without the structure, or with a count of zero sets in it, the
+    * variable counts are zero. */
+   const VkDescriptorSetVariableDescriptorCountAllocateInfo *var_counts =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO);
 
    for (i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
       VK_FROM_HANDLE(mali_descriptor_set_layout, layout, pAllocateInfo->pSetLayouts[i]);
       struct mali_descriptor_set *set;
-      result = pool_alloc_set(dev, pool, layout, &set);
+      uint32_t variable_count = 0;
+      if (layout->has_variable_count && var_counts && var_counts->descriptorSetCount > 0) {
+         /* The specification keeps it within the binding's size; a larger
+          * value would run past the set's memory, so it is cut. */
+         variable_count = MIN2(var_counts->pDescriptorCounts[i],
+                               layout->bindings[layout->variable_binding].desc_count);
+      }
+      result = pool_alloc_set(dev, pool, layout, variable_count, &set);
       if (result != VK_SUCCESS)
          break;
       pDescriptorSets[i] = mali_descriptor_set_to_handle(set);

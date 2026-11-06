@@ -276,10 +276,11 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
 #endif
 
-   /* VK_MALISX2_descriptor_indexing is VK_EXT_descriptor_indexing to Mesa's
-    * runtime, which supports only the latter where the former is offered
-    * (mali_EnumerateDeviceExtensionProperties). The EXT itself is not
-    * offered there, so it cannot be enabled by name. */
+   /* On v7 VK_MALISX2_descriptor_indexing is VK_EXT_descriptor_indexing to
+    * Mesa's runtime, which supports only the latter where the former is
+    * offered (mali_EnumerateDeviceExtensionProperties). The EXT itself is
+    * not offered there, so it cannot be enabled by name. v9 and v11 offer
+    * the EXT under its own name, and malisx2's name is unknown to them. */
    VkDeviceCreateInfo create_info = *pCreateInfo;
    STACK_ARRAY(const char *, ext_names, pCreateInfo->enabledExtensionCount);
    if (!ext_names) {
@@ -288,7 +289,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
       const char *name = pCreateInfo->ppEnabledExtensionNames[i];
-      if (pdev->vk.supported_extensions.EXT_descriptor_indexing) {
+      if (mali_descriptor_indexing_renamed(pdev->arch)) {
          if (!strcmp(name, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
             STACK_ARRAY_FINISH(ext_names);
             vk_free2(&instance->vk.alloc, pAllocator, dev);

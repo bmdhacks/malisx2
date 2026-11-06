@@ -27,6 +27,7 @@
 #ifndef MALI_DESCRIPTOR_SET_LAYOUT_H
 #define MALI_DESCRIPTOR_SET_LAYOUT_H
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -65,6 +66,12 @@ mali_desc_type_index(VkDescriptorType type)
 /* Hardware limit is 2^24 per set. */
 #define MALI_MAX_DESCS_PER_SET (1u << 24)
 
+/* Descriptors of one type per set and per shader stage, ordinary and
+ * update-after-bind, as reported on v9 and v11 (panvk's MAX_DESCRIPTORS);
+ * a combined image sampler counts as a sampler and a sampled image, and
+ * takes two slots. v7 has less (mali_physical_device.c). */
+#define MALI_MAX_DESCS_PER_TYPE (1u << 20)
+
 struct mali_descriptor_set_binding_layout {
    VkDescriptorType type;
    VkDescriptorBindingFlags flags;
@@ -91,9 +98,16 @@ struct mali_descriptor_set_layout {
    uint32_t binding_count;      /* highest binding number + 1 */
    struct mali_descriptor_set_binding_layout *bindings;
    /* Descriptors of each type a set of this layout takes from its pool
-    * (mali_desc_type_index). */
+    * (mali_desc_type_index), the variable-count binding at its full size. */
    uint32_t type_counts[MALI_DESC_TYPE_COUNT];
    bool has_immutable_samplers;
+   /* The binding with VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+    * if has_variable_count. It is the layout's last binding, not a dynamic
+    * buffer or an inline uniform block; its desc_count is the largest count
+    * a set may be given, and a set takes only the count it is allocated
+    * with (mali_descriptor_set::variable_count). */
+   bool has_variable_count;
+   uint32_t variable_binding;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_descriptor_set_layout, vk.base,
@@ -136,6 +150,19 @@ mali_desc_index(const struct mali_descriptor_set_binding_layout *b,
                 uint32_t elem, enum mali_subdesc sub)
 {
    return b->desc_idx + elem * mali_desc_stride(b) + mali_subdesc_offset(b, sub);
+}
+
+/* Slots a set of this layout takes when its variable-count binding has
+ * variable_count elements (variable_count is ignored by a layout without
+ * one). */
+static inline uint32_t
+mali_desc_set_slots(const struct mali_descriptor_set_layout *l, uint32_t variable_count)
+{
+   if (!l->has_variable_count)
+      return l->desc_count;
+   const struct mali_descriptor_set_binding_layout *b = &l->bindings[l->variable_binding];
+   assert(variable_count <= b->desc_count);
+   return l->desc_count - (b->desc_count - variable_count) * mali_desc_stride(b);
 }
 
 /* Slot of the layout's first sampler (of its lowest sampler or combined

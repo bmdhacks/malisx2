@@ -132,6 +132,15 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
 
       bl->type = b->descriptorType;
       bl->flags = binding_flags ? binding_flags[i] : 0;
+      /* Only the highest binding may have a variable count (the
+       * specification's rule), and not a dynamic buffer: those have no
+       * slots. An inline uniform block is not offered. */
+      if ((bl->flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) &&
+          i == pCreateInfo->bindingCount - 1 && !vk_descriptor_type_is_dynamic(bl->type) &&
+          bl->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         layout->has_variable_count = true;
+         layout->variable_binding = b->binding;
+      }
       bl->desc_count = b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
                           mali_iub_desc_count(b->descriptorCount) :
                           b->descriptorCount;
@@ -207,15 +216,18 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
    return VK_SUCCESS;
 }
 
-/* The checks of vkCreateDescriptorSetLayout without creating anything. The
- * variable-count query is answered with 0: variable descriptor counts are
- * not supported (descriptorBindingVariableDescriptorCount is false where
- * descriptor indexing is offered, on v7). */
+/* The checks of vkCreateDescriptorSetLayout without creating anything, and
+ * for a binding with a variable descriptor count the most elements it can
+ * have: what is left of a set's slots after the other bindings, over the
+ * slots one element takes. */
 VKAPI_ATTR void VKAPI_CALL
 mali_GetDescriptorSetLayoutSupport(VkDevice _device,
                                    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
                                    VkDescriptorSetLayoutSupport *pSupport)
 {
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags_info =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
    VkDescriptorSetVariableDescriptorCountLayoutSupport *var =
       vk_find_struct(pSupport->pNext, DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT);
    if (var)
@@ -223,33 +235,56 @@ mali_GetDescriptorSetLayoutSupport(VkDevice _device,
 
    pSupport->supported = false;
 
-   uint64_t slots = 0;
-   uint32_t dyn_ubos = 0, dyn_ssbos = 0;
+   uint64_t slots = 0, fixed_slots = 0;
+   uint32_t dyn_ubos = 0, dyn_ssbos = 0, variable_stride = 0;
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *b = &pCreateInfo->pBindings[i];
       if (!type_supported(b->descriptorType))
          return;
+
+      /* A variable count binding with a count of zero is taken as one
+       * element for this query (the specification's rule). */
+      const bool variable =
+         flags_info && i < flags_info->bindingCount &&
+         (flags_info->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) &&
+         !vk_descriptor_type_is_dynamic(b->descriptorType) &&
+         b->descriptorType != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+      const uint32_t count = variable ? MAX2(b->descriptorCount, 1) : b->descriptorCount;
+
+      uint64_t binding_slots = 0;
       switch (b->descriptorType) {
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-         dyn_ubos += b->descriptorCount;
+         dyn_ubos += count;
          break;
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-         dyn_ssbos += b->descriptorCount;
+         dyn_ssbos += count;
          break;
       case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
-         if (b->descriptorCount)
-            slots += mali_iub_desc_count(b->descriptorCount);
+         if (count)
+            binding_slots = mali_iub_desc_count(count);
          break;
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         slots += 2ull * b->descriptorCount;
+         binding_slots = 2ull * count;
          break;
       default:
-         slots += b->descriptorCount;
+         binding_slots = count;
          break;
       }
+      slots += binding_slots;
+      if (variable)
+         variable_stride = b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 2 : 1;
+      else
+         fixed_slots += binding_slots;
    }
 
    pSupport->supported = dyn_ubos <= MALI_MAX_DYNAMIC_UNIFORM_BUFFERS &&
                          dyn_ssbos <= MALI_MAX_DYNAMIC_STORAGE_BUFFERS &&
                          slots <= MALI_MAX_DESCS_PER_SET;
+   /* v7 does not offer a variable descriptor count: its tables are filled
+    * for a layout's whole count. */
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   if (var && pSupport->supported && variable_stride && mali_device_physical(dev)->arch != 7) {
+      var->maxVariableDescriptorCount =
+         MIN2((MALI_MAX_DESCS_PER_SET - fixed_slots) / variable_stride, MALI_MAX_DESCS_PER_TYPE);
+   }
 }

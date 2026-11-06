@@ -5,8 +5,9 @@
 
 /*
  * VkEvent, on every arch. An event is one 32-bit word (in a 16-byte slot)
- * of CPU-uncached device memory, the memory type the application sees as
- * HOST_VISIBLE | HOST_COHERENT. Nonzero means set.
+ * of memory the CPU and GPU see coherently without cache maintenance: CSF
+ * event memory on v11, CPU-uncached device memory on the job manager
+ * (mali_event.c, mali_event_pool_init). Nonzero means set.
  *
  *  - The host resets it with a store (vkResetEvent) and reads it for
  *    vkGetEventStatus. vkSetEvent stores 1 and then tells the kernel, so

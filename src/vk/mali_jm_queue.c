@@ -824,13 +824,32 @@ udata_of(unsigned cmd, unsigned batch)
    return ((uint64_t)(cmd & 0xffff) << 32) | ((uint64_t)(batch & 0xffff) << 16);
 }
 
-/* Extra core_req bits a chain needs: PERMON when it writes system
+/*
+ * Extra core_req bits a chain needs: PERMON when it writes system
  * timestamps (queries, MALISX2_MEASURE), which keeps the GPU's timestamp
  * counter running while the atom is on the GPU, as the blob does for its
- * query chains. */
+ * query chains.
+ *
+ * On v7 every hardware atom asks for it (the debug switch "nopermon"
+ * turns that off). On the Unisoc T618's kernel, hakuX lost the device to
+ * a GPU that stopped making progress and had to be reset, 2 races out of
+ * 2, about a minute in; with hakuX's per-pass timestamps, which put
+ * PERMON on nearly every atom, the same race ran for minutes. While a
+ * PERMON atom runs the kernel keeps the cycle counter, and with it the
+ * GPU's power domains, on, so the GPU does not power its cores and L2
+ * down and up between atoms.
+ */
+#if PAN_ARCH < 9
+static bool permon_always;
+#endif
+
 static inline uint32_t
 chain_req(const struct mali_jm_chain *c)
 {
+#if PAN_ARCH < 9
+   if (permon_always)
+      return KB_JM_REQ_PERMON;
+#endif
    return c->timestamps ? KB_JM_REQ_PERMON : 0;
 }
 
@@ -1232,6 +1251,9 @@ MALI_PER_ARCH(device_init)(struct mali_device *dev)
    mali_kbase_jm_atom_ids_init(&jd->ids);
    jd->free_ids = mali_kbase_jm_atom_ids_free_count(&jd->ids);
    mali_jm_heap_init(jd);
+#if PAN_ARCH < 9
+   permon_always = !mali_debug_flag("nopermon");
+#endif
 
    dev->jm = jd;
    dev->fe = jd;

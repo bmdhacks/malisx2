@@ -43,7 +43,7 @@ static void dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                      const struct mali_desc_state *desc, const void *push, uint32_t push_size,
                      const uint32_t base[3], const uint32_t groups[3],
                      const uint32_t (*textures)[8], unsigned texture_count, bool xfer,
-                     uint64_t indirect);
+                     uint64_t indirect, struct mali_jm_chain *chain);
 
 /* GPU address of the 32-bit field `off` bytes into struct
  * mali_compute_sysvals in a dispatch's FAU block at fau (the used sysval
@@ -103,12 +103,18 @@ dispatch_indirect(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
       push.nwg[i] = fau_sysval_addr(
          cs, fau, offsetof(struct mali_compute_sysvals, num_work_groups) + 4 * i);
 
+   /* The patch job goes onto the chain the copy job is on. Taking the
+    * vtc chain again could close a batch that has just reached its job
+    * limit, which would put the patch and Compute jobs in a different batch
+    * from the copy job they depend on (job indices only mean something
+    * within one chain). A few jobs past the limit are fine, as for the
+    * other emitters that add several jobs per call. */
    const uint16_t before = c->index;
    const uint32_t zero[3] = {0, 0, 0};
-   dispatch(cmd, pc, NULL, &push, sizeof(push), zero, one, NULL, 0, false, 0);
+   dispatch(cmd, pc, NULL, &push, sizeof(push), zero, one, NULL, 0, false, 0, c);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
-   /* The patch job is the chain's newest job, in the same batch. */
+   /* The patch job is the chain's newest job. */
    if (c->index <= before || !c->prev_next) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
       return;
@@ -151,7 +157,7 @@ static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
          const struct mali_desc_state *desc, const void *push, uint32_t push_size,
          const uint32_t base[3], const uint32_t groups[3], const uint32_t (*textures)[8],
-         unsigned texture_count, bool xfer, uint64_t indirect)
+         unsigned texture_count, bool xfer, uint64_t indirect, struct mali_jm_chain *chain)
 {
    if (!cs || !cs->spd[MALI_SPD_MAIN])
       return;
@@ -217,7 +223,8 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
     * block built here has as many words. */
    assert(cs->fau.total_count == DIV_ROUND_UP(cs->info.fau.count, 2));
 
-   struct mali_jm_chain *c = xfer ? mali_jm_cmd_vtc_transfer(cmd) : mali_jm_cmd_vtc(cmd);
+   struct mali_jm_chain *c =
+      chain ? chain : xfer ? mali_jm_cmd_vtc_transfer(cmd) : mali_jm_cmd_vtc(cmd);
    if (!c)
       return;
 
@@ -334,7 +341,7 @@ MALI_PER_ARCH(cmd_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mal
                                    uint32_t push_size, const uint32_t base[3],
                                    const uint32_t groups[3])
 {
-   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, true, 0);
+   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, true, 0, NULL);
 }
 
 void
@@ -343,7 +350,8 @@ MALI_PER_ARCH(cmd_dispatch_meta)(struct mali_cmd_buffer *cmd, const struct mali_
                                  const uint32_t (*textures)[8], unsigned texture_count)
 {
    const uint32_t base[3] = {0, 0, 0};
-   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, true, 0);
+   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, true, 0,
+            NULL);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -356,7 +364,7 @@ MALI_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer, uint32_t baseGroup
    const uint32_t base[3] = {baseGroupX, baseGroupY, baseGroupZ};
    const uint32_t groups[3] = {groupCountX, groupCountY, groupCountZ};
    dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
-            sizeof(cmd->push_constants), base, groups, NULL, 0, false, 0);
+            sizeof(cmd->push_constants), base, groups, NULL, 0, false, 0, NULL);
 }
 
 #if PAN_ARCH < 9
@@ -370,6 +378,6 @@ MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buff
    const uint32_t groups[3] = {1, 1, 1};
    dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
             sizeof(cmd->push_constants), base, groups, NULL, 0, false,
-            vk_buffer_address(buffer, offset));
+            vk_buffer_address(buffer, offset), NULL);
 }
 #endif

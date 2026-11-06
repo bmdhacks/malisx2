@@ -446,6 +446,15 @@ device_extensions_for_arch(uint32_t arch)
       ext.EXT_vertex_input_dynamic_state = true;
       ext.EXT_shader_demote_to_helper_invocation = true;
       ext.EXT_private_data = true;
+
+      /* Descriptor indexing, the part hakuX uses (get_features), offered to
+       * applications only as malisx2's own VK_MALISX2_descriptor_indexing
+       * (mali_vk.h): v7 cannot meet VK_EXT_descriptor_indexing's required
+       * features and update-after-bind limits. Mesa's runtime keys the
+       * descriptor indexing feature structs and SPIR-V capabilities on the
+       * EXT, so it is supported here and hidden from applications
+       * (mali_EnumerateDeviceExtensionProperties, mali_CreateDevice). */
+      ext.EXT_descriptor_indexing = true;
    }
    return ext;
 }
@@ -622,6 +631,18 @@ get_features(struct vk_features *f, uint32_t arch)
       f->extendedDynamicState2LogicOp = false;
       f->extendedDynamicState2PatchControlPoints = false;
       f->vertexInputDynamicState = true;
+   }
+
+   if (arch == 7) {
+      /* VK_MALISX2_descriptor_indexing (device_extensions_for_arch). v7
+       * copies a stage's descriptors from the sets into its tables by a
+       * copy job when the draw runs, so writes after the bind are what it
+       * copies; unwritten descriptors are copied but not read; non-uniform
+       * indices are lowered to loops (mali_shader.c). */
+      f->runtimeDescriptorArray = true;
+      f->descriptorBindingPartiallyBound = true;
+      f->descriptorBindingSampledImageUpdateAfterBind = true;
+      f->shaderSampledImageArrayNonUniformIndexing = true;
    }
 }
 
@@ -944,6 +965,70 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * rendering is single-sampled. */
       props->dynamicRenderingLocalReadDepthStencilAttachments = true;
       props->dynamicRenderingLocalReadMultisampledAttachments = false;
+
+      /* VK_MALISX2_descriptor_indexing (get_features): the limits start as
+       * the ordinary ones; per-stage ones are raised below. A non-uniform
+       * index must be uniform within a fragment quad even for explicit
+       * level of detail, which quadDivergentImplicitLod does not cover
+       * (mali_vk.h). */
+      props->maxUpdateAfterBindDescriptorsInAllPools = UINT32_MAX / 2;
+      props->quadDivergentImplicitLod = false;
+      props->shaderSampledImageArrayNonUniformIndexingNative = false;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = props->maxPerStageDescriptorSamplers;
+      props->maxPerStageDescriptorUpdateAfterBindUniformBuffers =
+         props->maxPerStageDescriptorUniformBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindStorageBuffers =
+         props->maxPerStageDescriptorStorageBuffers;
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages =
+         props->maxPerStageDescriptorSampledImages;
+      props->maxPerStageDescriptorUpdateAfterBindStorageImages =
+         props->maxPerStageDescriptorStorageImages;
+      props->maxPerStageDescriptorUpdateAfterBindInputAttachments =
+         props->maxPerStageDescriptorInputAttachments;
+      props->maxPerStageUpdateAfterBindResources = props->maxPerStageResources;
+      props->maxDescriptorSetUpdateAfterBindSamplers = props->maxDescriptorSetSamplers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffers = props->maxDescriptorSetUniformBuffers;
+      props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic =
+         props->maxDescriptorSetUniformBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffers = props->maxDescriptorSetStorageBuffers;
+      props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic =
+         props->maxDescriptorSetStorageBuffersDynamic;
+      props->maxDescriptorSetUpdateAfterBindSampledImages = props->maxDescriptorSetSampledImages;
+      props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
+      props->maxDescriptorSetUpdateAfterBindInputAttachments =
+         props->maxDescriptorSetInputAttachments;
+
+      /*
+       * VK_MALISX2_descriptor_indexing (get_features). An update-after-bind
+       * limit counts the descriptors of sets with and without the
+       * update-after-bind bit, so none is below its ordinary counterpart:
+       * per set they are the ordinary limits.
+       *
+       * Per stage, a stage whose textures and samplers all come from one
+       * update-after-bind set reads that set as its tables
+       * (mali_nir_lower_descriptors_v7.c direct sets), so a bindless array
+       * costs nothing per draw there. The tables have 16-bit counts, so the
+       * set must have fewer than 65536 slots: up to 16384 images and 1024
+       * samplers (hakuX asks for 3 x 4096 and 256, and then drops its
+       * per-draw sets: about a third of the driver's time per draw on the
+       * Mali-G52).
+       *
+       * The sampled image limit counts uniform texel buffers too, and those
+       * are not read through the Texture table: each takes an entry of the
+       * stage's image table, which storage images and storage texel buffers
+       * share and which holds MALI_V7_MAX_STAGE_IMG_ENTRIES whatever the
+       * limits say. A pipeline whose stage needs more fails to be created
+       * with VK_ERROR_FEATURE_NOT_PRESENT (mali_shader.c v7_fixup_info).
+       */
+      props->maxPerStageDescriptorUpdateAfterBindSampledImages = 16384;
+      props->maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
+      props->maxPerStageUpdateAfterBindResources =
+         props->maxPerStageDescriptorUpdateAfterBindSamplers +
+         props->maxPerStageDescriptorUpdateAfterBindUniformBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindStorageBuffers +
+         props->maxPerStageDescriptorUpdateAfterBindSampledImages +
+         props->maxPerStageDescriptorUpdateAfterBindStorageImages +
+         props->maxPerStageDescriptorUpdateAfterBindInputAttachments;
    }
 
    snprintf(props->deviceName, sizeof(props->deviceName), "%s", name);
@@ -970,6 +1055,38 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
 
 /* ---------------------------------------------------------------------- */
 /* Queries we implement ourselves                                          */
+
+/* Mesa's list, with VK_EXT_descriptor_indexing (supported only for the
+ * runtime, device_extensions_for_arch) shown as malisx2's own
+ * VK_MALISX2_descriptor_indexing (mali_vk.h). */
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                        const char *pLayerName,
+                                        uint32_t *pPropertyCount,
+                                        VkExtensionProperties *pProperties)
+{
+   VK_FROM_HANDLE(mali_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkExtensionProperties, out, pProperties, pPropertyCount);
+
+   for (int i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++) {
+      if (!pdev->vk.supported_extensions.extensions[i])
+         continue;
+#ifdef ANDROID_STRICT
+      if (!vk_android_allowed_device_extensions.extensions[i])
+         continue;
+#endif
+      vk_outarray_append_typed(VkExtensionProperties, &out, prop) {
+         *prop = vk_device_extensions[i];
+         if (!strcmp(prop->extensionName, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+            snprintf(prop->extensionName, sizeof(prop->extensionName), "%s",
+                     VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+            prop->specVersion = VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION;
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
 
 VKAPI_ATTR void VKAPI_CALL
 mali_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,

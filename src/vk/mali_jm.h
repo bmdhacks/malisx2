@@ -222,7 +222,8 @@ struct mali_jm_draw_tmpl {
  * Attributes pointers take, plus the dynamic storage buffer table and the
  * set addresses the stage's system values carry. Built by
  * mali_v7_desc_prepare; the entries that come from the sets are written by
- * a copy job (mali_v7_desc_copy).
+ * mali_v7_desc_copy: on the CPU from the sets' host copies when every set
+ * it reads has one, else by a copy job.
  */
 struct mali_v7_desc_tables {
    /* MALI_V7_DESC_TABLE_*, 0 for a table the shader does not have: 8-byte
@@ -234,6 +235,13 @@ struct mali_v7_desc_tables {
    uint64_t dyn_ssbos;                        /* the dynamic storage buffer table */
    uint64_t sets[MALI_MAX_SETS];              /* the bound sets' memory, 0 when unbound */
    uint32_t set_desc_counts[MALI_MAX_SETS];   /* their slot counts */
+   /* Filling the copied entries on the CPU (mali_v7_desc_copy): the
+    * tables' mappings, the bound sets' host copies (none for a set of an
+    * update-after-bind pool), and whether every set the shader's map
+    * reads has one. */
+   void *tables_cpu[MALI_V7_DESC_TABLE_COUNT];
+   const void *set_host[MALI_MAX_SETS];
+   bool cpu_fill;
    /* The shader the tables were built for (their layout is its own). */
    const struct mali_shader *shader;
    /* The dynamic buffers they were built with, one per entry of the
@@ -657,7 +665,9 @@ bool mali_v7_desc_prepare(struct mali_cmd_buffer *cmd, const struct mali_shader 
  * the same bound sets: the dynamic uniform buffer entries and the dynamic
  * storage buffer table are packed anew and the copied entries kept, so the
  * draw needs no copy job. A bound set cannot change while the command
- * buffer records (no update-after-bind is exposed), and a push set gets
+ * buffer records, except one laid out for update after bind, which is
+ * read when the command buffer executes, by a copy job or as the stage's
+ * own table, so the kept entries see its last write too. A push set gets
  * new memory with every push. *unchanged when the shader's dynamic buffers
  * (addresses with the offsets applied, and ranges) are the same too. False,
  * with *t unchanged, when the tables must be rebuilt
@@ -671,10 +681,12 @@ bool mali_v7_desc_refresh(struct mali_cmd_buffer *cmd, const struct mali_shader 
                           struct mali_v7_desc_tables *t, bool *unchanged);
 
 /*
- * Writes the table entries that come from the sets (the shader's copy map)
- * with a Compute job on chain c, one invocation per entry (panvk_v7
- * meta_get_copy_desc_job). *index: that job's index, the Dependency 1 of
- * the job that reads the tables; 0 when there is nothing to copy.
+ * Writes the table entries that come from the sets (the shader's copy map).
+ * On the CPU, from the sets' host copies, when t->cpu_fill: nothing is
+ * added to the chain. Otherwise with a Compute job on chain c, one
+ * invocation per entry (panvk_v7 meta_get_copy_desc_job). *index: that
+ * job's index, the Dependency 1 of the job that reads the tables; 0 when
+ * there is no job.
  * attrib_buf_idx_offset: the buffer index the image Attribute descriptors
  * start at (twice the vertex binding count for a vertex shader, else 0).
  * False on failure, with the command buffer's error set.

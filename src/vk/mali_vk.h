@@ -372,6 +372,46 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
                                                            uint32_t indexCount,
                                                            uint32_t minIndex, uint32_t maxIndex);
 
+/*
+ * malisx2's own device extension on v7, in place of
+ * VK_EXT_descriptor_indexing (whose required features and 500000
+ * update-after-bind limits v7's 16-bit descriptor tables cannot meet):
+ *
+ * - With it offered, VkPhysicalDeviceDescriptorIndexingFeatures and
+ *   VkPhysicalDeviceDescriptorIndexingProperties may be chained into
+ *   vkGetPhysicalDeviceFeatures2 and vkGetPhysicalDeviceProperties2. They
+ *   report the part v7 has (runtime arrays, partially bound bindings,
+ *   sampled images updated after bind, non-uniform sampled-image indexing)
+ *   and its own update-after-bind limits.
+ * - With it enabled, an application may use those features (in
+ *   VkPhysicalDeviceDescriptorIndexingFeatures at vkCreateDevice too),
+ *   VkDescriptorSetLayoutBindingFlagsCreateInfo, the update-after-bind
+ *   layout and pool flags, and SPV_EXT_descriptor_indexing's capabilities
+ *   for them, as VK_EXT_descriptor_indexing defines them, within those
+ *   limits.
+ * - One deviation: a non-uniform index into a sampled-image or sampler
+ *   array must be the same for the four invocations of each 2x2 fragment
+ *   quad, and dynamically uniform in other stages. v7's texture unit takes
+ *   one index a quad, and the per-invocation loop that makes a non-uniform
+ *   index uniform leaves the inactive invocations' index stale, so a quad
+ *   with two indices reads its first invocation's texture in all four.
+ *   That holds for every operation of the texture unit, texelFetch,
+ *   explicit level of detail and gather included, so it is wider than
+ *   what the reported quadDivergentImplicitLod (false) excuses, which is
+ *   only implicit level of detail. (hakuX indexes per draw, which a quad
+ *   never straddles.)
+ * - A stage can use at most 240 storage images, storage texel buffers and
+ *   uniform texel buffers together (the image table), whatever
+ *   maxPerStageDescriptorUpdateAfterBindSampledImages says of the last
+ *   kind; pipeline creation fails with VK_ERROR_FEATURE_NOT_PRESENT past
+ *   that.
+ *
+ * VK_EXT_descriptor_indexing itself is not offered on v7 and cannot be
+ * enabled (mali_physical_device.c, mali_device.c).
+ */
+#define VK_MALISX2_DESCRIPTOR_INDEXING_EXTENSION_NAME "VK_MALISX2_descriptor_indexing"
+#define VK_MALISX2_DESCRIPTOR_INDEXING_SPEC_VERSION 1
+
 #if defined(PAN_ARCH) && PAN_ARCH == 7
 #include "util/log.h"
 

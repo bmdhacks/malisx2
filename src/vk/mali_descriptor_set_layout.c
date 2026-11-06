@@ -183,9 +183,13 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
    layout->vk.dynamic_descriptor_count = dyn_idx;
 
    /* The hash identifies the layout in pipeline cache keys: everything the
-    * shader lowering reads. */
+    * shader lowering reads. That includes the layout's flags: v7 compiles
+    * a stage that reads a set laid out for update after bind differently
+    * (mali_nir_lower_descriptors_v7.c choose_direct_set), and a shader
+    * built for the one cannot run on the other. */
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &layout->flags, sizeof(layout->flags));
    _mesa_blake3_update(&ctx, &layout->binding_count, sizeof(layout->binding_count));
    _mesa_blake3_update(&ctx, &layout->desc_count, sizeof(layout->desc_count));
    _mesa_blake3_update(&ctx, &layout->dyn_buf_count, sizeof(layout->dyn_buf_count));
@@ -205,7 +209,8 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
 
 /* The checks of vkCreateDescriptorSetLayout without creating anything. The
  * variable-count query is answered with 0: variable descriptor counts are
- * not supported (descriptor indexing is not exposed). */
+ * not supported (descriptorBindingVariableDescriptorCount is false where
+ * descriptor indexing is offered, on v7). */
 VKAPI_ATTR void VKAPI_CALL
 mali_GetDescriptorSetLayoutSupport(VkDevice _device,
                                    const VkDescriptorSetLayoutCreateInfo *pCreateInfo,

@@ -75,6 +75,13 @@ struct mali_descriptor_set {
     * layout without slots (dynamic buffers only, or empty). */
    uint64_t gpu;
    void *cpu;
+   /* The same slots in cached host memory, written along with cpu, for
+    * the CPU to read: v7 builds a draw's descriptor tables from them
+    * (mali_jm_desc_v7.c). Only v7 has it, and only for a set of a pool
+    * that is not update-after-bind; NULL otherwise, and without slots. A
+    * push descriptor set's cpu is already such a copy, and host is the
+    * same pointer. */
+   void *host;
 
    /* Dynamic uniform/storage buffers, by the index the layout gives them
     * (binding desc_idx + array element). */
@@ -95,6 +102,10 @@ struct mali_descriptor_pool {
    struct mali_kbase_bo bo;
    struct util_vma_heap heap;
    uint64_t heap_size;
+   /* The sets' host copies (mali_descriptor_set::host), heap_size bytes
+    * at the same offsets as in bo. NULL on v9 and v11, and for a pool
+    * created with the update-after-bind bit. */
+   uint8_t *host;
 
    /* Descriptors of each type still available (mali_desc_type_index). */
    uint32_t avail[MALI_DESC_TYPE_COUNT];

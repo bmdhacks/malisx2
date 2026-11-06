@@ -65,6 +65,12 @@ struct lower_desc_ctx {
    struct desc_map dyn_ubos;
    struct desc_map dyn_ssbos;
    struct desc_map others[MALI_V7_DESC_TABLE_COUNT];
+   /* The sets the stage's texture and sampler accesses name, and the one
+    * read directly (mali_v7_shader_desc::direct_set; -1 none) with the
+    * slot of its first sampler, for texel fetches that name none. */
+   uint32_t tex_sets;
+   int direct_set;
+   uint32_t direct_sampler_slot;
 };
 
 struct desc_id {
@@ -499,19 +505,37 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
       nir_def *index_ssa;
       get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
 
-      /* One Sampler per element in the per-type table (no planes). */
-      const uint32_t sampler_index =
-         shader_desc_idx(ctx, set, binding, MALI_SUBDESC_SAMPLER) + index_imm;
-      if (index_ssa) {
-         nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset,
-                               nir_iadd_imm(b, index_ssa, sampler_index));
+      if ((int)set == ctx->direct_set) {
+         /* The set is the table, from its first sampler on (choose_direct_set):
+          * the element's slot in it, less that one's. */
+         const struct mali_descriptor_set_binding_layout *bl = binding_layout(ctx, set, binding);
+         const uint32_t slot =
+            mali_desc_index(bl, index_imm, MALI_SUBDESC_SAMPLER) - ctx->direct_sampler_slot;
+         if (index_ssa) {
+            nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset,
+                                  nir_iadd_imm(b, nir_imul_imm(b, index_ssa, mali_desc_stride(bl)),
+                                               slot));
+         } else {
+            tex->sampler_index = slot;
+         }
+         progress = true;
       } else {
-         tex->sampler_index = sampler_index;
+         /* One Sampler per element in the per-type table (no planes). */
+         const uint32_t sampler_index =
+            shader_desc_idx(ctx, set, binding, MALI_SUBDESC_SAMPLER) + index_imm;
+         if (index_ssa) {
+            nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset,
+                                  nir_iadd_imm(b, index_ssa, sampler_index));
+         } else {
+            tex->sampler_index = sampler_index;
+         }
+         progress = true;
       }
-      progress = true;
    }
-   /* A texel fetch names no sampler: index 0, a dummy one the draw or
-    * dispatch provides when the stage has textures but no samplers. */
+   /* A texel fetch names no sampler: index 0 (pan_nir_lower_tex), a dummy
+    * one the draw or dispatch provides when the stage has textures but no
+    * samplers, or in a direct stage the set's first sampler
+    * (mali_descriptor_set.c puts one there before the application does). */
 
    int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    if (tex_src_idx >= 0) {
@@ -521,6 +545,19 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
       uint32_t set, binding, index_imm, max_idx;
       nir_def *index_ssa;
       get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
+
+      if ((int)set == ctx->direct_set) {
+         const struct mali_descriptor_set_binding_layout *bl = binding_layout(ctx, set, binding);
+         const uint32_t slot = mali_desc_index(bl, index_imm, MALI_SUBDESC_TEXTURE);
+         if (index_ssa) {
+            nir_tex_instr_add_src(tex, nir_tex_src_texture_offset,
+                                  nir_iadd_imm(b, nir_imul_imm(b, index_ssa, mali_desc_stride(bl)),
+                                               slot));
+         } else {
+            tex->texture_index = slot;
+         }
+         return true;
+      }
 
       const uint32_t texture_index =
          shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) + index_imm;
@@ -640,8 +677,10 @@ record_binding(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding, enum 
 
    ctx->used_set_mask |= BITFIELD_BIT(set);
 
-   /* Storage buffers are read from the set directly. */
-   if (bl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+   /* Storage buffers are read from the set directly, and so are a direct
+    * set's textures and samplers (lower_tex). */
+   if (bl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+       ((int)set == ctx->direct_set && sub != MALI_SUBDESC_NONE))
       return;
 
    const bool sampler_subdesc = sub == MALI_SUBDESC_SAMPLER;
@@ -714,6 +753,60 @@ collect_desc_access(nir_builder *b, nir_instr *instr, void *data)
    default:
       return false;
    }
+}
+
+/* The sets texture and sampler accesses name (lower_desc_ctx::tex_sets). */
+static bool
+scan_tex_sets(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct lower_desc_ctx *ctx = data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const nir_tex_src_type srcs[2] = {nir_tex_src_sampler_deref, nir_tex_src_texture_deref};
+   for (unsigned i = 0; i < 2; i++) {
+      const int idx = nir_tex_instr_src_index(tex, srcs[i]);
+      if (idx < 0)
+         continue;
+      uint32_t set, binding, index_imm, max_idx;
+      nir_def *index_ssa;
+      get_resource_deref_binding(nir_src_as_deref(tex->src[idx].src), &set, &binding,
+                                 &index_imm, &index_ssa, &max_idx);
+      ctx->tex_sets |= BITFIELD_BIT(set);
+   }
+   return false;
+}
+
+/*
+ * A direct set: the stage's textures and samplers all from one set laid
+ * out for update after bind, which then is the stage's Texture and Sampler
+ * table, indexed by slot (lower_tex; mali_jm_desc_v7.c points the tables at
+ * it). Such a set is a bindless table (hakuX's: three arrays of 4096
+ * images and 256 samplers): copied per draw into tables of the stage's
+ * own, as other sets are, it would be ~400 KB a draw. Its layout already
+ * has one 32-byte slot per Texture or Sampler descriptor, as a table has,
+ * and the counts are 16-bit. Texture and image size queries read the set
+ * as before.
+ */
+static void
+choose_direct_set(struct lower_desc_ctx *ctx)
+{
+   ctx->direct_set = -1;
+   if (!ctx->tex_sets || !util_is_power_of_two_nonzero(ctx->tex_sets))
+      return;
+   const unsigned set = ffs(ctx->tex_sets) - 1;
+   const struct mali_descriptor_set_layout *l = set < MALI_MAX_SETS ? ctx->set_layouts[set] : NULL;
+   if (!l || !(l->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) ||
+       l->desc_count > UINT16_MAX)
+      return;
+   /* The Sampler table starts at the set's first sampler, so that sampler
+    * 0, which texel fetches name, is one: a set without samplers is copied,
+    * and the copy's tables get a dummy sampler (lower_tex). */
+   const int first = mali_desc_set_first_sampler_slot(l);
+   if (first < 0)
+      return;
+   ctx->direct_set = set;
+   ctx->direct_sampler_slot = first;
 }
 
 /* The copy map entries of one binding: count elements, one entry each. */
@@ -803,6 +896,10 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
    v7->map = NULL;
    v7->map_count = 0;
    v7->needs_set_addrs = false;
+   v7->direct_set = -1;
+   v7->direct_slots = 0;
+   v7->direct_sampler_base = 0;
+   v7->copy_set_mask = 0;
 
    ctx.ht = _mesa_hash_table_u64_create(NULL);
 
@@ -810,6 +907,8 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
       if (layout->set_layouts[i])
          ctx.set_layouts[i] = mali_descriptor_set_layout(layout->set_layouts[i]);
    }
+   NIR_PASS(_, nir, nir_shader_instructions_pass, scan_tex_sets, nir_metadata_all, &ctx);
+   choose_direct_set(&ctx);
 
    NIR_PASS(progress, nir, nir_shader_instructions_pass, collect_desc_access,
             nir_metadata_all, &ctx);
@@ -853,6 +952,15 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
    free(table);
 
    v7->needs_set_addrs = ctx.needs_set_addrs;
+   /* The sets the copy map reads. The direct set is among them only when
+    * another table copies from it (its uniform buffers or images). */
+   for (uint32_t i = 0; i < v7->map_count; i++)
+      v7->copy_set_mask |= BITFIELD_BIT(MALI_COPY_DESC_HANDLE_SET(v7->map[i]));
+   if (ok && ctx.direct_set >= 0) {
+      v7->direct_set = ctx.direct_set;
+      v7->direct_slots = ctx.set_layouts[ctx.direct_set]->desc_count;
+      v7->direct_sampler_base = ctx.direct_sampler_slot;
+   }
    _mesa_hash_table_u64_destroy(ctx.ht);
 
    if (ok && nir->constant_data_size)

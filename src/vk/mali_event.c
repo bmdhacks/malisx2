@@ -28,13 +28,32 @@
  * unless it is the last. */
 #define MALI_EVENT_SLAB_SIZE (16u << 10)
 
+/*
+ * The words' memory, by frontend:
+ *
+ *  - command-stream frontend (v11): CSF event memory, as the queue's sync
+ *    objects and the blob's event objects (class 45 "internal"). A stream
+ *    blocked in a SYNC_WAIT on the word is looked at again after
+ *    vkSetEvent's CS_EVENT_SIGNAL only through the kernel's permanent
+ *    mapping of event pages (kbase_phy_alloc_mapping_get finds nothing
+ *    else): on the RG 477V a wait on plain uncached memory stayed blocked
+ *    after the host set it. The kernel makes such memory SAME_VA and
+ *    coherent, uncached on both sides where the system is not coherent;
+ *  - job manager (v7, v9): CPU-uncached device memory. The kernel reads
+ *    and writes the soft-event byte through kbase_vmap_prot, which needs
+ *    only CPU read and write permission; event memory is a CSF flag that a
+ *    job-manager kernel refuses.
+ */
 void
 mali_event_pool_init(struct mali_device *dev)
 {
+   const bool csf = dev->kbase->frontend != MALI_KBASE_FRONTEND_JM;
    mali_bo_pool_init(&dev->event_pool, dev->kbase, "events",
-                     mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
-                     MALI_KBASE_MEM_CLASS_DEVICE_CPU_UNCACHED, MALI_EVENT_SLAB_SIZE,
-                     MALI_EVENT_SLOT_SIZE, false);
+                     mali_kbase_mem_same_va_policy(csf ? MALI_KBASE_FLAGS_INTERNAL_CSF_EVENT
+                                                       : MALI_KBASE_FLAGS_DEVICE_UNCACHED),
+                     csf ? MALI_KBASE_MEM_CLASS_INTERNAL
+                         : MALI_KBASE_MEM_CLASS_DEVICE_CPU_UNCACHED,
+                     MALI_EVENT_SLAB_SIZE, MALI_EVENT_SLOT_SIZE, false);
 }
 
 void

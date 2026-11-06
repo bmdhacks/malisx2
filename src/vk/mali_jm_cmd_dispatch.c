@@ -213,10 +213,9 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    }
    const uint64_t fau =
       mali_compute_fau(cmd, cs, &tables, push, push_size, base, groups) & BITFIELD64_MASK(56);
-   /* An indirect dispatch's count is not known here: size the WLS for
-    * the most instances (mali_compute_tsd caps them per core). */
-   const uint32_t wls_groups[3] = {1024, 1024, 1024};
-   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? wls_groups : groups);
+   /* An indirect dispatch's count is not known here: no groups, which
+    * gives its WLS the most instances the cores hold at once. */
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? NULL : groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !tsd || (cs->fau.total_count && !fau))
       return;
    /* The RSD's preload.uniform_count is the shader's FAU word count; the

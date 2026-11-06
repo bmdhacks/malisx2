@@ -46,7 +46,13 @@
  *    done by compute (mali_jm_cmd_vtc_transfer), not of draws and
  *    dispatches, which are outside its second scope: a "colour output ->
  *    transfer" barrier for a fragment-side image copy then does not close
- *    the batch at the next pass's tiling;
+ *    the batch at the next pass's tiling. On v7 the requirement of an image
+ *    memory barrier (image_barrier_req) is waited for only by the vtc jobs
+ *    that can touch images or memory (transfers, dispatches, draws whose
+ *    vertex shader reads images or writes memory), not by a pass's tiling;
+ *    the pass still starts its own batch where the plain requirement would
+ *    have closed the open one, so its tiling runs while the fragment work
+ *    before it shades;
  *  - fragment after vtc: free inside a batch (its fragment atoms depend on
  *    its vtc atom); a batch without a vtc chain waits for the newest vtc
  *    atom;
@@ -56,7 +62,8 @@
  * What is still owed when the command buffer ends goes to the queue
  * (mali_jm_cmd::end_req), which applies it to the next atoms of later
  * command buffers, as a barrier's second scope requires; a transfer-only
- * requirement there, again only to the next vtc chain with a transfer job.
+ * requirement there, again only to the next vtc chain with a transfer job,
+ * and on v7 an image barrier's to the next one that can touch images.
  */
 
 #include "mali_cmd_state.h"

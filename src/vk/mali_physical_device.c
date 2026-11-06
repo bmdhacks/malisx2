@@ -496,6 +496,26 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
    return arch == 7 || arch == 9 || arch == 11;
 }
 
+/*
+ * Indirect draws with a draw count above 1 and a first instance
+ * (multiDrawIndirect, drawIndirectFirstInstance), and the indirect count
+ * forms (VK_KHR_draw_indirect_count). On the job manager (v7, v9) each
+ * draw of a call is its own jobs behind a patch job that reads its
+ * parameters (mali_jm_idraw_nir.c), so maxDrawCount draws are recorded
+ * for an indirect count call whatever the count turns out to be.
+ */
+static bool
+multi_draw_indirect_for_arch(uint32_t arch)
+{
+   return arch == 7 || arch == 9;
+}
+
+static bool
+draw_indirect_count_for_arch(uint32_t arch)    /* VK_KHR_draw_indirect_count */
+{
+   return arch == 7 || arch == 9;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -505,6 +525,7 @@ device_extensions_for_arch(uint32_t arch)
    ext.KHR_8bit_storage = storage8_for_arch(arch);
    ext.KHR_16bit_storage = storage16_for_arch(arch);
    ext.KHR_shader_float16_int8 = int8_for_arch(arch);
+   ext.KHR_draw_indirect_count = draw_indirect_count_for_arch(arch);
    return ext;
 }
 
@@ -625,8 +646,10 @@ get_features(struct vk_features *f, uint32_t arch)
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
       .logicOp = false,
-      .multiDrawIndirect = false,
-      .drawIndirectFirstInstance = false,
+      .multiDrawIndirect = multi_draw_indirect_for_arch(arch),
+      .drawIndirectFirstInstance = multi_draw_indirect_for_arch(arch),
+      /* Vulkan 1.2's name for VK_KHR_draw_indirect_count. */
+      .drawIndirectCount = draw_indirect_count_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
       /* v7 and v11 (not v9): clip distances are varyings the fragment
@@ -891,7 +914,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .mipmapPrecisionBits = 8,
       .lineSubPixelPrecisionBits = 8,     /* same as panvk on this hardware */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = 1,
+      /* The job manager records every draw of a call as jobs of its own
+       * (multi_draw_indirect_for_arch): the smallest limit Vulkan allows
+       * with multiDrawIndirect, which bounds what one call records. */
+      .maxDrawIndirectCount = multi_draw_indirect_for_arch(pdev->arch) ? UINT16_MAX : 1,
       .maxSamplerLodBias = 126.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,

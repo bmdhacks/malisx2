@@ -8,6 +8,7 @@
  * the blob's values, including the memory types.
  */
 
+#include "mali_image.h"
 #include "mali_queue.h"
 #include "mali_vk.h"
 #include "mali_shader.h"
@@ -478,6 +479,23 @@ dual_src_blend_for_arch(uint32_t arch)
    }
 }
 
+/* textureCompressionBC: every BCn format a sampled image, linearly
+ * filtered and a blit source (Vulkan's required format support). v7 has
+ * that when the GPU has all of BC1-7 (mali_format_table.c); v9 and v11
+ * answer no for every BCn format. */
+static bool
+bc_formats_complete(const struct mali_physical_device *pdev)
+{
+   const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                     VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+   for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
+      if ((mali_format_image_features(pdev, f) & need) != need)
+         return false;
+   }
+   return true;
+}
+
 /*
  * The features we intend to implement for ARMSX2 on this GPU, not the
  * blob's full list. Values that decide ARMSX2's paths follow the blob
@@ -521,7 +539,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
-      .textureCompressionBC = false,
+      .textureCompressionBC = false,  /* bc_formats_complete */
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = false,
       .vertexPipelineStoresAndAtomics = false,
@@ -1095,10 +1113,17 @@ physical_device_create(struct mali_instance *instance, const char *path,
     * as warnings. */
    mesa_logi("malisx2 build %s, driverInfo %s", MALI_GIT_SHA,
             driver_info_for_arch(pdev->arch));
+   /* One bit per compressed texture format the GPU samples (BCn, ETC2,
+    * ASTC; pan_format texfeat_bit), to tell which a device can take. */
+   mesa_logi("malisx2 texture features 0x%08x 0x%08x 0x%08x 0x%08x (raw 0x%08x)",
+            pdev->props.texture_features[0], pdev->props.texture_features[1],
+            pdev->props.texture_features[2], pdev->props.texture_features[3],
+            pdev->props.raw_texture_features[0]);
 
    struct vk_features features;
    struct vk_properties props;
    get_features(&features, pdev->arch);
+   features.textureCompressionBC = bc_formats_complete(pdev);
    get_properties(pdev, name, &props);
 
    const struct vk_device_extension_table extensions =

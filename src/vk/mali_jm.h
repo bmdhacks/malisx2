@@ -982,15 +982,6 @@ struct mali_jm_device {
    struct mali_shader *v7_desc_copy;
    /* The uniform buffer word copy shader (mali_v7_ubo_copy), the same way. */
    struct mali_shader *v7_ubo_copy;
-   /* In-pass by-region barriers between attachment writes and input
-    * attachment reads draw nothing: the tile-buffer reads are pixel
-    * ordered (mali_jm_cmd_buffer.c tile_ordered_barrier). Off with the
-    * debug switch "fbbarrier". */
-   bool v7_tile_ordered_fb_barrier;
-   /* Image-only barriers order only the vtc jobs that can touch images
-    * (MALI_JM_IMAGE_BARRIER_NARROW, mali_jm_cmd_buffer.c); off with the
-    * debug switch "vtcwait". */
-   bool v7_image_barrier_narrow;
    /* How many of mali_device::free_slabs are 1 MiB slabs for large blocks
     * (mali_jm_cmd_buffer.c); under mali_device::slab_lock. */
    unsigned free_big_slabs;
@@ -1006,17 +997,6 @@ struct mali_jm_device {
       uint64_t atoms, job_submits, events, joins, partial_flushes, number_waits;
       uint64_t fence_waits, fence_triggers, fence_wait_errors;
    } stats;
-};
-
-/* Why a vtc atom waits for the fragment slot (mali_jm_queue::why). */
-enum mali_jm_why {
-   MALI_JM_WHY_BARRIER,      /* a barrier: every earlier fragment atom */
-   MALI_JM_WHY_XFER,         /* a barrier: the fragment-side transfers */
-   MALI_JM_WHY_BATCH,        /* a barrier: an earlier batch of the buffer */
-   MALI_JM_WHY_HEAP,         /* the tiler heap slot's last reader */
-   MALI_JM_WHY_XVTC,         /* a transfer-only requirement */
-   MALI_JM_WHY_WAIT,         /* a semaphore wait */
-   MALI_JM_WHY_COUNT,
 };
 
 struct mali_jm_queue {
@@ -1048,13 +1028,6 @@ struct mali_jm_queue {
     * (MALI_JM_REQ_XVTC_BUF): copies into fresh images wait for it too. */
    bool xvtc_buf;
 #endif
-   /* Debug switch vtcwhy: per reason, the vtc atoms whose dependency on
-    * the fragment slot named an atom still running (build_submit), logged
-    * about once a second. */
-   bool why_on;
-   uint32_t why[MALI_JM_WHY_COUNT];
-   uint32_t why_vtc;
-   int64_t why_since;
 };
 
 VkResult MALI_PER_ARCH(device_init)(struct mali_device *dev);

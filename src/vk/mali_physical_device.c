@@ -414,6 +414,32 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_dynamic_rendering = true,
    .KHR_depth_stencil_resolve = true,
    .KHR_create_renderpass2 = true,
+
+   /* What Vulkan 1.3 made core, on every arch. The device stays 1.1: 1.2
+    * and 1.3 also require host query reset, buffer device address,
+    * maintenance4, inline uniform blocks and subgroup size control, which
+    * no arch has.
+    *
+    *  - synchronization2: the driver's barrier, submit and timestamp
+    *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
+    *    around them), so the 64-bit stage and access masks reach the same
+    *    code. The event commands exist on v11 only; the job-manager archs
+    *    (v7, v9) have no VkEvent (vkCreateEvent fails), so no event
+    *    command can be reached there;
+    *  - extended dynamic state 1 and 2 and vertex input dynamic state: the
+    *    runtime keeps the state, and a pipeline that leaves any of it
+    *    dynamic has its hardware words packed again at the draw from the
+    *    command buffer's state (mali_cmd_state.h mali_gfx_update_dirty).
+    *    Rasterizer discard drops the draw. No logic op and no patch control
+    *    points (no logicOp, no tessellation);
+    *  - demote to helper invocation: every back end's discard is a demote;
+    *  - private data: the runtime's, on every object. */
+   .KHR_synchronization2 = true,
+   .EXT_extended_dynamic_state = true,
+   .EXT_extended_dynamic_state2 = true,
+   .EXT_vertex_input_dynamic_state = true,
+   .EXT_shader_demote_to_helper_invocation = true,
+   .EXT_private_data = true,
 };
 
 /*
@@ -443,22 +469,6 @@ device_extensions_for_arch(uint32_t arch)
        * (mali_jm_cmd_buffer.c), and an output location blends into the
        * attachment it feeds (mali_shader.c lower_sysvals). */
       ext.KHR_dynamic_rendering_local_read = true;
-      /* What v7 has of what Vulkan 1.3 made core: synchronization2 (the
-       * driver's barrier and submit are the 2 forms; the runtime has the
-       * 1.0 ones), the dynamic states of VK_EXT_extended_dynamic_state
-       * and _2 and vertex input dynamic state (pipelines with dynamic
-       * state repack their words at the draw, mali_cmd_state.h
-       * mali_gfx_update_dirty), private data (runtime) and demote to
-       * helper invocation (Mesa's Bifrost backend). The device stays 1.1:
-       * 1.2 and 1.3 also require host query reset, buffer device address,
-       * maintenance4, inline uniform blocks and subgroup size control,
-       * which v7 does not have. */
-      ext.KHR_synchronization2 = true;
-      ext.EXT_extended_dynamic_state = true;
-      ext.EXT_extended_dynamic_state2 = true;
-      ext.EXT_vertex_input_dynamic_state = true;
-      ext.EXT_shader_demote_to_helper_invocation = true;
-      ext.EXT_private_data = true;
 
       /* Descriptor indexing, the part hakuX uses (get_features), offered to
        * applications only as malisx2's own VK_MALISX2_descriptor_indexing
@@ -644,26 +654,24 @@ get_features(struct vk_features *f, uint32_t arch)
        * whose only rendering path on a 1.1 device is vkCmdBeginRendering
        * and which requires all three names. */
       .dynamicRendering = true,
+
+      /* The extensions of mali_device_extensions that Vulkan 1.3 made
+       * core. Extended dynamic state 2 reports neither of its two optional
+       * parts. */
+      .synchronization2 = true,
+      .privateData = true,
+      .shaderDemoteToHelperInvocation = true,
+      .extendedDynamicState = true,
+      .extendedDynamicState2 = true,
+      .extendedDynamicState2LogicOp = false,
+      .extendedDynamicState2PatchControlPoints = false,
+      .vertexInputDynamicState = true,
    };
 
    /* The extensions of device_extensions_for_arch on v7. */
    if (arch == 7) {
       f->dynamicRenderingLocalRead = true;
-      f->synchronization2 = true;
-      f->privateData = true;
-      f->shaderDemoteToHelperInvocation = true;
-      /* VK_EXT_extended_dynamic_state, _2 and vertex input dynamic
-       * state: the runtime keeps the state; a pipeline with dynamic
-       * state repacks its words from it at the draw. No logic op and no
-       * patch control points (no logicOp, no tessellation). */
-      f->extendedDynamicState = true;
-      f->extendedDynamicState2 = true;
-      f->extendedDynamicState2LogicOp = false;
-      f->extendedDynamicState2PatchControlPoints = false;
-      f->vertexInputDynamicState = true;
-   }
 
-   if (arch == 7) {
       /* VK_MALISX2_descriptor_indexing (device_extensions_for_arch). v7
        * copies a stage's descriptors from the sets into its tables by a
        * copy job when the draw runs, so writes after the bind are what it

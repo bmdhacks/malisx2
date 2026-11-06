@@ -781,12 +781,19 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       const struct vk_vertex_binding_state *b = &vi->bindings[a->binding];
       const bool per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
       const uint64_t addr = d->vb[a->binding].addr;
+      /* The attribute unit adds the draw's Offset start to the element of
+       * a divided buffer as it does to a per-vertex one (Mesa's gallium
+       * driver, pan_cmdstream.c), so a per-instance attribute read through
+       * a divisor starts that many elements early. Only an instanced draw
+       * divides (emit_attrib_buf); one instance reads with stride 0. */
+      int64_t first = per_instance ? (int64_t)di->first_instance : 0;
+      if (per_instance && di->instance_count > 1 && b->divisor)
+         first -= dd->raw_vertex_offset;
       pan_pack(&adescs[i], ATTRIBUTE, cfg) {
          cfg.buffer_index = a->binding * 2;
          cfg.offset_enable = true;
          cfg.format = GENX(pan_format_from_pipe_format)(vk_format_to_pipe_format(a->format))->hw;
-         cfg.offset = a->offset + (addr & 63) +
-                      (per_instance ? (uint64_t)di->first_instance * strides[a->binding] : 0);
+         cfg.offset = (int64_t)a->offset + (int64_t)(addr & 63) + first * strides[a->binding];
       }
       /* An indirect draw's per-instance offsets: base + firstInstance x
        * stride, by the patch job (di->first_instance is 0 here). */

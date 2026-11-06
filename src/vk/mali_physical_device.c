@@ -470,15 +470,30 @@ static const struct vk_device_extension_table mali_device_extensions = {
 
 /*
  * 8- and 16-bit storage buffer and push constant access, and 8-bit integer
- * arithmetic, as panvk reports them. v7 only: its shaders go through Mesa's
- * Bifrost backend, which lowers narrow loads and stores itself
- * (bifrost_nir.c, nir_lower_mem_access_bit_sizes); kraid (v9, v11) is not
- * checked for them yet. parallel-RDP (N64) requires the storage features.
+ * arithmetic, as panvk reports them. v7's shaders go through Mesa's Bifrost
+ * backend, which lowers narrow loads and stores itself (bifrost_nir.c,
+ * nir_lower_mem_access_bit_sizes); kraid (v9, v11) loads and stores bytes
+ * and half words directly (8- and 16-bit OpLoad and OpStore) and has the
+ * narrow integer ALU. parallel-RDP (N64) requires the storage features.
+ * One predicate per extension, so that a part that fails on a device can be
+ * turned off alone.
  */
 static bool
-small_storage_for_arch(uint32_t arch)
+storage8_for_arch(uint32_t arch)      /* VK_KHR_8bit_storage */
 {
-   return arch == 7;
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+static bool
+storage16_for_arch(uint32_t arch)     /* VK_KHR_16bit_storage */
+{
+   return arch == 7 || arch == 9 || arch == 11;
+}
+
+static bool
+int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int8 */
+{
+   return arch == 7 || arch == 9 || arch == 11;
 }
 
 static struct vk_device_extension_table
@@ -486,12 +501,10 @@ device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
 
-   /* 8- and 16-bit storage (see small_storage_for_arch). */
-   if (small_storage_for_arch(arch)) {
-      ext.KHR_8bit_storage = true;
-      ext.KHR_16bit_storage = true;
-      ext.KHR_shader_float16_int8 = true;
-   }
+   /* 8- and 16-bit storage and int8 (see storage8_for_arch). */
+   ext.KHR_8bit_storage = storage8_for_arch(arch);
+   ext.KHR_16bit_storage = storage16_for_arch(arch);
+   ext.KHR_shader_float16_int8 = int8_for_arch(arch);
    return ext;
 }
 
@@ -525,9 +538,9 @@ dual_src_blend_for_arch(uint32_t arch)
 }
 
 /* textureCompressionBC: every BCn format a sampled image, linearly
- * filtered and a blit source (Vulkan's required format support). v7 has
- * that when the GPU has all of BC1-7 (mali_format_table.c); v9 and v11
- * answer no for every BCn format. */
+ * filtered and a blit source (Vulkan's required format support). v7 and v9
+ * have that when the GPU has all of BC1-7 (mali_format_table.c); v11
+ * answers no for every BCn format. */
 static bool
 bc_formats_complete(const struct mali_physical_device *pdev)
 {
@@ -652,14 +665,15 @@ get_features(struct vk_features *f, uint32_t arch)
       .shaderInt16 = true,
 
       /* VK_KHR_8bit_storage, VK_KHR_16bit_storage and the int8 half of
-       * VK_KHR_shader_float16_int8 (small_storage_for_arch). */
-      .storageBuffer8BitAccess = small_storage_for_arch(arch),
-      .uniformAndStorageBuffer8BitAccess = small_storage_for_arch(arch),
-      .storagePushConstant8 = small_storage_for_arch(arch),
-      .storageBuffer16BitAccess = small_storage_for_arch(arch),
-      .uniformAndStorageBuffer16BitAccess = small_storage_for_arch(arch),
-      .storagePushConstant16 = small_storage_for_arch(arch),
-      .shaderInt8 = small_storage_for_arch(arch),
+       * VK_KHR_shader_float16_int8 (storage8_for_arch and the two after
+       * it). */
+      .storageBuffer8BitAccess = storage8_for_arch(arch),
+      .uniformAndStorageBuffer8BitAccess = storage8_for_arch(arch),
+      .storagePushConstant8 = storage8_for_arch(arch),
+      .storageBuffer16BitAccess = storage16_for_arch(arch),
+      .uniformAndStorageBuffer16BitAccess = storage16_for_arch(arch),
+      .storagePushConstant16 = storage16_for_arch(arch),
+      .shaderInt8 = int8_for_arch(arch),
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,

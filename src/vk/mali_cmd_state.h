@@ -121,7 +121,11 @@ mali_thread_props(const struct mali_device *dev)
 
 #if PAN_ARCH >= 9
 /* panvk calculate_task_axis_and_increment: spread workgroups evenly over
- * the cores, with tasks small enough that other clients can share them. */
+ * the cores, with tasks small enough that other clients can share them.
+ * groups NULL is an indirect dispatch, whose count is not known when the
+ * job is built: axis X and the largest increment the threads allow, which
+ * the hardware clamps to the count along the axis (panvk's indirect
+ * dispatch does the same). */
 static inline void
 mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_shader *cs,
                        const uint32_t groups[3], unsigned *axis, unsigned *inc)
@@ -131,15 +135,22 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
       MIN3(tp->max_threads_per_wg, tp->max_threads_per_core, tp->registers_per_core / regs);
    const unsigned threads_per_wg =
       cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2];
-   const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
+   const unsigned threads_per_task = DIV_ROUND_UP(max_threads, tp->max_tasks_per_core);
 
    *axis = MALI_TASK_AXIS_X;
    *inc = 1;
-   if (!total || !threads_per_wg)
+   if (!threads_per_wg)
+      return;
+   if (!groups) {
+      *inc = MAX2(threads_per_task / threads_per_wg, 1);
+      return;
+   }
+
+   const uint64_t total = (uint64_t)groups[0] * groups[1] * groups[2];
+   if (!total)
       return;
 
    const unsigned wgs_per_core = (unsigned)MIN2(DIV_ROUND_UP(total, tp->core_count), UINT32_MAX);
-   const unsigned threads_per_task = DIV_ROUND_UP(max_threads, tp->max_tasks_per_core);
    unsigned wgs_per_task = CLAMP(threads_per_task / threads_per_wg, 1, wgs_per_core);
 
    *inc = wgs_per_task;
@@ -227,6 +238,22 @@ mali_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    for (unsigned i = 0; i < cs->fau.total_count; i++)
       out[i] = tmp[i];
    return p.gpu | ((uint64_t)cs->fau.total_count << 56);
+}
+
+/* Byte offset in a dispatch's FAU block (mali_compute_fau) of the 32-bit
+ * field `off` bytes into struct mali_compute_sysvals, -1 if the shader does
+ * not read that field's word. The used sysval words come first, in order, so
+ * a word's place is the number of used words before it. */
+static inline int
+mali_compute_fau_sysval_offset(const struct mali_shader *cs, unsigned off)
+{
+   const unsigned w = off / MALI_FAU_WORD_SIZE;
+   if (w >= MALI_MAX_SYSVAL_FAUS || !BITSET_TEST(cs->fau.used_sysvals, w))
+      return -1;
+   unsigned rank = 0;
+   for (unsigned i = 0; i < w; i++)
+      rank += BITSET_TEST(cs->fau.used_sysvals, i);
+   return rank * MALI_FAU_WORD_SIZE + off % MALI_FAU_WORD_SIZE;
 }
 
 #if PAN_ARCH >= 9

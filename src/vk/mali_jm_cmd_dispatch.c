@@ -28,6 +28,17 @@
  * Environment: its Draw section points at the shader's Renderer State
  * Descriptor and at descriptor tables built for each dispatch
  * (mali_jm_desc_v7.c; the v7 half of dispatch below).
+ *
+ * vkCmdDispatchIndirect (v7 and v9): the job manager cannot read a count
+ * from memory, so the dispatch's Compute job is written in two steps. A
+ * patch job, a Compute job running an internal shader
+ * (MALI_META_INDIRECT_DISPATCH, mali_cmd_copy.c), reads the
+ * VkDispatchIndirectCommand and writes the counts into the Compute job and
+ * into the FAU words the shader reads as num_work_groups; it also turns
+ * the Compute job into a Null job when a count is 0. The Compute job goes
+ * in behind it as a Not Started job that depends on it, and the patch job
+ * has Suppress Prefetch set so the job manager reads the Compute job only
+ * after the patch wrote it.
  */
 
 #include "mali_cmd_state.h"
@@ -38,7 +49,6 @@
 #include "mali_rsd_v7.h"
 #endif
 
-#if PAN_ARCH < 9
 static void dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                      const struct mali_desc_state *desc, const void *push, uint32_t push_size,
                      const uint32_t base[3], const uint32_t groups[3],
@@ -46,20 +56,27 @@ static void dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                      uint64_t indirect, struct mali_jm_chain *chain);
 
 /* GPU address of the 32-bit field `off` bytes into struct
- * mali_compute_sysvals in a dispatch's FAU block at fau (the used sysval
- * words first, in order: mali_compute_fau), 0 if the shader reads none. */
+ * mali_compute_sysvals in a dispatch's FAU block at fau (the address
+ * alone), 0 if the shader reads none. */
 static uint64_t
 fau_sysval_addr(const struct mali_shader *cs, uint64_t fau, unsigned off)
 {
-   const unsigned w = off / MALI_FAU_WORD_SIZE;
-   if (!fau || w >= MALI_MAX_SYSVAL_FAUS || !BITSET_TEST(cs->fau.used_sysvals, w))
-      return 0;
-   unsigned rank = 0;
-   for (unsigned i = 0; i < w; i++)
-      rank += BITSET_TEST(cs->fau.used_sysvals, i);
-   return fau + rank * MALI_FAU_WORD_SIZE + off % MALI_FAU_WORD_SIZE;
+   const int o = fau ? mali_compute_fau_sysval_offset(cs, off) : -1;
+   return o < 0 ? 0 : fau + o;
 }
 
+/* Job Header word 4 has Suppress Prefetch at bit 11 (v7 and v9): the job
+ * manager does not read the next job's descriptor until this job is done. */
+static void
+suppress_prefetch(void *job)
+{
+   uint32_t w;
+   memcpy(&w, (uint8_t *)job + 16, sizeof(w));
+   w |= 1u << 11;
+   memcpy((uint8_t *)job + 16, &w, sizeof(w));
+}
+
+#if PAN_ARCH < 9
 /*
  * The jobs of a v7 vkCmdDispatchIndirect, as panvk_v7's cmd_dispatch:
  * the dispatch's Compute job is allocated first and given to a patch job
@@ -121,11 +138,9 @@ dispatch_indirect(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
    }
    const uint16_t patch_index = c->index;
    uint8_t *patch_hdr = (uint8_t *)c->prev_next - 24;
-   uint32_t w;
-   memcpy(&w, patch_hdr + 16, sizeof(w));
-   w |= 1u << 11; /* Suppress Prefetch */
-   memcpy(patch_hdr + 16, &w, sizeof(w));
+   suppress_prefetch(patch_hdr);
    if (copy_dep) {
+      uint32_t w;
       memcpy(&w, patch_hdr + 20, sizeof(w));
       if (!(w & 0xffff)) {
          w |= copy_dep; /* Dependency 1 */
@@ -151,6 +166,82 @@ dispatch_indirect(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
       return;
    cmd->dispatches++;
 }
+#else
+/* The Compute payload of a v9 dispatch of `groups` workgroups of cs
+ * (the job's header is the chain's). fau is the FAU word, address and word
+ * count. */
+static void
+pack_compute_payload(struct mali_ptr job, const struct mali_shader *cs, uint64_t srt,
+                     uint64_t fau, uint64_t tsd, const uint32_t groups[3], unsigned axis,
+                     unsigned inc)
+{
+   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
+      cfg.workgroup_size_x = cs->cs.local_size[0];
+      cfg.workgroup_size_y = cs->cs.local_size[1];
+      cfg.workgroup_size_z = cs->cs.local_size[2];
+      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
+      /* 14 bits; the builder's increment is a few workgroups per task. */
+      cfg.task_increment = MIN2(inc, (1u << 14) - 1);
+      cfg.task_axis = axis;
+      cfg.workgroup_count_x = groups[0];
+      cfg.workgroup_count_y = groups[1];
+      cfg.workgroup_count_z = groups[2];
+      cfg.compute.resources = srt;
+      cfg.compute.shader = cs->spd[MALI_SPD_MAIN];
+      cfg.compute.thread_storage = tsd;
+      cfg.compute.fau = fau & BITFIELD64_MASK(56);
+      cfg.compute.fau_count = fau >> 56;
+   }
+}
+
+/*
+ * The patch job of a v9 vkCmdDispatchIndirect, ahead of the Compute job at
+ * `job` (see the file comment): one invocation of the internal shader
+ * MALI_META_INDIRECT_DISPATCH, given the buffer address, the job's address,
+ * where the three workgroup counts are in its payload and where the shader
+ * keeps num_work_groups in its FAU block (fau, the address alone). Sets
+ * *index to the patch job's index, which the Compute job depends on. False
+ * on failure, with the error set on the command buffer.
+ */
+static bool
+add_patch_job(struct mali_cmd_buffer *cmd, struct mali_jm_chain *c,
+              const struct mali_shader *cs, uint64_t fau, uint64_t indirect,
+              struct mali_ptr job, uint16_t *index)
+{
+   const struct mali_shader *pc =
+      MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_INDIRECT_DISPATCH);
+   if (!pc)
+      return false;
+
+   struct mali_meta_indirect_push push = {
+      .cmd = indirect,
+      .job = job.gpu,
+      .inv = job.gpu + pan_section_offset(COMPUTE_JOB, PAYLOAD) + 2 * sizeof(uint32_t),
+   };
+   for (unsigned i = 0; i < 3; i++)
+      push.nwg[i] = fau_sysval_addr(
+         cs, fau, offsetof(struct mali_compute_sysvals, num_work_groups) + 4 * i);
+
+   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+   const uint32_t zero[3] = {0, 0, 0}, one[3] = {1, 1, 1};
+   const uint64_t pfau = mali_compute_fau(cmd, pc, &push, sizeof(push), zero, one);
+   const uint64_t psrt = mali_compute_res_table(cmd, pc, NULL, NULL, 0);
+   const uint64_t ptsd = mali_compute_tsd(cmd, pc, &tp, one);
+   if (vk_command_buffer_has_error(&cmd->vk) || !psrt || !ptsd ||
+       (pc->fau.total_count && !pfau))
+      return false;
+   unsigned axis, inc;
+   mali_compute_task_axis(&tp, pc, one, &axis, &inc);
+
+   struct mali_ptr patch =
+      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, 0);
+   if (!patch.cpu)
+      return false;
+   pack_compute_payload(patch, pc, psrt, pfau, ptsd, one, axis, inc);
+   suppress_prefetch(patch.cpu);
+   *index = c->index;
+   return true;
+}
 #endif
 
 static void
@@ -161,7 +252,9 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
 {
    if (!cs || !cs->spd[MALI_SPD_MAIN])
       return;
-   if (!groups[0] || !groups[1] || !groups[2])
+   /* An indirect dispatch's groups are {1, 1, 1}: its counts are patched in
+    * on the GPU, and a count of 0 there makes the job a Null job. */
+   if (!indirect && (!groups[0] || !groups[1] || !groups[2]))
       return;
 
 #if PAN_ARCH < 9
@@ -279,17 +372,31 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
 
    const uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
    const uint64_t srt = mali_compute_res_table(cmd, cs, desc, textures, texture_count);
-   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   /* An indirect dispatch's count is not known here: no groups, which
+    * gives its WLS the most instances the cores hold at once, and task
+    * axis X. */
+   const uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? NULL : groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !srt || !tsd ||
        (cs->fau.total_count && !fau))
       return;
 
    unsigned axis, inc;
-   mali_compute_task_axis(&tp, cs, groups, &axis, &inc);
+   mali_compute_task_axis(&tp, cs, indirect ? NULL : groups, &axis, &inc);
 
-   struct mali_jm_chain *c = xfer ? mali_jm_cmd_vtc_transfer(cmd) : mali_jm_cmd_vtc(cmd);
+   struct mali_jm_chain *c =
+      chain ? chain : xfer ? mali_jm_cmd_vtc_transfer(cmd) : mali_jm_cmd_vtc(cmd);
    if (!c)
       return;
+
+   /* An indirect dispatch's Compute job is allocated first: the patch job
+    * that goes in ahead of it needs its address. */
+   struct mali_ptr job = {0};
+   uint16_t patch_index = 0;
+   if (indirect) {
+      job = mali_cmd_alloc(cmd, pan_size(COMPUTE_JOB), 128);
+      if (!job.cpu || !add_patch_job(cmd, c, cs, fau & BITFIELD64_MASK(56), indirect, job, &patch_index))
+         return;
+   }
 
    /* Timing. */
    uint32_t mh = 0;
@@ -298,35 +405,28 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                                  cmd->dispatches);
       uint64_t key;
       memcpy(&key, cs->key, sizeof(key));
-      mali_jm_measure_info(cmd, mh, groups[0], groups[1], groups[2],
-                          cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2]);
+      /* The counts of an indirect dispatch are in the buffer, not known
+       * here. */
+      mali_jm_measure_info(cmd, mh, indirect ? 0 : groups[0], indirect ? 0 : groups[1],
+                           indirect ? 0 : groups[2],
+                           cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2]);
       mali_jm_measure_shader(cmd, mh, key);
    }
 
-   struct mali_ptr job =
-      mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, 0);
+   if (!indirect)
+      job = mali_jm_cmd_add_job(cmd, c, MALI_JOB_TYPE_COMPUTE, pan_size(COMPUTE_JOB), false, 0);
    if (!job.cpu) {
       if (unlikely(mh))
          mali_jm_measure_end(cmd, mh, c);
       return;
    }
 
-   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
-      cfg.workgroup_size_x = cs->cs.local_size[0];
-      cfg.workgroup_size_y = cs->cs.local_size[1];
-      cfg.workgroup_size_z = cs->cs.local_size[2];
-      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
-      /* 14 bits; the builder's increment is a few workgroups per task. */
-      cfg.task_increment = MIN2(inc, (1u << 14) - 1);
-      cfg.task_axis = axis;
-      cfg.workgroup_count_x = groups[0];
-      cfg.workgroup_count_y = groups[1];
-      cfg.workgroup_count_z = groups[2];
-      cfg.compute.resources = srt;
-      cfg.compute.shader = cs->spd[MALI_SPD_MAIN];
-      cfg.compute.thread_storage = tsd;
-      cfg.compute.fau = fau & BITFIELD64_MASK(56);
-      cfg.compute.fau_count = fau >> 56;
+   pack_compute_payload(job, cs, srt, fau, tsd, groups, axis, inc);
+   if (indirect &&
+       !mali_jm_cmd_add_job_at(cmd, c, job, MALI_JOB_TYPE_NOT_STARTED, false, patch_index)) {
+      if (unlikely(mh))
+         mali_jm_measure_end(cmd, mh, c);
+      return;
    }
    cmd->dispatches++;
    if (unlikely(mh))
@@ -366,7 +466,6 @@ MALI_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer, uint32_t baseGroup
             sizeof(cmd->push_constants), base, groups, NULL, 0, false, 0, NULL);
 }
 
-#if PAN_ARCH < 9
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                                    VkDeviceSize offset)
@@ -379,4 +478,3 @@ MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buff
             sizeof(cmd->push_constants), base, groups, NULL, 0, false,
             vk_buffer_address(buffer, offset), NULL);
 }
-#endif

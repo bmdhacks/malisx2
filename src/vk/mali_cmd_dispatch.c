@@ -27,6 +27,15 @@
  * The iterator scoreboard entry moves on before each RUN_COMPUTE
  * (cs_iter_sb_update on v11: NEXT_SB_ENTRY), so consecutive dispatches can
  * overlap; barriers and the end of the command buffer wait for them.
+ *
+ * vkCmdDispatchIndirect loads the three counts from the buffer into the
+ * JOB_SIZE registers, stores them into the FAU words the shader reads as
+ * num_work_groups (panvk csf cmd_dispatch_shader), and runs the job with
+ * task axis X: RUN_COMPUTE_INDIRECT has been seen to hang the GPU, and a
+ * task increment larger than the count along the axis is clamped by the
+ * hardware. A count of 0 is not given to the hardware: the stream branches
+ * over RUN_COMPUTE when any of the three is 0, as Vulkan says such a
+ * dispatch does nothing.
  */
 
 #include "mali_cmd_state.h"
@@ -34,6 +43,7 @@
 
 #include "mali_arch.h"
 #include "mali_queue.h"
+#include "vk_buffer.h"
 
 #define COMPUTE_SRT MALI_COMPUTE_SR_SRT_0
 #define COMPUTE_FAU MALI_COMPUTE_SR_FAU_0
@@ -63,28 +73,32 @@ next_iter_sb(struct mali_cmd_buffer *cmd, struct cs_builder *b)
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
 }
 
+/* indirect: GPU address of a VkDispatchIndirectCommand, 0 for a direct
+ * dispatch of `groups`. The groups of an indirect dispatch are given as
+ * {1, 1, 1} here, where they only fill the FAU words the stream overwrites
+ * with the real counts. */
 static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
          const struct mali_desc_state *desc, const void *push, uint32_t push_size,
          const uint32_t base[3], const uint32_t groups[3], const uint32_t (*textures)[8],
-         unsigned texture_count)
+         unsigned texture_count, uint64_t indirect)
 {
    if (!cs || !cs->spd[MALI_SPD_MAIN])
       return;
-   if (!groups[0] || !groups[1] || !groups[2])
+   if (!indirect && (!groups[0] || !groups[1] || !groups[2]))
       return;
 
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
    uint64_t srt = mali_compute_res_table(cmd, cs, desc, textures, texture_count);
-   uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? NULL : groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !srt || !tsd ||
        (cs->fau.total_count && !fau))
       return;
 
    unsigned axis, inc;
-   mali_compute_task_axis(&tp, cs, groups, &axis, &inc);
+   mali_compute_task_axis(&tp, cs, indirect ? NULL : groups, &axis, &inc);
 
    struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_COMPUTE);
 
@@ -108,9 +122,33 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_X), 0);
    cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
    cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
-   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), groups[0]);
-   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), groups[1]);
-   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), groups[2]);
+   if (indirect) {
+      /* The counts, into the staging registers and into the FAU words
+       * the shader reads. The stores are waited for before the job
+       * starts (cs_flush_stores); the FAU block is this dispatch's own,
+       * so a command buffer submitted again stores the counts again. */
+      const struct cs_index addr = mali_cs_scratch_reg64(b, 0);
+      cs_move64_to(b, addr, indirect);
+      cs_load_to(b, cs_sr_reg_tuple(b, COMPUTE, JOB_SIZE_X, 3), addr, BITFIELD_MASK(3), 0);
+      bool stores = false;
+      for (unsigned i = 0; i < 3; i++) {
+         const int off = mali_compute_fau_sysval_offset(
+            cs, offsetof(struct mali_compute_sysvals, num_work_groups) + 4 * i);
+         if (off < 0)
+            continue;
+         if (!stores)
+            cs_move64_to(b, addr, fau & BITFIELD64_MASK(56));
+         stores = true;
+         cs_store32(b, cs_reg32(b, MALI_COMPUTE_SR_JOB_SIZE_X + i), addr, off);
+      }
+      cs_flush_stores(b);
+      /* Loads still in flight when no store waited for them. */
+      cs_flush_loads(b);
+   } else {
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), groups[0]);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), groups[1]);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), groups[2]);
+   }
 
    /* Timing. */
    uint32_t mh = 0;
@@ -119,13 +157,25 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                               cmd->dispatches);
       uint64_t key;
       memcpy(&key, cs->key, sizeof(key));
-      mali_measure_info(cmd, mh, groups[0], groups[1], groups[2],
+      /* The counts of an indirect dispatch are in the buffer, not known
+       * here. */
+      mali_measure_info(cmd, mh, indirect ? 0 : groups[0], indirect ? 0 : groups[1],
+                        indirect ? 0 : groups[2],
                         cs->cs.local_size[0] * cs->cs.local_size[1] * cs->cs.local_size[2]);
       mali_measure_shader(cmd, mh, key);
    }
 
    next_iter_sb(cmd, b);
-   cs_run_compute(b, inc, axis, cs_shader_res_sel(0, 0, 0, 0));
+   if (indirect) {
+      /* No job for a count of 0: the smallest of the three is 0 then. */
+      const struct cs_index min = mali_cs_scratch_reg32(b, 2);
+      cs_umin32(b, min, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y));
+      cs_umin32(b, min, min, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z));
+      cs_if(b, MALI_CS_CONDITION_NEQUAL, min)
+         cs_run_compute(b, inc, axis, cs_shader_res_sel(0, 0, 0, 0));
+   } else {
+      cs_run_compute(b, inc, axis, cs_shader_res_sel(0, 0, 0, 0));
+   }
    cmd->dispatches++;
    if (unlikely(mh))
       mali_measure_end(cmd, mh);
@@ -137,7 +187,7 @@ MALI_PER_ARCH(cmd_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mal
                          uint32_t push_size, const uint32_t base[3],
                          const uint32_t groups[3])
 {
-   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0);
+   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, 0);
 }
 
 void
@@ -146,7 +196,7 @@ MALI_PER_ARCH(cmd_dispatch_meta)(struct mali_cmd_buffer *cmd, const struct mali_
                        const uint32_t (*textures)[8], unsigned texture_count)
 {
    const uint32_t base[3] = {0, 0, 0};
-   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count);
+   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -161,4 +211,17 @@ MALI_PER_ARCH(CmdDispatchBase)(VkCommandBuffer commandBuffer, uint32_t baseGroup
    MALI_PER_ARCH(cmd_dispatch_shader)(cmd, cmd->compute.shader, &cmd->compute.desc,
                             cmd->push_constants, sizeof(cmd->push_constants),
                             base, groups);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+                                   VkDeviceSize offset)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_buffer, buffer, _buffer);
+   const uint32_t base[3] = {0, 0, 0};
+   const uint32_t groups[3] = {1, 1, 1};
+   dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
+            sizeof(cmd->push_constants), base, groups, NULL, 0,
+            vk_buffer_address(buffer, offset));
 }

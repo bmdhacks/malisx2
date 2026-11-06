@@ -21,7 +21,9 @@
  * for a storage buffer, attribute descriptors for a storage image
  * (mali_image_view.c) or a buffer view (below), zero for an unused slot.
  * Draws and dispatches copy the slots a shader uses, storage buffers
- * aside, into per-type tables (mali_jm_desc_v7.c).
+ * aside, into per-type tables (mali_jm_desc_v7.c): on the CPU, when the
+ * command is recorded, from a host copy of the set that v7 keeps next to
+ * the set memory (set_store), or in a copy job when the command executes.
  */
 
 #ifndef PAN_ARCH
@@ -172,13 +174,15 @@ slot_ptr(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
    return (uint8_t *)set->cpu + (size_t)idx * MALI_DESCRIPTOR_SIZE;
 }
 
-/* Store size bytes at dst, a pointer into set->cpu, and the same bytes
- * into the host copy. */
+/* Store size bytes at dst, a pointer into set->cpu, and on v7 the same
+ * bytes into the host copy. v9 and v11 have no host copy. */
 static void
 set_store(const struct mali_descriptor_set *set, void *dst, const void *src, size_t size)
 {
+#if PAN_ARCH < 9
    if (set->host && set->host != set->cpu)
       memmove((uint8_t *)set->host + ((uint8_t *)dst - (uint8_t *)set->cpu), src, size);
+#endif
    memmove(dst, src, size);
 }
 
@@ -187,8 +191,10 @@ set_store(const struct mali_descriptor_set *set, void *dst, const void *src, siz
 static const void *
 set_load_ptr(const struct mali_descriptor_set *set, const void *p)
 {
+#if PAN_ARCH < 9
    if (set->host)
       return (const uint8_t *)set->host + ((const uint8_t *)p - (const uint8_t *)set->cpu);
+#endif
    return p;
 }
 
@@ -474,8 +480,12 @@ copy_descriptors(const VkCopyDescriptorSet *c)
 }
 
 /* Set memory is CPU-uncached: the GPU sees these writes without any cache
- * maintenance, and reads the set in place when a command buffer that bound
- * it executes (so updates after the bind are seen, as with the blob). */
+ * maintenance. On v9 and v11 it reads the set in place when a command
+ * buffer that bound it executes, so a write after the bind is seen, as
+ * with the blob. On v7 a draw's tables are filled when it is recorded,
+ * from the set as it is then, unless the set's layout is update-after-bind
+ * (mali_jm_desc_v7.c): a write after the bind is seen there only for such
+ * a set, as the specification allows for no other. */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(UpdateDescriptorSets)(VkDevice _device, uint32_t descriptorWriteCount,
                                     const VkWriteDescriptorSet *pDescriptorWrites,
@@ -633,12 +643,20 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
       }
       pool->heap_size = slots * MALI_DESCRIPTOR_SIZE;
       util_vma_heap_init(&pool->heap, pool->bo.gpu_va, pool->heap_size);
-      pool->host = vk_alloc2(&dev->vk.alloc, pAllocator, pool->heap_size, 8,
-                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      if (!pool->host) {
-         pool_destroy(dev, pAllocator, pool);
-         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+#if PAN_ARCH < 9
+      /* The host copy v7 fills its draws' tables from. None for an
+       * update-after-bind pool: its sets are read by the GPU as they are
+       * when the draw executes, so the tables of a draw are copied by a
+       * job there (mali_jm_desc_v7.c). */
+      if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT)) {
+         pool->host = vk_zalloc2(&dev->vk.alloc, pAllocator, pool->heap_size, 8,
+                                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         if (!pool->host) {
+            pool_destroy(dev, pAllocator, pool);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
       }
+#endif
    }
 
    *pDescriptorPool = mali_descriptor_pool_to_handle(pool);
@@ -742,7 +760,7 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    set->layout = layout;
    set->gpu = gpu;
    set->cpu = gpu ? (uint8_t *)pool->bo.cpu + (gpu - pool->bo.gpu_va) : NULL;
-   set->host = gpu ? pool->host + (gpu - pool->bo.gpu_va) : NULL;
+   set->host = gpu && pool->host ? pool->host + (gpu - pool->bo.gpu_va) : NULL;
 
    /* A texel fetch in a v7 stage that reads this set as its tables reads
     * the set's first sampler slot (mali_desc_set_first_sampler_slot): a

@@ -443,7 +443,10 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
       if (!carry)
          memset(sh->data, 0, size);
       set->cpu = sh->data;
+#if PAN_ARCH < 9
+      /* v7 fills a draw's tables from this copy. */
       set->host = sh->data;
+#endif
       set->gpu = p.gpu;
       out->dst = p.cpu;
    } else {

@@ -6,9 +6,10 @@
 /*
  * VkEvent commands on the command-stream frontend (v11): vkCmdSetEvent2,
  * vkCmdResetEvent2, vkCmdWaitEvents2. The Vulkan 1.0 vkCmdSetEvent,
- * vkCmdResetEvent and vkCmdWaitEvents are Mesa's, which call these (the
- * driver does not expose synchronization2, so applications never name the
- * "2" forms). The object and the host side are mali_event.c.
+ * vkCmdResetEvent and vkCmdWaitEvents are Mesa's, which call these (v11
+ * does not expose synchronization2, so its applications never name the
+ * "2" forms; v7 does, and its event commands are waist stubs). The object
+ * and the host side are mali_event.c.
  *
  * A set or reset is a barrier from every subqueue into the compute
  * subqueue (mali_cmd_emit_barrier: each source waits for its own

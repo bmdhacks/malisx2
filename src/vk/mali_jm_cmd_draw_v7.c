@@ -362,7 +362,9 @@ blend_alpha_one_store(const struct mali_blend_eq *eq)
  * fixed-function descriptor converts from the fragment shader's output
  * register format. The BLEND instructions read the internal words from the
  * hardware's blend FAU slots (bifrost_compile.c BIR_FAU_BLEND_0), so no
- * system value carries them on v7 (no fs.blend_descs).
+ * system value carries them on v7 (no fs.blend_descs). Descriptor i is
+ * attachment i's whatever output location feeds it: the shader's BLEND
+ * for that location reads slot i (mali_shader.c lower_sysvals).
  */
 static bool
 emit_blend_descs(struct mali_cmd_buffer *cmd, void *out, uint32_t count, uint64_t fs_code)

@@ -126,6 +126,19 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
                            mali_query_avail_va(pool, query), 1, true);
 }
 
+/* synchronization2's form (VK_KHR_synchronization2 on v7): the same
+ * choice of chain, made on the 64-bit stage mask. */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
+                                  VkQueryPool _pool, uint32_t query)
+{
+   MALI_PER_ARCH(CmdWriteTimestamp)(commandBuffer,
+                                    stage_is_vtc_only(stage)
+                                       ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                                       : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                    _pool, query);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Occlusion queries                                                       */
 

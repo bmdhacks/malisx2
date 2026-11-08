@@ -514,6 +514,36 @@ draw_indirect_for_arch(uint32_t arch)
    return arch == 7 || arch == 9 || arch == 11;
 }
 
+/*
+ * Buffer device addresses (VK_KHR_buffer_device_address), without capture
+ * and replay. A bound buffer's address is its memory's GPU address plus
+ * the offset (mali_BindBufferMemory2), which Mesa's common
+ * vkGetBufferDeviceAddress returns, and every allocation is mapped on the
+ * GPU, so the allocate flag changes nothing. Physical storage buffer
+ * pointers are 64bit_global (shader_spirv_options) and become global loads
+ * and stores, the instructions v7's storage buffers already use, only
+ * without the bounds check. v7 only: v9 and v11 are untested. Vita3K maps
+ * the guest's memory through these; without them it runs with memory
+ * mapping disabled.
+ */
+static bool
+bda_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
+/*
+ * std430 layout in uniform buffers (VK_KHR_uniform_buffer_standard_layout).
+ * The offsets come from the SPIR-V; v7's uniform buffer loads and the FAU
+ * push of their words (lower_ubo_push) take any 4-byte-aligned offset.
+ * Vita3K requires it with buffer device addresses.
+ */
+static bool
+ubo_std_layout_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
 /* maxDrawIndirectCount. v11: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
@@ -536,6 +566,9 @@ device_extensions_for_arch(uint32_t arch)
    ext.KHR_8bit_storage = storage8_for_arch(arch);
    ext.KHR_16bit_storage = storage16_for_arch(arch);
    ext.KHR_shader_float16_int8 = int8_for_arch(arch);
+
+   ext.KHR_buffer_device_address = bda_for_arch(arch);
+   ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
    return ext;
 }
 
@@ -707,6 +740,14 @@ get_features(struct vk_features *f, uint32_t arch)
       .uniformAndStorageBuffer16BitAccess = storage16_for_arch(arch),
       .storagePushConstant16 = storage16_for_arch(arch),
       .shaderInt8 = int8_for_arch(arch),
+
+      /* VK_KHR_buffer_device_address and
+       * VK_KHR_uniform_buffer_standard_layout (bda_for_arch and the one
+       * after it). */
+      .bufferDeviceAddress = bda_for_arch(arch),
+      .bufferDeviceAddressCaptureReplay = false,
+      .bufferDeviceAddressMultiDevice = false,
+      .uniformBufferStandardLayout = ubo_std_layout_for_arch(arch),
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,

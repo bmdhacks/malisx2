@@ -362,8 +362,13 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_external_memory = true,
    .KHR_external_semaphore = true,
    .KHR_get_memory_requirements2 = true,
-   .KHR_maintenance1 = true,
 #endif
+   /* Vulkan 1.1 core, listed by name for applications that ask for Vulkan
+    * 1.0: Vita3K takes no device without both (and swapchain), and with
+    * no device selected it crashes at boot. vkTrimCommandPool is Mesa's
+    * common one; storage_buffer_storage_class is SPIR-V only. */
+   .KHR_maintenance1 = true,
+   .KHR_storage_buffer_storage_class = true,
    /* ARMSX2's in-tile destination read (the blob advertises both names).
     * Without it ARMSX2 reads the destination through an input attachment
     * with a by-region barrier between primitives, splitting draws (3.5

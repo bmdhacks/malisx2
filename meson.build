@@ -53,7 +53,7 @@ rust = import('rust')
 # Mesa: branch malisx2 of github.com/bmdhacks/armsx2-turnip (upstream Mesa
 # plus our kraid changes) at this commit, checked out (or symlinked) at
 # mesa/. Only the sources are used; Mesa's own build is not run.
-mesa_commit = 'f59c211100b174191d9df540451e94b2d5cb2b26'
+mesa_commit = '45ff8fac44d9132118d0dddd2ff49f5d827533fb'
 if not fs.is_dir('mesa' / 'src' / 'panfrost')
   error('''Mesa is missing. Fetch it with:
   git init mesa && git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git @0@ && git -C mesa checkout FETCH_HEAD'''.format(mesa_commit))

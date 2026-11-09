@@ -1069,7 +1069,8 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 }
 
 /* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
- * allocated sets s->v7.failed and ends the lowering early. */
+ * allocated, or a resource the pipeline layout lacks (s->v7.bad_layout),
+ * sets s->v7.failed and ends the lowering early. */
 static void
 lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
           struct mali_shader *s, bool allow_merging_workgroups)
@@ -2351,7 +2352,12 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
 
 #if PAN_ARCH < 9
    if (s->v7.failed) {
-      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      result = s->v7.bad_layout ?
+                  vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV,
+                            "the %s shader names set %u binding %u, which the pipeline layout "
+                            "does not have",
+                            mesa_shader_stage_name(stage), s->v7.bad_set, s->v7.bad_binding) :
+                  vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto fail;
    }
 #endif

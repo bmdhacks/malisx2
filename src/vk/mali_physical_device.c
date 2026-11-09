@@ -521,27 +521,25 @@ draw_indirect_for_arch(uint32_t arch)
  * vkGetBufferDeviceAddress returns, and every allocation is mapped on the
  * GPU, so the allocate flag changes nothing. Physical storage buffer
  * pointers are 64bit_global (shader_spirv_options) and become global loads
- * and stores, the instructions v7's storage buffers already use, only
- * without the bounds check. v7 only: v9 and v11 are untested. Vita3K maps
- * the guest's memory through these; without them it runs with memory
- * mapping disabled.
+ * and stores on every arch. Vita3K maps the guest's memory through these;
+ * without them it runs with memory mapping disabled.
  */
 static bool
 bda_for_arch(uint32_t arch)
 {
-   return arch == 7;
+   return arch == 7 || arch == 9 || arch == 11;
 }
 
 /*
  * std430 layout in uniform buffers (VK_KHR_uniform_buffer_standard_layout).
- * The offsets come from the SPIR-V; v7's uniform buffer loads and the FAU
- * push of their words (lower_ubo_push) take any 4-byte-aligned offset.
- * Vita3K requires it with buffer device addresses.
+ * The offsets come from the SPIR-V; uniform buffer loads and the FAU push of
+ * their words (lower_ubo_push) take any 4-byte-aligned offset. Vita3K
+ * requires it with buffer device addresses.
  */
 static bool
 ubo_std_layout_for_arch(uint32_t arch)
 {
-   return arch == 7;
+   return arch == 7 || arch == 9 || arch == 11;
 }
 
 /* maxDrawIndirectCount. v11: the stream compares the count as a signed

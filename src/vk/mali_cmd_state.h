@@ -1110,8 +1110,10 @@ mali_gfx_dyn_bake_dirty(const struct vk_dynamic_graphics_state *dyn)
 
 /* Whether a draw reaches the rasterizer. A pipeline with rasterizer discard
  * (static, or set dynamically) makes a draw that nothing can observe on v9
- * and v11: the vertex shader writes no memory (vertexPipelineStoresAndAtomics
- * is off), there is no transform feedback or primitives-generated query, and
+ * and v11: the vertex shader writes no descriptor-bound memory
+ * (vertexPipelineStoresAndAtomics is off; a store through a buffer device
+ * address is lost with the draw), there is no transform feedback or
+ * primitives-generated query, and
  * no fragment is produced for an occlusion query to count. Such a draw is
  * dropped before it touches any state, so the dirty bits and staging
  * registers are as they were for the next draw. (v7 keeps the Vertex job

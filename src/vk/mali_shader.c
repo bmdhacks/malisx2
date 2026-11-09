@@ -1068,14 +1068,99 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *align = comp_size * (length == 3 ? 4 : length);
 }
 
-/* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
- * allocated, or a resource the pipeline layout lacks (s->v7.bad_layout),
- * sets s->v7.failed and ends the lowering early. */
+/*
+ * Every set and binding a shader names must be in the pipeline layout, as
+ * Vulkan requires. The descriptor lowering looks them up with only asserts
+ * behind it: in a release build a binding the layout lacks reads past the
+ * set layout's bindings and sizes its maps from whatever is there, which
+ * made two pipeline compiles allocate and fill about 7.5 GB each. (Vita3K's
+ * shader cache keeps God of War's shaders across a change of its memory
+ * mapping mode: its uniform buffers are set 0's bindings 2 and 3 with
+ * mapping off, and set 0 has only bindings 0 and 1 with mapping on.) Such a
+ * shader is rejected instead.
+ */
+struct layout_check {
+   const struct vk_pipeline_layout *layout;
+   bool bad;
+   uint32_t set, binding;
+};
+
 static void
-lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
+layout_check_binding(struct layout_check *c, uint32_t set, uint32_t binding)
+{
+   if (c->bad)
+      return;
+
+   const struct vk_pipeline_layout *layout = c->layout;
+   if (layout && set < layout->set_count && set < MALI_MAX_SETS && layout->set_layouts[set] &&
+       binding < mali_descriptor_set_layout(layout->set_layouts[set])->binding_count)
+      return;
+
+   c->bad = true;
+   c->set = set;
+   c->binding = binding;
+}
+
+static void
+layout_check_deref(struct layout_check *c, nir_src *src)
+{
+   const nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(*src));
+   layout_check_binding(c, var->data.descriptor_set, var->data.binding);
+}
+
+static bool
+layout_check_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct layout_check *c = data;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      const nir_tex_src_type srcs[2] = {nir_tex_src_sampler_deref, nir_tex_src_texture_deref};
+      for (unsigned i = 0; i < 2; i++) {
+         const int idx = nir_tex_instr_src_index(tex, srcs[i]);
+         if (idx >= 0)
+            layout_check_deref(c, &tex->src[idx].src);
+      }
+      return false;
+   }
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index:
+      layout_check_binding(c, nir_intrinsic_desc_set(intr), nir_intrinsic_binding(intr));
+      break;
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+      layout_check_deref(c, &intr->src[0]);
+      break;
+   default:
+      break;
+   }
+   return false;
+}
+
+/* Resource lowering (panvk_lower_nir). Fails when the shader names a
+ * resource the pipeline layout lacks or, on v7, when a table map cannot be
+ * allocated. */
+static VkResult
+lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_compile_info *info,
           struct mali_shader *s, bool allow_merging_workgroups)
 {
    const struct vk_pipeline_robustness_state *rs = info->rs;
+
+   struct layout_check check = {.layout = info->layout};
+   NIR_PASS(_, nir, nir_shader_instructions_pass, layout_check_instr, nir_metadata_all, &check);
+   if (check.bad)
+      return vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV,
+                       "the %s shader names set %u binding %u, which the pipeline layout "
+                       "does not have",
+                       mesa_shader_stage_name(nir->info.stage), check.set, check.binding);
 
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
@@ -1092,10 +1177,8 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
 
    /* Per-type descriptor tables (mali_shader.h). */
    if (!mali_nir_lower_descriptors_v7(nir, rs, ssbo_addr_format(rs), info->layout, &s->desc,
-                                      &s->v7)) {
-      s->v7.failed = true;
-      return;
-   }
+                                      &s->v7))
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 #else
    mali_nir_lower_descriptors(nir, rs, info->layout, &s->desc);
 #endif
@@ -1178,6 +1261,7 @@ lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return VK_SUCCESS;
 }
 
 static unsigned
@@ -2213,7 +2297,9 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
    switch (stage) {
    case MESA_SHADER_VERTEX:
       s->desc.driver_table_prefix = MALI_MAX_VS_ATTRIBS;
-      lower_nir(nir, info, s, false);
+      result = lower_nir(dev, nir, info, s, false);
+      if (result != VK_SUCCESS)
+         goto fail;
 
       if (inputs.view_mask) {
 #if PAN_ARCH < 10
@@ -2278,7 +2364,9 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       s->desc.driver_table_prefix = nir->num_inputs;
       inputs.varying_layout = info->vs_varying_layout;
 
-      lower_nir(nir, info, s, false);
+      result = lower_nir(dev, nir, info, s, false);
+      if (result != VK_SUCCESS)
+         goto fail;
 
       nir_assign_io_var_locations(nir, nir_var_shader_out);
       lower_nir_io(nir);
@@ -2340,7 +2428,9 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
        * panvk gates this on PAN_ARCH >= 9. allow_merging_workgroups stays
        * false. */
 #endif
-      lower_nir(nir, info, s, s->info.cs.allow_merging_workgroups);
+      result = lower_nir(dev, nir, info, s, s->info.cs.allow_merging_workgroups);
+      if (result != VK_SUCCESS)
+         goto fail;
       break;
    }
 
@@ -2349,18 +2439,6 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
                          mesa_shader_stage_name(stage));
       goto fail;
    }
-
-#if PAN_ARCH < 9
-   if (s->v7.failed) {
-      result = s->v7.bad_layout ?
-                  vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV,
-                            "the %s shader names set %u binding %u, which the pipeline layout "
-                            "does not have",
-                            mesa_shader_stage_name(stage), s->v7.bad_set, s->v7.bad_binding) :
-                  vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-      goto fail;
-   }
-#endif
 
    result = compile_nir(dev, nir, &inputs, state, s);
    if (result != VK_SUCCESS)

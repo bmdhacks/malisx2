@@ -372,12 +372,6 @@ struct mali_v7_shader_desc {
    int32_t direct_set;
    uint32_t direct_slots;
    uint32_t direct_sampler_base;
-   /* The lowering could not allocate its map (mali_shader.c lower_nir), or,
-    * with bad_layout, the shader names set bad_set's binding bad_binding,
-    * which the pipeline layout does not have. */
-   bool failed;
-   bool bad_layout;
-   uint32_t bad_set, bad_binding;
    /* The shader's constant data (host copy, for serialization) and its GPU
     * copy, which common.constant_data points at. */
    void *data;

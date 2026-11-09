@@ -71,10 +71,6 @@ struct lower_desc_ctx {
    uint32_t tex_sets;
    int direct_set;
    uint32_t direct_sampler_slot;
-   /* The first resource the shader names that the pipeline layout lacks
-    * (check_layout_access); bad_layout false when there is none. */
-   bool bad_layout;
-   uint32_t bad_set, bad_binding;
 };
 
 struct desc_id {
@@ -759,78 +755,6 @@ collect_desc_access(nir_builder *b, nir_instr *instr, void *data)
    }
 }
 
-/*
- * Every set and binding the shader names must be in the pipeline layout,
- * as Vulkan requires. One that is not would make binding_layout() read
- * past the set layout's bindings and size the copy map from whatever is
- * there: a shader translated for another layout made two pipeline
- * compiles allocate and fill about 7.5 GB each. (Vita3K's shader cache
- * keeps God of War's shaders across a change of its memory mapping mode:
- * its uniform buffers are set 0's bindings 2 and 3 with mapping off, and
- * set 0 has only bindings 0 and 1 with mapping on.) Such a shader is
- * rejected instead.
- */
-static bool
-binding_in_layout(const struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding)
-{
-   return set < MALI_MAX_SETS && ctx->set_layouts[set] &&
-          binding < ctx->set_layouts[set]->binding_count;
-}
-
-static void
-check_binding(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding)
-{
-   if (ctx->bad_layout || binding_in_layout(ctx, set, binding))
-      return;
-   ctx->bad_layout = true;
-   ctx->bad_set = set;
-   ctx->bad_binding = binding;
-}
-
-static bool
-check_layout_access(nir_builder *b, nir_instr *instr, void *data)
-{
-   struct lower_desc_ctx *ctx = data;
-   uint32_t set, binding, index_imm, max_idx;
-   nir_def *index_ssa;
-
-   if (instr->type == nir_instr_type_tex) {
-      nir_tex_instr *tex = nir_instr_as_tex(instr);
-      const nir_tex_src_type srcs[2] = {nir_tex_src_sampler_deref, nir_tex_src_texture_deref};
-      for (unsigned i = 0; i < 2; i++) {
-         const int idx = nir_tex_instr_src_index(tex, srcs[i]);
-         if (idx < 0)
-            continue;
-         get_resource_deref_binding(nir_src_as_deref(tex->src[idx].src), &set, &binding,
-                                    &index_imm, &index_ssa, &max_idx);
-         check_binding(ctx, set, binding);
-      }
-      return false;
-   }
-   if (instr->type != nir_instr_type_intrinsic)
-      return false;
-
-   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-   switch (intr->intrinsic) {
-   case nir_intrinsic_vulkan_resource_index:
-      check_binding(ctx, nir_intrinsic_desc_set(intr), nir_intrinsic_binding(intr));
-      break;
-   case nir_intrinsic_image_deref_store:
-   case nir_intrinsic_image_deref_load:
-   case nir_intrinsic_image_deref_atomic:
-   case nir_intrinsic_image_deref_atomic_swap:
-   case nir_intrinsic_image_deref_size:
-   case nir_intrinsic_image_deref_samples:
-      get_resource_deref_binding(nir_src_as_deref(intr->src[0]), &set, &binding, &index_imm,
-                                 &index_ssa, &max_idx);
-      check_binding(ctx, set, binding);
-      break;
-   default:
-      break;
-   }
-   return false;
-}
-
 /* The sets texture and sampler accesses name (lower_desc_ctx::tex_sets). */
 static bool
 scan_tex_sets(nir_builder *b, nir_instr *instr, void *data)
@@ -976,21 +900,13 @@ mali_nir_lower_descriptors_v7(nir_shader *nir, const struct vk_pipeline_robustne
    v7->direct_slots = 0;
    v7->direct_sampler_base = 0;
    v7->copy_set_mask = 0;
-   v7->bad_layout = false;
+
+   ctx.ht = _mesa_hash_table_u64_create(NULL);
 
    for (uint32_t i = 0; layout && i < layout->set_count && i < MALI_MAX_SETS; i++) {
       if (layout->set_layouts[i])
          ctx.set_layouts[i] = mali_descriptor_set_layout(layout->set_layouts[i]);
    }
-   NIR_PASS(_, nir, nir_shader_instructions_pass, check_layout_access, nir_metadata_all, &ctx);
-   if (ctx.bad_layout) {
-      v7->bad_layout = true;
-      v7->bad_set = ctx.bad_set;
-      v7->bad_binding = ctx.bad_binding;
-      return false;
-   }
-
-   ctx.ht = _mesa_hash_table_u64_create(NULL);
    NIR_PASS(_, nir, nir_shader_instructions_pass, scan_tex_sets, nir_metadata_all, &ctx);
    choose_direct_set(&ctx);
 

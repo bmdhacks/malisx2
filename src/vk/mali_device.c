@@ -234,6 +234,11 @@ mali_GetDeviceProcAddr(VkDevice _device, const char *pName)
          container_of(device->physical, struct mali_physical_device, vk);
       return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetIndexRangeMALISX2 : NULL;
    }
+   if (device && pName && !strcmp(pName, "vkCmdSetDepthCullMALISX2")) {
+      const struct mali_physical_device *pdev =
+         container_of(device->physical, struct mali_physical_device, vk);
+      return pdev->arch == 7 ? (PFN_vkVoidFunction)mali_v7_CmdSetDepthCullMALISX2 : NULL;
+   }
    return vk_device_get_proc_addr(device, pName);
 }
 

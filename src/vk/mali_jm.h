@@ -392,6 +392,9 @@ struct mali_jm_cmd {
    /* The varying arena of the indirect draws (mali_jm_cmd_draw_v7.c), from
     * the first one on; returned to the device at reset. */
    struct mali_cmd_slab *idraw_arena;
+   /* vkCmdSetDepthCullMALISX2: its flags, 0 for the pipeline's depth
+    * clip and clamp (mali_jm_cmd_draw_v7.c). */
+   uint8_t depth_cull;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */

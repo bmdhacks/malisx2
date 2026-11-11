@@ -504,6 +504,11 @@ emit_viewport(struct mali_cmd_buffer *cmd)
       cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
       cfg.minimum_z = MIN2(vp->minDepth, vp->maxDepth);
       cfg.maximum_z = MAX2(vp->minDepth, vp->maxDepth);
+      /* vkCmdSetDepthCullMALISX2 culling above: up to 1e-5 past maxDepth is
+       * kept, as float rounding puts geometry modelled on the far plane a
+       * ULP or two past it (a 24-bit depth stores it as maxDepth). */
+      if (cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+         cfg.maximum_z += 1e-5f;
    }
    return p.gpu;
 }
@@ -883,6 +888,26 @@ build_fs_rsd(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline *p
          cfg.evaluate_per_sample = true;
       }
       rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= ms.opaque[0];
+   }
+   if (cmd->jm.depth_cull & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) {
+      /* vkCmdSetDepthCullMALISX2: the fixed-function near and far discards
+       * follow its flags, as they follow depth clip from the pipeline, and
+       * the depth range is not fixed (clamped where not culled). With the
+       * Primitive's depth culls this covers exactly what the pipeline's
+       * depth clip covers (bdatest depthcull). */
+      struct mali_multisample_misc_packed mask, set;
+      pan_pack_nodefaults(&mask, MULTISAMPLE_MISC, cfg) {
+         cfg.fixed_function_near_discard = true;
+         cfg.fixed_function_far_discard = true;
+         cfg.fixed_function_depth_range_fixed = true;
+      }
+      pan_pack_nodefaults(&set, MULTISAMPLE_MISC, cfg) {
+         cfg.fixed_function_near_discard = cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2;
+         cfg.fixed_function_far_discard = cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2;
+         cfg.fixed_function_depth_range_fixed = false;
+      }
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] &= ~mask.opaque[0];
+      rsd.opaque[MALI_V7_RSD_MULTISAMPLE_MISC_WORD] |= set.opaque[0];
    }
    memcpy(m.cpu, &rsd, sizeof(rsd));
    t->fs_rsd = m.gpu;
@@ -1286,6 +1311,14 @@ emit_tiler_job(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
       di->indexed ? mali_gfx_index_type(d->ib.index_size) : MALI_INDEX_TYPE_NONE;
    prim.opaque[0] = (t->prim0 & ~prim_provoking_bit()) | prim_index_type(index_type) |
                     (r->first_provoking_vertex ? prim_provoking_bit() : 0);
+   if (cmd->jm.depth_cull & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) {
+      /* vkCmdSetDepthCullMALISX2: the Primitive's Low and High Depth Cull
+       * (word 0 bits 16 and 17, genxml v7.xml); outside them the depth is
+       * clamped to the Viewport's Minimum and Maximum Z. */
+      prim.opaque[0] &= ~(3u << 16);
+      prim.opaque[0] |= ((cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2) ? 1u << 16 : 0) |
+                        ((cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2) ? 1u << 17 : 0);
+   }
    memcpy(pan_section_ptr(tj.cpu, TILER_JOB, PRIMITIVE), &prim, sizeof(prim));
 
    pan_section_pack(tj.cpu, TILER_JOB, PRIMITIVE_SIZE, cfg) {
@@ -1903,6 +1936,22 @@ MALI_PER_ARCH(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer, VkBuff
       .indexed = true,
    };
    draw_indirect_call(cmd, &call);
+}
+
+/* vkCmdSetDepthCullMALISX2 (malisx2's own, from vkGetDeviceProcAddr; what
+ * the flags mean: mali_vk.h). */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetDepthCullMALISX2)(VkCommandBuffer commandBuffer, uint32_t flags)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   const uint8_t cull = (flags & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) ? (uint8_t)(flags & 7) : 0;
+   /* The Viewport's Maximum Z carries the far-plane tolerance, the
+    * fragment RSD the near and far discards. */
+   if ((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
+   if (cull != cmd->jm.depth_cull)
+      cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_ZSD;
+   cmd->jm.depth_cull = cull;
 }
 
 /*

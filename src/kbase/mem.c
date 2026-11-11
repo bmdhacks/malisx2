@@ -408,6 +408,50 @@ mali_kbase_import_dmabuf(struct mali_kbase *kb, int fd, uint64_t flags,
    im.in.type = KB_MEM_IMPORT_TYPE_UMM;
    im.in.padding = padding_pages;
    long ret = kb_ioctl(kb, KB_IOCTL_MEM_IMPORT, &im);
+
+   /*
+    * Some Huawei job-manager kernels (including older Kirin 990 builds)
+    * use a 32-byte MEM_IMPORT ioctl request instead of the 24-byte layout.
+    * The ioctl number encodes the struct size, so ENOTTY from the default
+    * request can mean that the older layout is required.
+    *
+    * Only retry for a JM kernel reporting ENOTTY. Keep both the original
+    * request and the normal behavior untouched on all other kernels.
+    */
+   if (ret == -ENOTTY && kb->frontend == MALI_KBASE_FRONTEND_JM) {
+      union {
+         struct {
+            uint64_t flags;
+            uint64_t phandle;
+            uint32_t type;
+            uint32_t padding;
+            uint64_t padding2;
+         } in;
+         struct {
+            uint64_t flags;
+            uint64_t gpu_va;
+            uint64_t va_pages;
+            uint64_t padding2;
+         } out;
+      } legacy;
+      _Static_assert(sizeof(legacy) == 32,
+                     "legacy Huawei MEM_IMPORT ioctl must be 32 bytes");
+      memset(&legacy, 0, sizeof(legacy));
+      legacy.in.flags = flags;
+      legacy.in.phandle = (uint64_t)(uintptr_t)&handle;
+      legacy.in.type = KB_MEM_IMPORT_TYPE_UMM;
+      legacy.in.padding = padding_pages;
+      ret = kb_ioctl(kb, _IOWR(KB_IOCTL_TYPE, 22, __typeof__(legacy)), &legacy);
+      if (ret >= 0) {
+         im.out.flags = legacy.out.flags;
+         im.out.gpu_va = legacy.out.gpu_va;
+         im.out.va_pages = legacy.out.va_pages;
+         KB_LOG(kb, "MEM_IMPORT: 32-byte legacy job-manager layout succeeded");
+      } else {
+         KB_LOG(kb, "MEM_IMPORT: 32-byte legacy job-manager retry failed: %s",
+                strerror((int)-ret));
+      }
+   }
    if (ret < 0) {
       KB_LOG(kb, "MEM_IMPORT of dma-buf fd %d, flags 0x%llx failed: %s", fd,
              (unsigned long long)flags, strerror((int)-ret));

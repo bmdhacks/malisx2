@@ -400,6 +400,10 @@ MALI_PER_ARCH(fb_pass_has_work)(const struct mali_render_state *r)
     * targets. */
    for (unsigned i = 0; i < 2; i++)
       work |= ts[i]->image && ts[i]->store && ts[i]->always_write;
+   /* A frame shader that writes memory and no target (the fragment-side
+    * image -> buffer copy, MALI_META_FS_STORE) is the pass's work. */
+   work |= r->desc.blit && (r->desc.blit->key->rt_op[0] == MALI_META_FS_STORE ||
+                            r->desc.blit->key->rt_op[0] == MALI_META_FS_QUERY);
 #endif
    for (unsigned i = 0; i < r->desc.rt_count; i++) {
       const struct mali_fb_target *t = &r->desc.rt[i];

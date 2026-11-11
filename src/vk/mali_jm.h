@@ -560,6 +560,14 @@ void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
  * image copy then goes to the fragment side instead (mali_cmd_image.c). */
 bool mali_jm_cmd_transfer_needs_frag(struct mali_cmd_buffer *cmd);
 
+/* Would a transfer job on the vtc chain wait for fragment work now, this
+ * batch's or an earlier one's (a recorded barrier from fragment or
+ * fragment-side transfer stages)? Every later vtc atom would wait behind
+ * it in the slot order, so v7 does such a copy on the fragment side where
+ * it can (mali_cmd_image.c). Requirements carried from an earlier command
+ * buffer are not known here. */
+bool mali_jm_cmd_transfer_waits_frag(struct mali_cmd_buffer *cmd);
+
 /* The open batch's current fragment segment, started if the batch has
  * none; with new_segment, always a new one (a new fragment atom). Applies
  * the barriers recorded for fragment work. NULL on failure. The vtc

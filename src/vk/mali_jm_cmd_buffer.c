@@ -807,6 +807,12 @@ mali_jm_cmd_transfer_needs_frag(struct mali_cmd_buffer *cmd)
    return cmd->jm.open && vtc_req_closes(cmd, vtc_req(cmd->jm.req, VTC_JOB_XFER));
 }
 
+bool
+mali_jm_cmd_transfer_waits_frag(struct mali_cmd_buffer *cmd)
+{
+   return vtc_req(cmd->jm.req, VTC_JOB_XFER) & (REQ_VTC_AFTER_FRAG | REQ_VTC_AFTER_FRAG_XFER);
+}
+
 struct mali_jm_chain *
 mali_jm_cmd_frag(struct mali_cmd_buffer *cmd, bool new_segment)
 {

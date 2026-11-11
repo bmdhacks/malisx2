@@ -31,6 +31,7 @@
 #include "mali_jm.h"
 #endif
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "compiler/nir/nir_builder.h"
@@ -537,6 +538,48 @@ MALI_PER_ARCH(CmdCopyQueryPoolResultsToMemoryKHR)(VkCommandBuffer commandBuffer,
    const uint64_t per_query = result_size * (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT ? 2 : 1);
    mali_v7_note_buffer_write(cmd, pDstRange->address,
                              (queryCount - 1) * pDstRange->stride + per_query);
+#endif
+
+#if PAN_ARCH < 9
+   /* The compute copy waits on the vtc slot for the fragment work that set
+    * the queries (cmd_query_fence), and every later vtc atom behind it: on
+    * the fragment side it follows that work in the slot order and holds up
+    * no tiling (mali_cmd_image.c copy_to_buffer_frag). */
+   if (mali_jm_cmd_transfer_waits_frag(cmd) && !cmd->gfx.render.active &&
+       queryCount <= (uint32_t)MALI_META_QUERY_ROW * 4096) {
+      struct mali_meta_fs_key key = {
+         .query_reports = (uint8_t)pool->val_count,
+      };
+      key.rt_op[0] = MALI_META_FS_QUERY;
+      key.rt_type[0] = MALI_META_FS_UINT;
+      struct mali_meta_fs_push fp = {
+         .query_val = mali_query_val_va(pool, firstQuery),
+         .query_avail = mali_query_avail_va(pool, firstQuery),
+         .query_dst = pDstRange->address,
+         .query_val_stride = pool->val_stride,
+         .query_avail_stride = pool->avail_stride,
+         .query_dst_stride = (uint32_t)pDstRange->stride,
+         .query_count = queryCount,
+         .query_flags = flags,
+      };
+      const struct mali_render_blit blit = {.key = &key, .push = &fp};
+      const uint32_t w = MIN2(queryCount, (uint32_t)MALI_META_QUERY_ROW);
+      const uint32_t h = DIV_ROUND_UP(queryCount, (uint32_t)MALI_META_QUERY_ROW);
+      /* At least a 16x16 framebuffer: the fragments past the queries do
+       * nothing. */
+      struct mali_render_desc d = {
+         .width = MAX2(w, 16),
+         .height = MAX2(h, 16),
+         .area = {{0, 0}, {w, h}},
+         .layer_count = 1,
+         .rt_count = 0,
+         .blit = &blit,
+      };
+      MALI_PER_ARCH(cmd_render_begin)(cmd, &d);
+      MALI_PER_ARCH(cmd_render_end)(cmd);
+      mali_jm_cmd_mark_frag_transfer(cmd);
+      return;
+   }
 #endif
 
    struct meta_query_push push = {

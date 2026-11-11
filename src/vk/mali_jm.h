@@ -400,6 +400,19 @@ struct mali_jm_cmd {
       uint64_t ib;
       uint32_t first, count, min, max;
    } idx_hint;
+   /* The range of the last indexed draw (scanned or hinted), for the next
+    * one that draws the same indices: same index buffer address and bound
+    * size, first index, count, index size and restart. The indices cannot
+    * have changed in between, as both draws need them unchanged until they
+    * run (index_range), except by a transfer recorded in between, which
+    * clears it (mali_v7_note_buffer_write). Vita3K draws a vertex-store
+    * draw's indices twice. */
+   struct mali_v7_idx_last {
+      bool valid, restart, empty;
+      uint8_t index_size;
+      uint64_t ib, ib_size;
+      uint32_t first, count, min, max;
+   } idx_last;
    /* The Local Storage descriptor of the copy jobs (mali_jm_desc_v7.c
     * copy_tsd), 0 until the first one. */
    uint64_t copy_tsd;

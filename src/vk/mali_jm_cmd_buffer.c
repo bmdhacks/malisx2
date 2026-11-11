@@ -1481,3 +1481,23 @@ const struct vk_command_buffer_ops MALI_PER_ARCH(cmd_buffer_ops) = {
    .reset = cmd_reset,
    .destroy = cmd_destroy,
 };
+
+#if PAN_ARCH == 7
+/* measurement/cpuprof.c: the index range of the indexed draw just recorded
+ * (idx_last, mali_jm_cmd_draw_v7.c), if it is the one drawing first_index..
+ * + count and drew something. Here rather than in the draw code so that the
+ * measurement leaves the v7 shader cache ID (gen_shader_cache_id.py) alone. */
+bool mali_v7_last_draw_range(struct vk_command_buffer *vk, uint32_t first_index, uint32_t count,
+                             uint32_t *range);
+bool
+mali_v7_last_draw_range(struct vk_command_buffer *vk, uint32_t first_index, uint32_t count,
+                        uint32_t *range)
+{
+   const struct mali_cmd_buffer *cmd = container_of(vk, struct mali_cmd_buffer, vk);
+   const struct mali_v7_idx_last *l = &cmd->jm.idx_last;
+   if (!l->valid || l->empty || l->first != first_index || l->count != count)
+      return false;
+   *range = l->max - l->min + 1;
+   return true;
+}
+#endif

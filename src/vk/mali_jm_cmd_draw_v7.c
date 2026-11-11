@@ -1426,6 +1426,8 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          min = last->min;
          max = last->max;
          empty = last->empty;
+         if (unlikely(mali_cpuprof_on))
+            mali_cpuprof_part(MALI_CPUPROF_IDXREUSE, os_time_get_nano());
       } else {
          const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
          ok = index_range(cmd, di, restart, &min, &max, &empty);

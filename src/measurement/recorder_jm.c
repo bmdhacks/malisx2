@@ -182,7 +182,7 @@ mali_jm_measure_capture_end(struct mali_device *dev, struct mali_jm_measure_capt
    mali_measure_path(m, name, path, sizeof(path));
 
    uint64_t bytes = 0;
-   FILE *fp = fopen(path, "wb");
+   FILE *fp = mali_measure_fopen(&m->cfg, path, "wb");
    bool ok = fp && write_capture(dev, cap, fp, &bytes);
    if (fp && fclose(fp) != 0)
       ok = false;

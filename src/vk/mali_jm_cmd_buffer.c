@@ -1194,11 +1194,31 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    VkPipelineStageFlags2 src = 0, dst = 0;
    VkAccessFlags2 srca = 0, dsta = 0;
    bool exec_only = false;   /* some barrier of the call orders execution only */
+#if PAN_ARCH < 9
+   /* Each barrier of the call is a dependency of its own: its source
+    * stages against its own destination stages. The requirements are
+    * worked out per barrier and then combined; the union of the masks
+    * would pair one barrier's source with another's destination. The
+    * runtime's render pass emulation begins a subpass with one barrier
+    * per subpass dependency, so a "fragment -> fragment" external
+    * dependency and a "vertex shader -> vertex input" self-dependency
+    * (Vita3K's render passes) would otherwise read as "fragment -> vertex
+    * input" and make every pass's tiling wait for the fragment work
+    * before it. */
+   uint16_t buf_req = 0, img_req = 0;
+   VkPipelineStageFlags2 ubo_src = 0;
+   VkAccessFlags2 ubo_srca = 0;
+#endif
    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
       const VkMemoryBarrier2 *m = &info->pMemoryBarriers[i];
 #if PAN_ARCH < 9
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
+      if (ubo_copy_dep(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask)) {
+         ubo_src |= m->srcStageMask;
+         ubo_srca |= m->srcAccessMask;
+      }
 #endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
@@ -1213,28 +1233,23 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 #if PAN_ARCH < 9
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
+      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
+      if (ubo_copy_dep(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask)) {
+         ubo_src |= m->srcStageMask;
+         ubo_srca |= m->srcAccessMask;
+      }
 #endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
       srca |= m->srcAccessMask;
       dsta |= m->dstAccessMask;
    }
-#if PAN_ARCH < 9
-   /* The buffer and global dependencies (an image barrier's access scope
-    * is the image), for ubo_copy_dep. */
-   const VkPipelineStageFlags2 buf_src = src, buf_dst = dst;
-   const VkAccessFlags2 buf_srca = srca, buf_dsta = dsta;
-   VkPipelineStageFlags2 img_src = 0, img_dst = 0;
-   VkAccessFlags2 img_dsta = 0;
-#endif
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       const VkImageMemoryBarrier2 *m = &info->pImageMemoryBarriers[i];
 #if PAN_ARCH < 9
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
-      img_src |= m->srcStageMask;
-      img_dst |= m->dstStageMask;
-      img_dsta |= m->dstAccessMask;
+      img_req |= image_barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
 #endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
@@ -1261,12 +1276,11 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
 #if PAN_ARCH < 9
    /* The global and buffer dependencies keep the full rule; the image ones
     * apply to the vtc jobs that can touch images. */
-   const uint16_t buf_req = barrier_req(buf_src, buf_dst, buf_dsta);
-   cmd->jm.req |= buf_req | image_barrier_req(img_src, img_dst, img_dsta);
+   cmd->jm.req |= buf_req | img_req;
    if (buf_req & REQ_XVTC_ALL)
       cmd->jm.xvtc_buf = true;
-   if (ubo_copy_dep(buf_src, buf_srca, buf_dst, buf_dsta))
-      mali_jm_cmd_barrier(cmd, buf_src, buf_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+   if (ubo_src)
+      mali_jm_cmd_barrier(cmd, ubo_src, ubo_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                           VK_ACCESS_2_UNIFORM_READ_BIT);
 #else
    mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);

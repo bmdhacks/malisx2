@@ -33,6 +33,8 @@
 #include "mali_version.h"
 
 #ifndef __ANDROID__
+#include <link.h>
+
 /* The shared WSI's physical-device entry points (VK_KHR_display). */
 #include "wsi_common.h"
 #endif
@@ -583,6 +585,47 @@ max_draw_indirect_count_for_arch(uint32_t arch)
    return arch >= 10 ? INT32_MAX : UINT16_MAX;
 }
 
+#ifndef __ANDROID__
+/*
+ * Arm's vulkan-wsi-layer, the Wayland and display layer some Linux
+ * distributions ship for Mali (ROCKNIX's RK3588 image among them), puts
+ * VK_KHR_sampler_ycbcr_conversion in the device extensions its Wayland
+ * backend requires, whatever API version the application asks for, in its
+ * releases before upstream commit 4a6f61a; a device that does not list it
+ * fails vkCreateDevice. The layer calls none of the extension's commands:
+ * it wants the disjoint image flag the extension brought, and uses that
+ * only for a format whose modifier reports VK_FORMAT_FEATURE_DISJOINT_BIT,
+ * which no format here does.
+ *
+ * So the name is listed while that layer is loaded in the process (the
+ * loader loads implicit and enabled layers at vkCreateInstance, before it
+ * enumerates physical devices), and never otherwise. samplerYcbcrConversion
+ * stays false, which the extension does not allow (vk.xml requires the
+ * feature of every device that lists it): an application that checks the
+ * feature, as it must before creating a conversion, sees none, a device
+ * that enables the feature is refused, and a sampler with a conversion is
+ * refused (mali_sampler.c). The commands are the Vulkan 1.1 core ones every
+ * device already resolves.
+ */
+static int
+is_arm_wsi_layer(struct dl_phdr_info *info, size_t size, void *data)
+{
+   static const char layer[] = "libVkLayer_window_system_integration.so";
+   const char *name = info->dlpi_name;
+   if (!name)
+      return 0;
+   const char *base = strrchr(name, '/');
+   base = base ? base + 1 : name;
+   return strncmp(base, layer, sizeof(layer) - 1) == 0;
+}
+
+static bool
+arm_wsi_layer_loaded(void)
+{
+   return dl_iterate_phdr(is_arm_wsi_layer, NULL) != 0;
+}
+#endif
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -597,6 +640,10 @@ device_extensions_for_arch(uint32_t arch)
 
    ext.KHR_buffer_device_address = bda_for_arch(arch);
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
+#ifndef __ANDROID__
+   /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
+   ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
+#endif
    return ext;
 }
 

@@ -71,6 +71,9 @@
 #include "mali_image.h"
 #include "mali_pipeline.h"
 #include "mali_vk.h"
+#if PAN_ARCH >= 10
+#include "mali_queue.h"
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Compute                                                                 */
@@ -153,9 +156,14 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
    const unsigned wgs_per_core = (unsigned)MIN2(DIV_ROUND_UP(total, tp->core_count), UINT32_MAX);
    unsigned wgs_per_task = CLAMP(threads_per_task / threads_per_wg, 1, wgs_per_core);
 
+   /* Not split along an axis of one workgroup: on the vertex/tiler
+    * stream a job split along X with a grid of 1 x N runs its N rows one
+    * after the other (the software vertex shader of an instanced geometry
+    * or tessellation draw took 125 us for 64 instances, 20 us split along
+    * Y). */
    *inc = wgs_per_task;
    for (unsigned i = 0; i < 2; i++) {
-      if (*inc <= groups[i])
+      if (*inc <= groups[i] && groups[i] > 1)
          break;
       (*axis)++;
       *inc /= groups[i];
@@ -332,10 +340,15 @@ mali_cmd_tls_size_field(const struct mali_cmd_buffer *cmd)
  * count is not known yet: its WLS gets as many instances as the cores can
  * hold at once (as panvk's pan_calc_wls_instances), which is also the most
  * any dispatch gets, so the buffer is sized by the hardware's thread
- * limits and the shader, not by a workgroup count. */
+ * limits and the shader, not by a workgroup count.
+ *
+ * Each dispatch has its own WLS range, as dispatches may run at the same
+ * time. On CSF a full slab is used again from the start once the stream has
+ * waited for its jobs; vt is a dispatch on the vertex/tiler stream, which
+ * waits for each job (cmd_vt_dispatch). */
 static inline uint64_t
-mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
-                 const struct mali_thread_props *tp, const uint32_t groups[3])
+mali_compute_tsd_in(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                    const struct mali_thread_props *tp, const uint32_t groups[3], bool vt)
 {
    struct mali_device *dev = cmd->dev;
    uint64_t tls_ptr = 0, wls_ptr = 0;
@@ -360,24 +373,56 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                           util_next_power_of_two(groups[2]);
       wls_instances = MIN2(dispatch, max_per_core);
       wls_size = util_next_power_of_two(MAX2(cs->info.wls_size, 128));
-      uint64_t total = (uint64_t)wls_size * wls_instances * tp->core_id_range;
+      uint64_t total = ALIGN_POT((uint64_t)wls_size * wls_instances * tp->core_id_range, 4096);
 
       /* 4 KiB aligned and inside one 4 GiB window (the descriptor's
-       * requirement): its own allocation, kept in one 4 GiB page. */
-      struct mali_cmd_slab *s = calloc(1, sizeof(*s));
-      const struct mali_kbase_alloc_info ai = {
-         .size = total,
-         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS |
-                                                KB_MEM_GPU_VA_SAME_4GB_PAGE),
-         .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
-      };
-      if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
-         free(s);
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return 0;
+       * requirement): carved from a slab kept in one 4 GiB page, each
+       * dispatch its own range as they may run at the same time. */
+#if PAN_ARCH >= 10
+      struct mali_wls_state *w = vt ? &cmd->wls_vt : &cmd->wls;
+      if (w->used + total > w->size && total <= w->size) {
+         cs_wait_slots(mali_cmd_cs(cmd, vt ? MALI_SUBQUEUE_VERTEX_TILER : MALI_SUBQUEUE_COMPUTE),
+                       dev->csf->sb.all_iters_mask);
+         w->used = 0;
       }
-      list_addtail(&s->link, &cmd->slabs);
-      wls_ptr = s->bo.gpu_va;
+#else
+      struct mali_wls_state *w = &cmd->wls;
+      (void)vt;
+#endif
+      if (w->used + total > w->size) {
+         const bool std = total <= MALI_WLS_SLAB_SIZE;
+         struct mali_cmd_slab *s = NULL;
+         if (std) {
+            simple_mtx_lock(&dev->slab_lock);
+            if (!list_is_empty(&dev->free_wls_slabs)) {
+               s = list_first_entry(&dev->free_wls_slabs, struct mali_cmd_slab, link);
+               list_del(&s->link);
+               dev->free_wls_slab_count--;
+            }
+            simple_mtx_unlock(&dev->slab_lock);
+         }
+         if (!s) {
+            s = calloc(1, sizeof(*s));
+            const struct mali_kbase_alloc_info ai = {
+               .size = std ? MALI_WLS_SLAB_SIZE : total,
+               .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS |
+                                                      KB_MEM_GPU_VA_SAME_4GB_PAGE),
+               .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
+            };
+            if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
+               free(s);
+               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+               return 0;
+            }
+            s->wls = std;
+         }
+         list_addtail(&s->link, &cmd->slabs);
+         w->gpu = s->bo.gpu_va;
+         w->size = s->bo.size;
+         w->used = 0;
+      }
+      wls_ptr = w->gpu + w->used;
+      w->used += total;
    }
 
    struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(LOCAL_STORAGE), 64);
@@ -406,6 +451,13 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       }
    }
    return p.gpu;
+}
+
+static inline uint64_t
+mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                 const struct mali_thread_props *tp, const uint32_t groups[3])
+{
+   return mali_compute_tsd_in(cmd, cs, tp, groups, false);
 }
 
 /* ---------------------------------------------------------------------- */

@@ -116,7 +116,7 @@ mali_version_h = vcs_tag(
 # binaries (vk/gen_shader_cache_id.py), not from the commit, so a driver
 # update that leaves the compiler alone keeps applications' pipeline caches.
 # One hash per architecture: a change only the v9 build sees leaves the
-# v10 and v11 ones alone.
+# v10, v11 and v12 ones alone.
 # The script runs on every build and rewrites the header only on a change.
 mali_shader_cache_id_h = custom_target(
   'mali_shader_cache_id.h',
@@ -188,6 +188,8 @@ malisx2_vk = static_library(
   # The measurement layer's configuration, output and CPU profile
   # (MALISX2_MEASURE); the recording side is per back half.
   files('measurement/config.c', 'measurement/cpuprof.c'),
+  # The tessellator on the CPU, for constant tessellation levels.
+  with_poly ? files('vk/mali_tess_cpu.c') : [],
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],

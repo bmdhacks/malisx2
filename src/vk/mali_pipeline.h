@@ -200,6 +200,9 @@ struct mali_graphics_pipeline {
    struct mali_shader *fs;              /* reference, NULL without a fragment stage */
    struct mali_gs_shaders *gs;          /* NULL without a geometry stage */
    struct mali_tess_shaders *tess;      /* NULL without tessellation */
+   /* With constant tessellation levels: the patch's tessellation
+    * (mali_tess_pattern.h), else NULL. */
+   struct mali_tess_pattern *tess_pattern;
    struct mali_bo_ref zsd_mem;          /* bind.zsd */
 
    /* Which states are dynamic (MESA_VK_DYNAMIC_*). */

@@ -140,7 +140,7 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
 }
 
 void
-mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled)
+mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled, uint32_t heap_waits)
 {
    struct mali_jm_heap *h = &jd->heap;
    if (h->count >= MALI_JM_HEAP_SLOTS_GROWN)
@@ -148,6 +148,9 @@ mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled)
    if (tiled > h->count) {
       h->win_hits++;
       h->win_max = MAX2(h->win_max, tiled);
+   } else if (heap_waits) {
+      h->win_hits++;
+      h->win_max = MAX2(h->win_max, h->count * 2);
    }
    if (++h->win_len < MALI_JM_HEAP_GROW_WINDOW)
       return;

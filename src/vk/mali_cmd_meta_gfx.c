@@ -48,6 +48,7 @@
 #include "mali_jm.h"
 #endif
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "compiler/nir/nir_builder.h"
@@ -86,6 +87,11 @@ struct mali_meta_gfx {
       struct mali_shader *shader;
    } e[META_FS_CACHE_SIZE];
 };
+
+/* The push constants become the fragment shader's FAU words, which a
+ * larger block overruns: the shader then faults with an invalid encoding
+ * (exception 0x51). */
+static_assert(sizeof(struct mali_meta_fs_push) <= 256, "meta fs push constants too large");
 
 static nir_def *
 push_load(nir_builder *b, unsigned comps, unsigned bits, size_t offset)
@@ -235,6 +241,63 @@ blit_zs(nir_builder *b, unsigned tex, nir_def *pos, nir_def *xy, nir_def *layer,
 }
 #endif
 
+#if PAN_ARCH < 9
+/* MALI_META_FS_QUERY: build_query_copy_nir (mali_cmd_copy.c) with the
+ * query index from the fragment position instead of the invocation ID. */
+static void
+query_copy_fs(nir_builder *b, const struct mali_meta_fs_key *key, nir_def *xy)
+{
+#define QP(field, bits) push_load(b, 1, bits, offsetof(struct mali_meta_fs_push, field))
+   nir_def *id = nir_iadd(b, nir_channel(b, xy, 0),
+                          nir_imul_imm(b, nir_channel(b, xy, 1), MALI_META_QUERY_ROW));
+   nir_push_if(b, nir_iand(b, nir_ult_imm(b, nir_channel(b, xy, 0), MALI_META_QUERY_ROW),
+                           nir_ult(b, id, QP(query_count, 32))));
+   {
+      nir_def *id64 = nir_u2u64(b, id);
+      nir_def *val_addr =
+         nir_iadd(b, QP(query_val, 64), nir_imul(b, id64, nir_u2u64(b, QP(query_val_stride, 32))));
+      nir_def *avail_addr = nir_iadd(
+         b, QP(query_avail, 64), nir_imul(b, id64, nir_u2u64(b, QP(query_avail_stride, 32))));
+      nir_def *dst_addr =
+         nir_iadd(b, QP(query_dst, 64), nir_imul(b, id64, nir_u2u64(b, QP(query_dst_stride, 32))));
+      nir_def *flags = QP(query_flags, 32);
+
+      nir_def *avail = nir_ine_imm(b, nir_load_global(b, 1, 64, avail_addr, .align_mul = 8), 0);
+      nir_def *wide = nir_ine_imm(b, nir_iand_imm(b, flags, VK_QUERY_RESULT_64_BIT), 0);
+      nir_def *partial = nir_ine_imm(b, nir_iand_imm(b, flags, VK_QUERY_RESULT_PARTIAL_BIT), 0);
+
+      nir_push_if(b, nir_ior(b, avail, partial));
+      {
+         nir_def *v = nir_load_global(b, 1, 64, val_addr, .align_mul = 8);
+         for (unsigned i = 1; i < key->query_reports; i++)
+            v = nir_iadd(b, v, nir_load_global(b, 1, 64, nir_iadd_imm(b, val_addr, i * 8),
+                                               .align_mul = 8));
+         nir_push_if(b, wide);
+         nir_store_global(b, v, dst_addr, .write_mask = 1, .align_mul = 8);
+         nir_push_else(b, NULL);
+         nir_store_global(b, nir_u2u32(b, nir_umin(b, v, nir_imm_int64(b, UINT32_MAX))),
+                          dst_addr, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+
+      nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags, VK_QUERY_RESULT_WITH_AVAILABILITY_BIT), 0));
+      {
+         nir_push_if(b, wide);
+         nir_store_global(b, nir_b2i64(b, avail), nir_iadd_imm(b, dst_addr, 8), .write_mask = 1,
+                          .align_mul = 8);
+         nir_push_else(b, NULL);
+         nir_store_global(b, nir_b2i32(b, avail), nir_iadd_imm(b, dst_addr, 4), .write_mask = 1,
+                          .align_mul = 4);
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+#undef QP
+}
+#endif
+
 static nir_shader *
 build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
 {
@@ -261,7 +324,8 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
    for (unsigned i = 0; i < 8; i++)
       need_area |= key->rt_op[i] == MALI_META_FS_CLEAR_IN_AREA ||
                    key->rt_op[i] == MALI_META_FS_BLIT ||
-                   key->rt_op[i] == MALI_META_FS_COPY;
+                   key->rt_op[i] == MALI_META_FS_COPY ||
+                   key->rt_op[i] == MALI_META_FS_STORE;
    need_area |= key->z_op == MALI_META_FS_CLEAR_IN_AREA ||
                 key->s_op == MALI_META_FS_CLEAR_IN_AREA;
 #if PAN_ARCH < 9
@@ -281,6 +345,48 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
       const enum mali_meta_fs_op op = key->rt_op[i];
       if (op == MALI_META_FS_NONE)
          continue;
+#if PAN_ARCH < 9
+      if (op == MALI_META_FS_QUERY) {
+         query_copy_fs(b, key, xy);
+         continue;
+      }
+      if (op == MALI_META_FS_STORE) {
+         /* The source block as COPY reads it, written raw to memory: only
+          * inside the area (a raw load or store outside it could touch
+          * anything). No output: the pass has no target. */
+         const unsigned elem = 1u << key->copy_elem_log2;
+         unsigned comps, bits;
+         raw_block_type(elem, &comps, &bits);
+         nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
+         nir_def *sxy = nir_iadd(b, xy, delta);
+         nir_push_if(b, inside);
+         nir_def *in;
+         if (key->copy_src_fmt) {
+            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+            in = raw_to_uvec4(
+               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+         } else {
+            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                                   : copy_raw_load(b, key, sxy, layer);
+         }
+         nir_def *dxy =
+            nir_iadd(b, xy, push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, store_delta)));
+         nir_def *addr = surface_addr(
+            b, push_load(b, 1, 64, offsetof(struct mali_meta_fs_push, store_dst)),
+            nir_imm_int64(b, 0),
+            push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, store_row_stride)),
+            nir_channel(b, dxy, 0), nir_channel(b, dxy, 1), nir_imm_int(b, 0),
+            push_load(b, 1, 32, offsetof(struct mali_meta_fs_push, store_tile_shift)), elem);
+         nir_def *v = nir_trim_vector(b, in, comps);
+         if (bits != 32)
+            v = nir_u2uN(b, v, bits);
+         nir_store_global(b, v, addr, .align_mul = MIN2(elem, 16),
+                          .write_mask = BITFIELD_MASK(comps));
+         nir_pop_if(b, NULL);
+         tex += key->copy_src_tex ? 1 : 0;
+         continue;
+      }
+#endif
       const nir_alu_type type = nir_type(key->rt_type[i]);
       nir_def *clear = push_load(b, 4, 32, offsetof(struct mali_meta_fs_push, clear_color) + 16 * i);
       nir_def *v;

@@ -58,6 +58,7 @@
 #define mali_jm_cmd_pass_split MALI_PER_ARCH(jm_cmd_pass_split)
 #define mali_jm_cmd_prepare_submit MALI_PER_ARCH(jm_cmd_prepare_submit)
 #define mali_jm_cmd_transfer_needs_frag MALI_PER_ARCH(jm_cmd_transfer_needs_frag)
+#define mali_jm_cmd_transfer_waits_frag MALI_PER_ARCH(jm_cmd_transfer_waits_frag)
 #define mali_jm_cmd_vtc MALI_PER_ARCH(jm_cmd_vtc)
 #define mali_jm_cmd_vtc_draw MALI_PER_ARCH(jm_cmd_vtc_draw)
 #define mali_jm_cmd_vtc_value MALI_PER_ARCH(jm_cmd_vtc_value)

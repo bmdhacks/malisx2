@@ -420,6 +420,152 @@ oom:
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 }
 
+#if PAN_ARCH < 9
+/*
+ * v7: an image -> buffer copy out of a plane a render pass writes (colour
+ * or depth/stencil attachment), done by a fragment-side pass over the
+ * source rectangle whose frame shader stores each block into the buffer
+ * (MALI_META_FS_STORE) instead of the compute copy.
+ *
+ * Such a copy usually reads what the pass before it just rendered (a
+ * render target written back to memory, Vita3K's surface sync). The
+ * compute copy would wait on the vtc slot for that pass's fragment work,
+ * and every later vtc atom waits behind it in the slot order, so no later
+ * pass could tile while the earlier ones shade. On the fragment slot the
+ * copy follows the rendering in the slot order and holds up no tiling. It
+ * is a fragment-side transfer of its batch, which barriers from transfer
+ * stages wait for (mali_jm.h).
+ *
+ * One layer of a 2D image, uncompressed blocks of 1 to 16 bytes into a
+ * linear buffer; anything else keeps the compute copy. False when it does
+ * not apply.
+ */
+static bool
+copy_to_buffer_frag(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned plane,
+                    unsigned level, unsigned layer, int sx, int sy,
+                    const struct copy_surface *src, const struct copy_surface *dst, uint32_t w,
+                    uint32_t h, uint32_t layers)
+{
+   /* A plane a render pass writes, or any plane while the compute copy
+    * would wait for fragment work (it was just blitted or copied on the
+    * fragment side: Vita3K's surface sync blits into a staging image and
+    * copies that out). */
+   if (!((img->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ||
+         mali_jm_cmd_transfer_waits_frag(cmd)) ||
+       img->vk.image_type != VK_IMAGE_TYPE_2D || layers != 1 || src->block_w != 1 ||
+       src->block_h != 1 || !util_is_power_of_two_nonzero(src->block_bytes) ||
+       src->block_bytes > 16 || !w || !h)
+      return false;
+   const bool afbc = mali_image_is_afbc(img);
+
+   struct mali_meta_fs_key key = {
+      .copy_src_tex = afbc,
+      .copy_elem_log2 = util_logbase2(src->block_bytes),
+   };
+   key.rt_op[0] = MALI_META_FS_STORE;
+   key.rt_type[0] = MALI_META_FS_UINT;
+   if (afbc)
+      key.copy_src_fmt = v7_copy_fmt(img, plane);
+
+   struct mali_meta_fs_push push = {
+      .area = {sx, sy, sx + (int32_t)w - 1, sy + (int32_t)h - 1},
+      .copy_row_stride = src->row_stride,
+      .copy_tile_shift = src->tile_shift,
+      .copy_src = src->base,
+      .copy_layer_stride = src->layer_stride,
+      .store_delta = {-sx, -sy},
+      .store_row_stride = dst->row_stride,
+      .store_tile_shift = dst->tile_shift,
+      .store_dst = dst->base,
+   };
+
+   uint32_t tex[1][8];
+   unsigned ntex = 0;
+   if (afbc) {
+      if (!MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, img, plane, copy_read_format(img, plane),
+                                                 level, layer, 1, tex[ntex++])) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return true;
+      }
+   }
+   const struct mali_render_blit blit = {
+      .key = &key,
+      .push = &push,
+      .textures = (const uint32_t(*)[8])tex,
+      .texture_count = ntex,
+   };
+   struct mali_render_desc d = {
+      .width = u_minify(img->vk.extent.width, level),
+      .height = u_minify(img->vk.extent.height, level),
+      .area = {{sx, sy}, {w, h}},
+      .layer_count = 1,
+      .rt_count = 0,
+      .blit = &blit,
+   };
+   transfer_pass(cmd, &d);
+   return true;
+}
+#endif
+
+#if PAN_ARCH < 9
+/*
+ * v7: a buffer -> image copy that the compute copy would do while it has to
+ * wait for fragment work (a texture upload into an image that passes
+ * before it sampled), done by a fragment-side pass over the destination
+ * blocks whose frame shader stores each block from the buffer into the
+ * image's own layout (MALI_META_FS_STORE). Why: copy_to_buffer_frag. A
+ * fresh image's first copy waits for nothing and keeps the compute copy.
+ *
+ * One layer of a 2D, non-AFBC plane (compressed images in whole blocks),
+ * blocks of 1 to 16 bytes; anything else keeps the compute copy. False
+ * when it does not apply.
+ */
+static bool
+copy_to_image_frag(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned level,
+                   const struct copy_surface *src, const struct copy_surface *dst, int dx,
+                   int dy, uint32_t w, uint32_t h, uint32_t layers)
+{
+   if (cmd->jm.xfer_fresh || !mali_jm_cmd_transfer_waits_frag(cmd) || mali_image_is_afbc(img) ||
+       img->vk.image_type != VK_IMAGE_TYPE_2D || layers != 1 ||
+       !util_is_power_of_two_nonzero(dst->block_bytes) || dst->block_bytes > 16 || src->tile_shift ||
+       !w || !h)
+      return false;
+
+   struct mali_meta_fs_key key = {
+      .copy_elem_log2 = util_logbase2(dst->block_bytes),
+   };
+   key.rt_op[0] = MALI_META_FS_STORE;
+   key.rt_type[0] = MALI_META_FS_UINT;
+   struct mali_meta_fs_push push = {
+      .area = {dx, dy, dx + (int32_t)w - 1, dy + (int32_t)h - 1},
+      .copy_delta = {-dx, -dy},
+      .copy_row_stride = src->row_stride,
+      .copy_tile_shift = 0,
+      .copy_src = src->base,
+      .copy_layer_stride = src->layer_stride,
+      .store_row_stride = dst->row_stride,
+      .store_tile_shift = dst->tile_shift,
+      .store_dst = dst->base,
+   };
+   const struct mali_render_blit blit = {
+      .key = &key,
+      .push = &push,
+   };
+   /* The pass is over the plane's blocks, one fragment per block. */
+   struct mali_render_desc d = {
+      .width = DIV_ROUND_UP(u_minify(img->vk.extent.width, level), dst->block_w),
+      .height = DIV_ROUND_UP(u_minify(img->vk.extent.height, level), dst->block_h),
+      .area = {{dx, dy}, {w, h}},
+      .layer_count = 1,
+      .rt_count = 0,
+      .blit = &blit,
+   };
+   transfer_pass(cmd, &d);
+   return true;
+}
+#endif
+
 /* Blocks of an AFBC plane into a raw surface: the compute copy reading
  * through the texture unit. */
 static void
@@ -509,6 +655,14 @@ copy_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
 #endif
 }
 
+#if PAN_ARCH < 9
+static bool one_to_one_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
+                                   const struct mali_image *dst);
+static void blit_layers_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
+                           const struct mali_image *dst, const VkImageBlit2 *r, VkFilter filter,
+                           uint32_t src_layer, uint32_t dst_layer, uint32_t layers);
+#endif
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdCopyImage2)(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *info)
 {
@@ -551,6 +705,32 @@ MALI_PER_ARCH(CmdCopyImage2)(VkCommandBuffer commandBuffer, const VkCopyImageInf
          const uint32_t h = DIV_ROUND_UP(r->extent.height, s.block_h);
          const unsigned splane = aspect_plane(src, aspect);
          const unsigned dplane = aspect_plane(dst, daspect);
+#if PAN_ARCH < 9
+         /* An image copy between identical formats is an unscaled blit:
+          * on the fragment side when the compute copy would wait for
+          * fragment work there (one_to_one_on_fragment). */
+         if (src->vk.format == dst->vk.format && aspect == daspect && !src3d && !dst3d &&
+             s.block_w == 1 && s.block_h == 1 && !mali_image_is_afbc(src) &&
+             !mali_image_is_afbc(dst) && one_to_one_on_fragment(cmd, src, dst)) {
+            const VkImageBlit2 br = {
+               .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+               .srcSubresource = {aspect, r->srcSubresource.mipLevel,
+                                  r->srcSubresource.baseArrayLayer, layers},
+               .srcOffsets = {{r->srcOffset.x, r->srcOffset.y, 0},
+                              {r->srcOffset.x + (int32_t)r->extent.width,
+                               r->srcOffset.y + (int32_t)r->extent.height, 1}},
+               .dstSubresource = {aspect, r->dstSubresource.mipLevel,
+                                  r->dstSubresource.baseArrayLayer, layers},
+               .dstOffsets = {{r->dstOffset.x, r->dstOffset.y, 0},
+                              {r->dstOffset.x + (int32_t)r->extent.width,
+                               r->dstOffset.y + (int32_t)r->extent.height, 1}},
+            };
+            blit_layers_v7(cmd, src, dst, &br, VK_FILTER_NEAREST,
+                           r->srcSubresource.baseArrayLayer, r->dstSubresource.baseArrayLayer,
+                           layers);
+            continue;
+         }
+#endif
          if (mali_image_is_afbc(dst) || copy_on_fragment(cmd, src, dst, aspect, &s)) {
             const struct copy_src cs = {
                .img = mali_image_is_afbc(src) ? src : NULL,
@@ -609,6 +789,11 @@ MALI_PER_ARCH(CmdCopyBufferToImage2)(VkCommandBuffer commandBuffer, const VkCopy
       const uint32_t w = DIV_ROUND_UP(r->imageExtent.width, d.block_w);
       const uint32_t h = DIV_ROUND_UP(r->imageExtent.height, d.block_h);
       const uint32_t layers = subresource_layers(&img->vk, &r->imageSubresource, &r->imageExtent);
+#if PAN_ARCH < 9
+      if (copy_to_image_frag(cmd, img, r->imageSubresource.mipLevel, &s, &d, dx, dy, w, h,
+                             layers))
+         continue;
+#endif
       if (mali_image_is_afbc(img)) {
          const struct copy_src cs = {.raw = s, .x = 0, .y = 0};
          copy_to_afbc(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
@@ -649,6 +834,12 @@ MALI_PER_ARCH(CmdCopyImageToBuffer2)(VkCommandBuffer commandBuffer, const VkCopy
                                    (uint64_t)(layers - 1) * d.layer_stride +
                                       (uint64_t)(h - 1) * d.row_stride +
                                       (uint64_t)w * d.block_bytes);
+#endif
+#if PAN_ARCH < 9
+      if (copy_to_buffer_frag(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
+                              r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer,
+                              sx, sy, &s, &d, w, h, layers))
+         continue;
 #endif
       if (mali_image_is_afbc(img))
          copy_from_afbc(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
@@ -792,6 +983,40 @@ blit_axis(int32_t s0, int32_t s1, int32_t d0, int32_t d1, uint32_t size, float *
 
 #if PAN_ARCH < 9
 /*
+ * An unscaled copy between identical formats that the compute copy would
+ * do on the vtc chain while it has to wait for fragment work (the open
+ * batch's, or a render target's that an earlier pass drew: Vita3K's
+ * surface copies right after the pass that drew the source). Every later
+ * vtc atom would wait behind it in the slot order, so no later pass could
+ * tile while the earlier ones shade. The blit pass does it on the
+ * fragment slot instead, behind the rendering it reads (as
+ * copy_to_buffer_frag). The pass draws into the destination and samples
+ * the source, so their format must be renderable and sampleable; the
+ * images' usage flags do not matter (neither is AFBC here, and a plain
+ * plane renders and samples whatever it was created for: Vita3K's surface
+ * sync blits a render target into a TRANSFER_SRC | TRANSFER_DST image).
+ */
+static bool
+one_to_one_on_fragment(struct mali_cmd_buffer *cmd, const struct mali_image *src,
+                       const struct mali_image *dst)
+{
+   /* Linear planes keep the compute copy: a render target's row stride has
+    * alignment rules a linear image need not meet. */
+   if (dst->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR ||
+       src->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR)
+      return false;
+   const VkFormatFeatureFlags feat =
+      mali_format_image_features(mali_device_physical(cmd->dev), dst->vk.format);
+   if (!(feat & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) ||
+       !(feat & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+      return false;
+   const VkImageUsageFlags rt =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   return (src->vk.usage & rt) || mali_jm_cmd_transfer_waits_frag(cmd);
+}
+
+/*
  * Layers [src_layer, src_layer + layers) of `src` into as many from
  * dst_layer of `dst` (Z slices on a 3D side) for one region of
  * vkCmdBlitImage2 on v7: the blit pass of CmdBlitImage2 below, plus depth
@@ -800,7 +1025,8 @@ blit_axis(int32_t s0, int32_t s1, int32_t d0, int32_t d1, uint32_t size, float *
  * between identical formats, with NEAREST). An unscaled, unflipped region
  * between identical formats with no compressed or AFBC image and texels of
  * 1, 2, 4, 8 or 16 bytes is a raw copy of each aspect's plane on the
- * compute copy instead (dispatch_copy, which copies no other block size).
+ * compute copy instead (dispatch_copy, which copies no other block size),
+ * unless one_to_one_on_fragment says it belongs on the fragment side.
  */
 static void
 blit_layers_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
@@ -841,7 +1067,10 @@ blit_layers_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
       util_is_power_of_two_nonzero(sbytes) && sbytes <= 16 &&
       !mali_image_is_afbc(src) && !mali_image_is_afbc(dst) &&
       (src3d || dst3d || vk_image_subresource_layer_count(&src->vk, &r->srcSubresource) == layers);
-   if (one_to_one) {
+   if (one_to_one && one_to_one_on_fragment(cmd, src, dst)) {
+      /* The blit pass at texel centres, nearest: the same texels. */
+      filter = VK_FILTER_NEAREST;
+   } else if (one_to_one) {
       u_foreach_bit(a, aspects) {
          const VkImageAspectFlags aspect = BITFIELD_BIT(a);
          if ((aspect == VK_IMAGE_ASPECT_DEPTH_BIT && !depth) ||

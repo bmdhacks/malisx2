@@ -555,7 +555,24 @@ enum mali_meta_fs_op {
                                 * copy_src_tex, else a raw surface in memory);
                                 * outside, texture copy_src_tex ? 1 : 0 (the
                                 * target itself). Render target 0 only. */
+   MALI_META_FS_STORE,         /* v7: inside the area, the source block at the
+                                * fragment's position + copy_delta (read as
+                                * COPY reads it) stored raw into a surface in
+                                * memory (linear or u-interleaved,
+                                * store_tile_shift) at the fragment's
+                                * position + store_delta; no colour output.
+                                * Render target 0 only, with no target: the
+                                * fragment-side image -> buffer and buffer ->
+                                * image copies. */
+   MALI_META_FS_QUERY,         /* v7: vkCmdCopyQueryPoolResults on the fragment
+                                * side, one fragment per query (query x + y *
+                                * MALI_META_QUERY_ROW), what the compute copy
+                                * writes (build_query_copy_nir); no colour
+                                * output, render target 0 only, no target. */
 };
+
+/* MALI_META_FS_QUERY: queries per row of the pass. */
+#define MALI_META_QUERY_ROW 256
 
 enum mali_meta_fs_type {
    MALI_META_FS_FLOAT = 0,
@@ -573,7 +590,7 @@ struct mali_meta_fs_key {
    /* COPY on v7 (enum mali_meta_copy_fmt, RAW on v9 and v11): the format
     * an AFBC target is written in (dst) or an AFBC source read in (src). */
    uint8_t copy_dst_fmt, copy_src_fmt;
-   uint8_t pad[1];
+   uint8_t query_reports;      /* QUERY: 64-bit counters summed per query */
 };
 
 /*
@@ -617,7 +634,17 @@ struct mali_meta_fs_push {
    /* v7: the layer a frame shader runs for (v7 has no frame argument, so
     * each layer has its own frame shader Draws). Unused on v9 and v11. */
    uint32_t layer;
-   uint32_t clear_color[8][4];
+   union {
+      uint32_t clear_color[8][4];
+      /* QUERY (no clears): struct meta_query_push of mali_cmd_copy.c. Here,
+       * not after the other fields, to keep the block small: a fragment
+       * shader's push constants have to fit its FAU words. */
+      struct {
+         uint64_t query_val, query_avail, query_dst;
+         uint32_t query_val_stride, query_avail_stride, query_dst_stride;
+         uint32_t query_count, query_flags, query_pad;
+      };
+   };
    /* COPY: source block = fragment position + delta (in blocks); a raw
     * source surface is addressed as the raw compute copy does
     * (mali_meta_copy_push), its block (0, 0) of layer 0 at copy_src. */
@@ -626,6 +653,12 @@ struct mali_meta_fs_push {
    uint32_t copy_tile_shift;
    uint64_t copy_src;
    uint64_t copy_layer_stride;
+   /* STORE: destination block = fragment position + delta, a surface
+    * addressed as the raw compute copy does, its block (0, 0) at store_dst. */
+   int32_t store_delta[2];
+   uint32_t store_row_stride;
+   uint32_t store_tile_shift;
+   uint64_t store_dst;
 };
 
 /* The compiled shader for a key, cached for the device's lifetime. NULL on

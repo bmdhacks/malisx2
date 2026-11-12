@@ -560,6 +560,14 @@ void mali_jm_cmd_pass_images(struct mali_cmd_buffer *cmd);
  * image copy then goes to the fragment side instead (mali_cmd_image.c). */
 bool mali_jm_cmd_transfer_needs_frag(struct mali_cmd_buffer *cmd);
 
+/* Would a transfer job on the vtc chain wait for fragment work now, this
+ * batch's or an earlier one's (a recorded barrier from fragment or
+ * fragment-side transfer stages)? Every later vtc atom would wait behind
+ * it in the slot order, so v7 does such a copy on the fragment side where
+ * it can (mali_cmd_image.c). Requirements carried from an earlier command
+ * buffer are not known here. */
+bool mali_jm_cmd_transfer_waits_frag(struct mali_cmd_buffer *cmd);
+
 /* The open batch's current fragment segment, started if the batch has
  * none; with new_segment, always a new one (a new fragment atom). Applies
  * the barriers recorded for fragment work. NULL on failure. The vtc
@@ -758,7 +766,7 @@ bool mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b);
 /* After a submission is built: it had `tiled` batches with a heap slot.
  * Grows the ring when submissions keep wrapping it (mali_jm.h). With
  * dev->lock held. */
-void mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled);
+void mali_jm_heap_note_submit(struct mali_jm_device *jd, uint32_t tiled, uint32_t heap_waits);
 
 #if PAN_ARCH < 9
 /* ---------------------------------------------------------------------- */
@@ -1027,8 +1035,13 @@ struct mali_jm_atom_info {
  * batch in the same submission, which cannot have finished yet. When that
  * happens in MALI_JM_HEAP_GROW_HITS of MALI_JM_HEAP_GROW_WINDOW submissions,
  * the ring grows to the most tiled batches one of them had, rounded up to a
- * multiple of 4 (mali_jm_heap_note_submit). An application with few passes
- * per submission keeps 4 slots and 8 MiB.
+ * multiple of 4 (mali_jm_heap_note_submit). A submission also counts when
+ * a batch's tiling waits for fragment work that the queue has not seen
+ * finish only because that work last read the batch's slot: many small
+ * submissions (Vita3K submits once or twice a pass) wrap the ring across
+ * submissions, and the next pass cannot tile while the earlier ones
+ * shade. Then the ring doubles. An application with few passes that the
+ * ring keeps up with stays at 4 slots and 8 MiB.
  */
 #define MALI_JM_HEAP_SLOTS_MAX 32
 #define MALI_JM_HEAP_SLOTS 4
@@ -1134,6 +1147,8 @@ struct mali_jm_queue {
    /* Per tiler heap slot, the last fragment atom that used it. */
    mali_jm_ref heap_last_frag[MALI_JM_HEAP_SLOTS_MAX];
    uint32_t submit_tiled;   /* batches with a heap slot in the submission being built */
+   uint32_t submit_heap_waits; /* of those, ones whose tiling waits for a fragment
+                                * atom only because it last read their slot */
    /* Submissions with atoms so far, the last one's tracker, and the
     * newest submission whose tracker event has been read. */
    uint64_t seq;

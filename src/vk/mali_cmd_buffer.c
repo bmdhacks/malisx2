@@ -243,6 +243,7 @@ init_streams(struct mali_cmd_buffer *cmd)
        * (finish_stream, mali_queue.c). */
       cmd->cs[i].iter_sb = MALI_SB_ITER_START;
 #endif
+      cmd->cs[i].compute_res = false;
       cmd->cs[i].flushed = (struct mali_cache_flush){0};
       memset(cmd->cs[i].carried, 0, sizeof(cmd->cs[i].carried));
       memset(cmd->cs[i].waited, 0, sizeof(cmd->cs[i].waited));
@@ -427,6 +428,13 @@ finish_stream(struct mali_cmd_buffer *cmd, unsigned sq)
                    MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
                    cs_defer(0, MALI_SB_IMM_FLUSH));
    cs_wait_slot(b, MALI_SB_IMM_FLUSH);
+   /* Every job has finished (the wait above), so the compute resource the
+    * vertex/tiler stream asked for can go: the next command buffer starts
+    * with the stream's usual resources. */
+   if (cmd->cs[sq].compute_res) {
+      cs_req_res(b, mali_subqueue_resources(sq));
+      cmd->cs[sq].compute_res = false;
+   }
 #if PAN_ARCH == 10
    /* Hand the stream back with the first iterator entry selected, which
     * the next command buffer's recording assumes (mali_cmd_next_iter_sb). */

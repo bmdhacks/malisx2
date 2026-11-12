@@ -104,7 +104,9 @@ mali_cs_subqueue_ctx_reg(struct cs_builder *b)
    return cs_reg64(b, MALI_CS_REG_SUBQUEUE_CTX);
 }
 
-/* The resources each subqueue asks the firmware for (panvk). */
+/* The resources each subqueue asks the firmware for when the queue starts
+ * it (panvk). The vertex/tiler stream asks for compute too only while a
+ * command buffer runs compute jobs on it (mali_cmd_vt_compute_res). */
 static inline uint32_t
 mali_subqueue_resources(enum mali_subqueue sq)
 {

@@ -8,3 +8,12 @@ option(
                 'that returns void aborts the process instead of being ' +
                 'logged and skipped.',
 )
+
+option(
+  'poly',
+  type : 'feature',
+  value : 'auto',
+  description : 'Geometry and tessellation shaders through Mesa\'s libpoly, ' +
+                'which needs Mesa\'s mesa_clc and vtn_bindgen2 on the build ' +
+                'machine (Mesa -Dmesa-clc=enabled -Dinstall-mesa-clc=true).',
+)

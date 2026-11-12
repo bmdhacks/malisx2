@@ -311,6 +311,227 @@ build_indirect_dispatch_nir(struct mali_device *dev)
 }
 #endif /* PAN_ARCH < 10 */
 
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+#include "compiler/nir/nir_precompiled.h"
+#include "compiler/spirv/nir_spirv.h"
+#include "mali_tess_spv.h"
+
+/*
+ * The tessellator's kernels (vk/cl/mali_tess.cl): SPIR-V to a compute
+ * shader the normal compile path takes, after Mesa's panfrost_compile
+ * (src/panfrost/clc/pan_compile.c, which does it at build time for panvk's
+ * internal kernels): the library, then a shader per kernel with its
+ * arguments in push constants (struct mali_meta_tess_push), its functions
+ * inlined and its memory access lowered to the generic address format.
+ */
+static const struct spirv_to_nir_options cl_spirv_options = {
+   .environment = NIR_SPIRV_OPENCL,
+   .shared_addr_format = nir_address_format_62bit_generic,
+   .global_addr_format = nir_address_format_62bit_generic,
+   .temp_addr_format = nir_address_format_62bit_generic,
+   .constant_addr_format = nir_address_format_64bit_global,
+   .create_library = true,
+   .printf = true,
+};
+
+static void
+cl_optimize(nir_shader *nir)
+{
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_split_var_copies);
+      NIR_PASS(progress, nir, nir_lower_var_copies);
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_deref);
+      NIR_PASS(progress, nir, nir_opt_copy_prop_vars);
+      NIR_PASS(progress, nir, nir_opt_undef);
+      NIR_PASS(progress, nir, nir_lower_undef_to_zero, NULL);
+   } while (progress);
+}
+
+static nir_def *
+cl_kernel_arg(nir_builder *b, unsigned num_components, unsigned bit_size, unsigned offset_B)
+{
+   return nir_load_push_constant(b, num_components, bit_size, nir_imm_int(b, offset_B),
+                                 .base = 0, .range = sizeof(struct mali_meta_tess_push));
+}
+
+static nir_shader *
+build_tess_nir(struct mali_device *dev, enum mali_meta_shader m)
+{
+   static const char *const names[] = {
+      [MALI_META_TESS_COUNT_ISOLINES] = "mali_tess_count_isolines",
+      [MALI_META_TESS_COUNT_TRIANGLES] = "mali_tess_count_triangles",
+      [MALI_META_TESS_COUNT_QUADS] = "mali_tess_count_quads",
+      [MALI_META_TESS_WRITE_ISOLINES] = "mali_tess_write_isolines",
+      [MALI_META_TESS_WRITE_TRIANGLES] = "mali_tess_write_triangles",
+      [MALI_META_TESS_WRITE_QUADS] = "mali_tess_write_quads",
+      [MALI_META_TESS_FINISH] = "mali_tess_finish",
+   };
+   const nir_shader_compiler_options *options =
+      MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE);
+
+   nir_shader *lib = spirv_to_nir(mali_tess_spv, ARRAY_SIZE(mali_tess_spv), NULL,
+                                  MESA_SHADER_KERNEL, "library", &cl_spirv_options, options);
+   if (!lib)
+      return NULL;
+   nir_fixup_is_exported(lib);
+   NIR_PASS(_, lib, nir_lower_system_values);
+   NIR_PASS(_, lib, nir_lower_calls_to_builtins);
+   nir_lower_compute_system_values_options cs = {.global_id_is_32bit = true};
+   NIR_PASS(_, lib, nir_lower_compute_system_values, &cs);
+   NIR_PASS(_, lib, nir_lower_printf, &(const struct nir_lower_printf_options){0});
+   NIR_PASS(_, lib, nir_lower_variable_initializers, nir_var_function_temp);
+   NIR_PASS(_, lib, nir_lower_returns);
+   NIR_PASS(_, lib, nir_inline_functions);
+   NIR_PASS(_, lib, nir_opt_copy_prop);
+   NIR_PASS(_, lib, nir_opt_deref);
+   nir_lower_constant_to_temp(lib);
+   NIR_PASS(_, lib, nir_lower_variable_initializers, ~0);
+   NIR_PASS(_, lib, nir_lower_vec3_to_vec4,
+            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared |
+               nir_var_mem_global | nir_var_mem_constant);
+   NIR_PASS(_, lib, nir_lower_vars_to_explicit_types, nir_var_uniform,
+            glsl_get_cl_type_size_align);
+   NIR_PASS(_, lib, nir_lower_explicit_io, nir_var_uniform,
+            nir_address_format_32bit_offset_as_64bit);
+
+   nir_function *kernel = NULL;
+   nir_foreach_entrypoint(f, lib) {
+      if (!strcmp(f->name, names[m]))
+         kernel = f;
+   }
+   if (!kernel) {
+      ralloc_free(lib);
+      return NULL;
+   }
+
+   const struct nir_precomp_opts opt = {.arg_align_B = 4};
+   nir_shader *s = nir_precompiled_build_variant(kernel, MESA_SHADER_COMPUTE, 0, options, &opt,
+                                                 cl_kernel_arg);
+   nir_link_shader_functions(s, lib);
+   NIR_PASS(_, s, nir_inline_functions);
+   nir_remove_non_entrypoints(s);
+   NIR_PASS(_, s, nir_opt_deref);
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_remove_dead_derefs);
+   NIR_PASS(_, s, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+   NIR_PASS(_, s, nir_lower_vars_to_explicit_types,
+            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared | nir_var_mem_global,
+            glsl_get_cl_type_size_align);
+   cl_optimize(s);
+   NIR_PASS(_, s, nir_remove_dead_variables, nir_var_all, NULL);
+   NIR_PASS(_, s, nir_lower_vars_to_explicit_types,
+            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared |
+               nir_var_mem_global | nir_var_mem_constant,
+            glsl_get_cl_type_size_align);
+   NIR_PASS(_, s, nir_lower_memcpy);
+   NIR_PASS(_, s, nir_lower_explicit_io, nir_var_mem_constant, nir_address_format_64bit_global);
+   NIR_PASS(_, s, nir_lower_convert_alu_types, NULL);
+   NIR_PASS(_, s, nir_opt_if, 0);
+   NIR_PASS(_, s, nir_opt_idiv_const, 16);
+   NIR_PASS(_, s, nir_opt_deref);
+   NIR_PASS(_, s, nir_lower_vars_to_ssa);
+   NIR_PASS(_, s, nir_lower_explicit_io,
+            nir_var_shader_temp | nir_var_function_temp | nir_var_mem_shared | nir_var_mem_global,
+            nir_address_format_62bit_generic);
+   cl_optimize(s);
+   NIR_PASS(_, s, nir_lower_vars_to_explicit_types, nir_var_shader_temp | nir_var_function_temp,
+            glsl_get_cl_type_size_align);
+   NIR_PASS(_, s, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+            glsl_get_cl_type_size_align);
+   ralloc_free(lib);
+   return s;
+}
+#endif
+
+#if PAN_ARCH >= 10
+#define LPUSH(b, field, bits)                                                  \
+   nir_load_push_constant(b, 1, bits,                                          \
+                          nir_imm_int(b, offsetof(struct mali_meta_lines_push, field)), \
+                          .base = 0, .range = sizeof(struct mali_meta_lines_push))
+
+static nir_def *
+lines_index(nir_builder *b, nir_def *src, nir_def *size, nir_def *pos)
+{
+   nir_def *addr = nir_iadd(b, src, nir_u2u64(b, nir_imul(b, pos, size)));
+   nir_def *v;
+   nir_push_if(b, nir_ieq_imm(b, size, 4));
+   nir_def *v4 = nir_load_global(b, 1, 32, addr, .align_mul = 4);
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ieq_imm(b, size, 2));
+   nir_def *v2 = nir_u2u32(b, nir_load_global(b, 1, 16, addr, .align_mul = 2));
+   nir_push_else(b, NULL);
+   nir_def *v1 = nir_u2u32(b, nir_load_global(b, 1, 8, addr, .align_mul = 1));
+   nir_pop_if(b, NULL);
+   v = nir_if_phi(b, v2, v1);
+   nir_pop_if(b, NULL);
+   v = nir_if_phi(b, v4, v);
+   return v;
+}
+
+/* Polygon mode line (mali_cmd_draw.c): one invocation per triangle. */
+static nir_shader *
+build_polygon_lines_nir(struct mali_device *dev)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
+      "mali_meta_polygon_lines");
+   b.shader->info.workgroup_size[0] = META_WG_SIZE;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *t = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_push_if(&b, nir_ult(&b, t, LPUSH(&b, count, 32)));
+   {
+      nir_def *mode = LPUSH(&b, mode, 32);
+      nir_def *first = LPUSH(&b, first, 32);
+      nir_def *src = LPUSH(&b, src, 64);
+      nir_def *size = LPUSH(&b, index_size, 32);
+      nir_def *restart = LPUSH(&b, restart, 32);
+      nir_def *list = nir_ieq_imm(&b, mode, MESA_PRIM_TRIANGLES);
+      nir_def *fan = nir_ieq_imm(&b, mode, MESA_PRIM_TRIANGLE_FAN);
+      /* List: 3t, 3t + 1, 3t + 2. Strip: t, t + 1, t + 2. Fan: 0, t + 1,
+       * t + 2. */
+      nir_def *base = nir_bcsel(&b, list, nir_imul_imm(&b, t, 3), t);
+      nir_def *pos[3] = {
+         nir_bcsel(&b, fan, nir_imm_int(&b, 0), base),
+         nir_bcsel(&b, fan, nir_iadd_imm(&b, t, 1), nir_iadd_imm(&b, base, 1)),
+         nir_bcsel(&b, fan, nir_iadd_imm(&b, t, 2), nir_iadd_imm(&b, base, 2)),
+      };
+      nir_def *idx[3];
+      nir_def *restarted = nir_imm_false(&b);
+      for (unsigned i = 0; i < 3; i++) {
+         nir_def *p = nir_iadd(&b, first, pos[i]);
+         nir_push_if(&b, nir_ine_imm(&b, src, 0));
+         nir_def *loaded = lines_index(&b, src, size, p);
+         nir_pop_if(&b, NULL);
+         idx[i] = nir_if_phi(&b, loaded, p);
+         restarted = nir_ior(&b, restarted, nir_iand(&b, nir_ine_imm(&b, restart, 0),
+                                                     nir_ieq(&b, idx[i], restart)));
+      }
+      nir_def *none = nir_imm_int(&b, ~0u);
+      nir_def *edges[6] = {idx[0], idx[1], idx[1], idx[2], idx[2], idx[0]};
+      for (unsigned i = 0; i < 6; i++)
+         edges[i] = nir_bcsel(&b, restarted, none, edges[i]);
+      nir_def *dst = nir_iadd(&b, LPUSH(&b, dst, 64), nir_u2u64(&b, nir_imul_imm(&b, t, 24)));
+      for (unsigned i = 0; i < 6; i++)
+         nir_store_global(&b, edges[i], nir_iadd_imm(&b, dst, 4 * i), .write_mask = 0x1,
+                          .align_mul = 4);
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+#endif
+
 /* The counters per query of the device's occlusion pools that have more than
  * one (v7: one per shader core ID, mali_query.c query_pool_alloc). */
 static unsigned
@@ -339,6 +560,14 @@ get_meta(struct mali_cmd_buffer *cmd, enum mali_meta_shader m)
 #if PAN_ARCH < 9
                         : m == MALI_META_INDEX_MINMAX
                            ? MALI_PER_ARCH(build_index_minmax_nir)(dev)
+#endif
+#if PAN_ARCH >= 10
+                        : m == MALI_META_POLYGON_LINES
+                           ? build_polygon_lines_nir(dev)
+#endif
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+                        : m >= MALI_META_TESS_COUNT_ISOLINES && m <= MALI_META_TESS_FINISH
+                           ? build_tess_nir(dev, m)
 #endif
                            : build_meta_nir(dev, m);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);

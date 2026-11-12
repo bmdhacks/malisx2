@@ -90,6 +90,10 @@ struct mali_cmd_cs {
     * (NEXT_SB_ENTRY). Placed in the padding after idle, so the struct's
     * layout is the same on both. */
    uint8_t iter_sb;
+   /* Vertex/tiler stream only: it asked for the compute resource, before
+    * its first compute job in this command buffer (mali_cmd_vt_compute_res);
+    * finish_stream gives it back. */
+   bool compute_res;
    struct mali_cache_flush flushed;
    int32_t carried[MALI_SUBQUEUE_COUNT];
    int32_t waited[MALI_SUBQUEUE_COUNT];
@@ -247,6 +251,22 @@ mali_cmd_defer_iter(const struct mali_cmd_buffer *cmd, enum mali_subqueue sq, un
 }
 #endif
 
+/* Before a compute job on the vertex/tiler stream (cmd_vt_dispatch,
+ * mali_cmd_dispatch.c): the stream asks for the compute resource once per
+ * command buffer, and only one that runs such a job. Draws without
+ * geometry or tessellation shaders, polygon mode line or the other
+ * internal compute passes leave the compute endpoints to the compute
+ * subqueue alone, as panvk does. */
+static inline void
+mali_cmd_vt_compute_res(struct mali_cmd_buffer *cmd)
+{
+   struct mali_cmd_cs *c = &cmd->cs[MALI_SUBQUEUE_VERTEX_TILER];
+   if (c->compute_res)
+      return;
+   cs_req_res(&c->b, mali_subqueue_resources(MALI_SUBQUEUE_VERTEX_TILER) | CS_COMPUTE_RES);
+   c->compute_res = true;
+}
+
 /* The recorded stream of subqueue sq: its first chunk and that chunk's size
  * in bytes. False when the stream is empty. */
 bool mali_cmd_buffer_span(struct mali_cmd_buffer *cmd, unsigned sq,
@@ -297,6 +317,17 @@ void mali_cmd_emit_barrier(struct mali_cmd_buffer *cmd, const struct mali_cs_dep
 /* Emits the fragment stream's put-off barrier wait and flush, if any.
  * Called before a fragment job and at the end of the command buffer. */
 void mali_cmd_frag_flush_pending(struct mali_cmd_buffer *cmd);
+
+/* An internal compute job on the vertex/tiler stream, waited for before
+ * the stream goes on (mali_cmd_dispatch.c). */
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch_shader,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                        const void *push, uint32_t push_size, const uint32_t groups[3]));
+MALI_PER_CSF_ARCH_DECL(void, cmd_draw_indexed_indirect_one,
+                       (struct mali_cmd_buffer *cmd, uint64_t params));
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs, uint64_t srt,
+                        uint64_t fau, const uint32_t groups[3]));
 
 /* Compute dispatch (mali_cmd_dispatch.c) and the internal copy shaders
  * (mali_cmd_copy.c): mali_cmd_gfx.h, shared with the job-manager back

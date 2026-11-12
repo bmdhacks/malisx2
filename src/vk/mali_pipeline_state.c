@@ -459,7 +459,14 @@ pack_blend(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       rt->eq = eq;
 
       rt->srgb = util_format_is_srgb(pfmt);
-      rt->load_destination = reads_dest(&eq);
+      /* A logic op other than these four combines with the destination,
+       * which then must not be killed early (the forward pixel kill and
+       * primitive reorder tests below). */
+      const bool logicop_reads_dest =
+         out->logicop_enable && out->logicop_func != PIPE_LOGICOP_CLEAR &&
+         out->logicop_func != PIPE_LOGICOP_SET && out->logicop_func != PIPE_LOGICOP_COPY &&
+         out->logicop_func != PIPE_LOGICOP_COPY_INVERTED;
+      rt->load_destination = reads_dest(&eq) || logicop_reads_dest;
       rt->constant_mask = constant_mask(&eq);
       out->any_dest_read |= rt->load_destination;
 
@@ -774,6 +781,28 @@ draw_mode(enum mesa_prim prim)
    }
 }
 
+/*
+ * The primitive the tiler draws: the topology's, or for triangles in
+ * polygon mode point or line (fillModeNonSolid, command-stream frontend)
+ * points or lines. Mali has no such mode: points are the draw's vertices
+ * drawn as a point list, and lines a line list of the triangles' edges
+ * that the draw builds first (mali_cmd_draw.c). Either way the triangles
+ * are not culled by face.
+ */
+static enum mesa_prim
+polygon_prim(enum mesa_prim prim, VkPolygonMode mode)
+{
+#if PAN_ARCH >= 10
+   if (u_reduced_prim(prim) == MESA_PRIM_TRIANGLES) {
+      if (mode == VK_POLYGON_MODE_POINT)
+         return MESA_PRIM_POINTS;
+      if (mode == VK_POLYGON_MODE_LINE)
+         return MESA_PRIM_LINES;
+   }
+#endif
+   return prim;
+}
+
 static void
 pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
@@ -786,7 +815,10 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    const uint8_t rt_mask = in->rp->attachments & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
    bool modifies_coverage = false;
 
-   const enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
+   const enum mesa_prim topology = in->has_gs     ? in->gs_prim
+                                   : in->has_tess ? in->tess_prim
+                                                  : vk_topology_to_mesa(dyn->ia.primitive_topology);
+   const enum mesa_prim prim = polygon_prim(topology, rs->polygon_mode);
    const enum mesa_prim reduced = u_reduced_prim(prim);
    bool msaa = dyn->ms.rasterization_samples > 1;
    /* Bresenham lines are rasterized at pixel centres. */
@@ -1009,7 +1041,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          vk_rasterization_state_depth_clip_enable(rs);
       cfg.secondary_shader = vs->info.vs.secondary_enable && fs != NULL;
 #if PAN_ARCH >= 9
-      cfg.primitive_restart = dyn->ia.primitive_restart_enable;
+      cfg.primitive_restart = dyn->ia.primitive_restart_enable || in->has_gs;
 #else
       /* An enum on v7: the implicit restart index of the index type
        * (panvk_emit_tiler_primitive). */

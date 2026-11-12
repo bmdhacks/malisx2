@@ -343,6 +343,50 @@ fs_input_mask(nir_shader *nir)
    return m;
 }
 
+/* fs_input_mask of a fragment stage, which the vertex stage's key needs before
+ * any cache lookup: kept in the pipeline cache as raw data under the fragment
+ * stage's hash (SPIR-V, specialization, robustness), so a pipeline whose two
+ * shaders are cached needs no NIR at all. Without it, every pipeline creation
+ * took the fragment stage through spirv_to_nir and the Bifrost preprocessing
+ * even on a full cache hit (Vita3K re-creates its pipelines each session). */
+static VkResult
+fs_reads(struct mali_device *dev, struct vk_pipeline_cache *cache,
+         VkPipelineCreateFlags2KHR flags, struct stage *fs, uint64_t *reads)
+{
+   uint8_t key[2 + sizeof(fs->stage_hash)];
+   memcpy(key, "fi", 2);
+   memcpy(key + 2, fs->stage_hash, sizeof(fs->stage_hash));
+
+   if (cache) {
+      bool hit;
+      struct vk_pipeline_cache_object *obj = vk_pipeline_cache_lookup_object(
+         cache, key, sizeof(key), &vk_raw_data_cache_object_ops, &hit);
+      if (obj) {
+         const struct vk_raw_data_cache_object *raw =
+            container_of(obj, struct vk_raw_data_cache_object, base);
+         const bool ok = raw->data_size == sizeof(*reads);
+         if (ok)
+            memcpy(reads, raw->data, sizeof(*reads));
+         vk_pipeline_cache_object_unref(&dev->vk, obj);
+         if (ok)
+            return VK_SUCCESS;
+      }
+   }
+
+   VkResult result = stage_to_nir(dev, flags, fs);
+   if (result != VK_SUCCESS)
+      return result;
+   *reads = fs_input_mask(fs->nir);
+
+   if (cache) {
+      struct vk_raw_data_cache_object *raw =
+         vk_raw_data_cache_object_create(&dev->vk, key, sizeof(key), reads, sizeof(*reads));
+      if (raw)
+         vk_pipeline_cache_object_unref(&dev->vk, vk_pipeline_cache_add_object(cache, &raw->base));
+   }
+   return VK_SUCCESS;
+}
+
 /*
  * The cross-stage dead-varying elimination panvk lacks: the generic vertex outputs
  * (VARYING_SLOT_VAR0..31) that the fragment shader does not read become temporaries and
@@ -814,10 +858,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
     * vertex shader without a fragment stage writes none). The fragment stage's NIR is kept
     * for its own compile. */
    if (fs) {
-      result = stage_to_nir(dev, flags, fs);
+      uint64_t reads;
+      result = fs_reads(dev, cache, flags, fs, &reads);
       if (result != VK_SUCCESS)
          goto out;
-      const uint64_t reads = fs_input_mask(fs->nir);
       vs->keep_outputs = reads ? reads : ~0ull;   /* found none: keep every output */
    } else {
       vs->keep_outputs = 0;

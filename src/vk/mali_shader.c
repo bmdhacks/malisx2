@@ -1813,6 +1813,35 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
 /* ---------------------------------------------------------------------- */
 /* Backend compile                                                         */
 
+#if PAN_ARCH < 9
+/*
+ * A vec4 of 32-bit words loaded through a pointer that is only known to be
+ * 4-byte aligned: the Bifrost compiler splits it into four LOAD.i32,
+ * because its rule is that a load is aligned to its size before v9
+ * (bifrost_nir.c mem_access_size_align_cb). The Mali-G52's LOAD.i128 reads
+ * 16 bytes at any 4-byte aligned address, across 16 and 64-byte lines and
+ * a 4 KiB page (bdatest "unaligned"), so such a load is given the
+ * alignment of its size and stays one message. Vita3K reads its uniform
+ * buffers this way (vec4 loads declared Aligned 4 through buffer device
+ * addresses), about 40 loads a vertex in WipEout 2048's vertex shaders,
+ * whose cost is load/store issue. The bytes read are the same.
+ */
+static bool
+v7_vec4_load_align(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global &&
+       intr->intrinsic != nir_intrinsic_load_global_constant)
+      return false;
+   if (intr->def.bit_size != 32 || intr->def.num_components != 4)
+      return false;
+   const uint32_t align = nir_intrinsic_align(intr);
+   if (align < 4 || align >= 16)
+      return false;
+   nir_intrinsic_set_align(intr, 16, 0);
+   return true;
+}
+#endif
+
 static VkResult
 compile_nir(struct mali_device *dev, nir_shader *nir,
             const struct pan_compile_inputs *compile_inputs,
@@ -1828,6 +1857,9 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
    } while (hoisted);
    NIR_PASS(_, nir, nir_shader_alu_pass, drop_trunc_before_f2i,
             nir_metadata_control_flow, NULL);
+#if PAN_ARCH < 9
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_vec4_load_align, nir_metadata_all, NULL);
+#endif
    pan_postprocess_nir(nir, &inputs, &s->info);
 
    struct lower_sysvals_ctx ctx = { .state = state };

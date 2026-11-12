@@ -1060,6 +1060,9 @@ mali_v7_note_buffer_write(struct mali_cmd_buffer *cmd, uint64_t addr, uint64_t s
 {
    if (!size)
       return;
+   /* It may write the last indexed draw's indices (struct mali_jm_cmd
+    * idx_last). */
+   cmd->jm.idx_last.valid = false;
    struct util_dynarray *a = &cmd->jm.buf_writes;
    struct mali_v7_range *r = util_dynarray_begin(a);
    const unsigned n = util_dynarray_num_elements(a, struct mali_v7_range);
@@ -1371,23 +1374,46 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       /* The vertex range, from the indices in the buffer at this point
        * of recording (index_range says what that needs); a draw whose
        * indices cannot be read here is skipped. */
-      uint32_t min, max;
+      uint32_t min = 0, max = 0;
       bool empty = false, ok = true;
+      const bool restart = st->ia.primitive_restart_enable;
       const bool hinted = cmd->jm.idx_hint.set && cmd->jm.idx_hint.ib == d->ib.addr &&
                           cmd->jm.idx_hint.first == di->first_index &&
                           cmd->jm.idx_hint.count == di->count;
       cmd->jm.idx_hint.set = false;
+      struct mali_v7_idx_last *last = &cmd->jm.idx_last;
       if (hinted) {
          /* vkCmdSetIndexRangeMALISX2: the application's range. */
          min = cmd->jm.idx_hint.min;
          max = cmd->jm.idx_hint.max;
+      } else if (last->valid && last->ib == d->ib.addr && last->ib_size == d->ib.size &&
+                 last->first == di->first_index && last->count == di->count &&
+                 last->index_size == d->ib.index_size && last->restart == restart) {
+         /* The same indices as the last indexed draw (idx_last). */
+         min = last->min;
+         max = last->max;
+         empty = last->empty;
       } else {
          const uint64_t t_scan = unlikely(mali_cpuprof_on) ? os_time_get_nano() : 0;
-         ok = index_range(cmd, di, st->ia.primitive_restart_enable, &min, &max, &empty);
+         ok = index_range(cmd, di, restart, &min, &max, &empty);
          if (unlikely(t_scan))
             mali_cpuprof_part(MALI_CPUPROF_IDXSCAN, t_scan);
       }
-      if (!ok || empty)
+      if (!ok)
+         return;
+      *last = (struct mali_v7_idx_last){
+         .valid = true,
+         .restart = restart,
+         .empty = empty,
+         .index_size = d->ib.index_size,
+         .ib = d->ib.addr,
+         .ib_size = d->ib.size,
+         .first = di->first_index,
+         .count = di->count,
+         .min = min,
+         .max = max,
+      };
+      if (empty)
          return;
       dd.vertex_range = max - min + 1;
       dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;

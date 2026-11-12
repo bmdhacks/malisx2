@@ -1200,7 +1200,6 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
    VkPipelineStageFlags2 src = 0, dst = 0;
    VkAccessFlags2 srca = 0, dsta = 0;
    bool exec_only = false;   /* some barrier of the call orders execution only */
-#if PAN_ARCH < 9
    /* Each barrier of the call is a dependency of its own: its source
     * stages against its own destination stages. The requirements are
     * worked out per barrier and then combined; the union of the masks
@@ -1212,15 +1211,16 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * input" and make every pass's tiling wait for the fragment work
     * before it. */
    uint16_t buf_req = 0, img_req = 0;
+#if PAN_ARCH < 9
    VkPipelineStageFlags2 ubo_src = 0;
    VkAccessFlags2 ubo_srca = 0;
 #endif
    for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
       const VkMemoryBarrier2 *m = &info->pMemoryBarriers[i];
+      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
 #if PAN_ARCH < 9
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
-      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
       if (ubo_copy_dep(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask)) {
          ubo_src |= m->srcStageMask;
          ubo_srca |= m->srcAccessMask;
@@ -1236,10 +1236,10 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * and foreign ones. */
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
       const VkBufferMemoryBarrier2 *m = &info->pBufferMemoryBarriers[i];
+      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
 #if PAN_ARCH < 9
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
-      buf_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
       if (ubo_copy_dep(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask)) {
          ubo_src |= m->srcStageMask;
          ubo_srca |= m->srcAccessMask;
@@ -1256,6 +1256,8 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       exec_only |=
          execution_only(m->srcStageMask, m->srcAccessMask, m->dstStageMask, m->dstAccessMask);
       img_req |= image_barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
+#else
+      img_req |= barrier_req(m->srcStageMask, m->dstStageMask, m->dstAccessMask);
 #endif
       src |= m->srcStageMask;
       dst |= m->dstStageMask;
@@ -1289,7 +1291,8 @@ MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
       mali_jm_cmd_barrier(cmd, ubo_src, ubo_srca, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
                           VK_ACCESS_2_UNIFORM_READ_BIT);
 #else
-   mali_jm_cmd_barrier(cmd, src, srca, dst, dsta);
+   /* v9 has no image-only rule: an image barrier waits as any other. */
+   cmd->jm.req |= buf_req | img_req;
 #endif
 }
 

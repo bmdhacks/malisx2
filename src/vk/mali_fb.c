@@ -1003,11 +1003,16 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
       clean |= clean_tile_write(&r->desc.rt[i]);
    /* panvk runs the preloads of a pass with a CRC target on every tile
     * (pan_emit_fb_desc: "Pre-frame shaders that preload a CRC-enabled RT
-    * must run in ALWAYS mode"). We keep Intersect: on the device a LOAD
-    * pass with CRC leaves tiles without geometry alone and does not stamp
-    * them (vk_render_smoke part 9), and Always would read back every tile
-    * of ARMSX2's full-target passes. The option restores panvk's rule. */
-   const bool always_preload = clean || (crc && mali_crc_options.always_preload);
+    * must run in ALWAYS mode"). We keep Intersect on v11: on the device a
+    * LOAD pass with CRC leaves tiles without geometry alone and does not
+    * stamp them (vk_render_smoke part 9), and Always would read back every
+    * tile of ARMSX2's full-target passes. The option restores panvk's
+    * rule. v10 takes panvk's rule: until its CRCs are valid, a pass turns
+    * on clean-tile writes of the target from the stream (mali_cmd_render.c),
+    * and pan_fix_frame_shader_mode's hardware issue (clean-tile writes
+    * break Intersect preloads) then applies. */
+   const bool always_preload =
+      clean || (crc && (PAN_ARCH == 10 || mali_crc_options.always_preload));
 
    uint64_t samples = sample_positions(cmd);
    struct mali_ptr p = mali_cmd_alloc(cmd, (uint64_t)size * layers, 64);
@@ -1086,6 +1091,23 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
       for (unsigned i = 0; i < r->rt_count; i++)
          pack_rt(r, i, l, next + i * pan_size(RENDER_TARGET));
    }
+
+#if PAN_ARCH == 10
+   /* The words the fragment stream picks the CRC enables from on v10, as
+    * packed (mali_cmd_render.c emit_crc_updates), and whether the pass's
+    * render area holds every tile of the target, so that after it all of
+    * the target's CRCs have been written. A CRC target has one layer. */
+   if (crc) {
+      const struct mali_image *img = r->desc.rt[r->crc_rt].image;
+      const uint32_t *words = p.cpu;
+      r->crc_fbd_flags = words[12];
+      r->crc_rt_flags = words[(pan_size(FRAMEBUFFER) + pan_size(ZS_CRC_EXTENSION) +
+                               r->crc_rt * pan_size(RENDER_TARGET)) / 4 + 1];
+      r->crc_covers_image = r->minx == 0 && r->miny == 0 &&
+                            r->maxx + 1 >= img->vk.extent.width &&
+                            r->maxy + 1 >= img->vk.extent.height;
+   }
+#endif
 
    struct mali_framebuffer_pointer_packed tag;
    pan_pack(&tag, FRAMEBUFFER_POINTER, cfg) {

@@ -32,9 +32,8 @@
  *    rejects the event unless frag_end <= vt_end < vt_start. A pass that
  *    draws nothing does not touch the counters at all.
  *
- * Transaction elimination (CRC) follows panvk v11's seed scheme; see
- * "CRC" below. v10 has no CRC yet (mali_image.c gives its images no CRC
- * state).
+ * Transaction elimination (CRC) follows panvk's schemes: v11's seed and
+ * v10's valid word; see "CRC" below.
  *
  * On v10 (genxml v10.xml) the stream has no NEXT_SB_ENTRY, SET_STATE,
  * indirect defers or shared scoreboard entries: the iterator entries are
@@ -250,9 +249,22 @@ MALI_PER_ARCH(cmd_render_tiler_set_provoking_vertex)(struct mali_cmd_buffer *cmd
  * again if its tile was not rendered since and the pass renders exactly the
  * tile contents it was computed from while memory holds something else
  * (panvk has the same limit).
+ *
+ * v10's stream has no AND or OR to merge a seed into the clear colour, so
+ * it takes panvk v10's scheme: the same header word says whether the
+ * stored CRCs are valid (1) or not (0; an invalidation stores 0, and bind
+ * zeroes the header). Before the fragment job the stream loads the word and
+ * patches the pass's Framebuffer Parameters word 12 and the target's Render
+ * Target word 1: valid, CRC read and write as packed; not valid, CRC and
+ * empty-tile writes without reads, and clean-tile writes on the target, so
+ * that every tile of the render area gets written and stamped. A pass in
+ * the not-valid state whose render area covers the whole target has
+ * written every CRC once its fragment job is done; the stream then waits
+ * for the job and sets the word (panvk mark_crc_valid_after_fragment). The
+ * wait happens once per invalidation.
  */
 
-/* Seed word in the CRC header. */
+/* Seed (v11) or valid word (v10) in the CRC header. */
 #define CRC_SEED_OFFSET 0
 #define CRC_SEED_MASK 0xffff
 /* Fragment-stream scratch registers of the seed code: above the ones the
@@ -274,15 +286,21 @@ MALI_PER_ARCH(cmd_crc_invalidate)(struct mali_cmd_buffer *cmd, const struct mali
     * registers a pending store reads, and bumps are rare. */
    cs_flush_stores(b);
    cs_move64_to(b, addr, image->crc_header);
+#if PAN_ARCH >= 11
    cs_load32_to(b, seed, addr, CRC_SEED_OFFSET);
    cs_add_imm32(b, seed, seed, 1);
+#else
+   /* Not valid any more. */
+   cs_move32_to(b, seed, 0);
+#endif
    cs_store32(b, seed, addr, CRC_SEED_OFFSET);
    cs_flush_stores(b);
 }
 
 /*
  * Fragment stream, before the pass's fragment job: put the CRC target's
- * current seed into the CRC Clear Color of the FBD, and invalidate every
+ * current seed into the CRC Clear Color of the FBD (v11), or its CRC
+ * enables for the valid word into the FBD (v10), and invalidate every
  * other stored target that has CRC state (its tiles are written without
  * CRCs). fbd is the FBD's address, untagged.
  */
@@ -317,11 +335,64 @@ emit_crc_updates(struct mali_cmd_buffer *cmd, const struct mali_render_state *r,
    cs_store32(b, lo, addr, 0);
    /* The caller waits for the store before the fragment job. */
 #else
-   /* No image has CRC state on v10 (mali_image.c). */
-   (void)fbd;
-   UNREACHABLE("no CRC target on v10");
+   /* panvk v10 patch_crc_valid. Word 12 bits 28-31 are empty-tile read,
+    * empty-tile write, CRC read and CRC write; Render Target word 1 bit 31
+    * is clean-tile write. */
+   const uint32_t valid_fbd = r->crc_fbd_flags;
+   const uint32_t invalid_fbd = (valid_fbd & BITFIELD_MASK(28)) | BITFIELD_BIT(29) |
+                                BITFIELD_BIT(31);
+   const uint32_t valid_rt = r->crc_rt_flags;
+   const uint32_t invalid_rt = valid_rt | BITFIELD_BIT(31);
+   const uint32_t rt_off = pan_size(FRAMEBUFFER) + pan_size(ZS_CRC_EXTENSION) +
+                           r->crc_rt * pan_size(RENDER_TARGET) + 4;
+
+   struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_FRAGMENT);
+   struct cs_index addr = mali_cs_scratch_reg64(b, CRC_SCRATCH);
+   struct cs_index valid = mali_cs_scratch_reg32(b, CRC_SCRATCH + 2);
+   struct cs_index fbd_flags = mali_cs_scratch_reg32(b, CRC_SCRATCH + 3);
+   struct cs_index rt_flags = mali_cs_scratch_reg32(b, CRC_SCRATCH + 4);
+
+   cs_flush_stores(b);
+   cs_move64_to(b, addr, r->desc.rt[r->crc_rt].image->crc_header);
+   cs_load32_to(b, valid, addr, CRC_SEED_OFFSET);
+   cs_move32_to(b, fbd_flags, invalid_fbd);
+   cs_move32_to(b, rt_flags, invalid_rt);
+   cs_if(b, MALI_CS_CONDITION_NEQUAL, valid) {
+      cs_move32_to(b, fbd_flags, valid_fbd);
+      cs_move32_to(b, rt_flags, valid_rt);
+   }
+   cs_move64_to(b, addr, fbd);
+   cs_store32(b, fbd_flags, addr, 12 * 4);
+   cs_store32(b, rt_flags, addr, rt_off);
+   /* The caller waits for the stores before the fragment job. */
 #endif
 }
+
+#if PAN_ARCH == 10
+/* v10: after a pass in the not-valid state that wrote every tile of its
+ * CRC target, wait for its fragment job (which signals iter_sb) and mark
+ * the target's CRCs valid (panvk mark_crc_valid_after_fragment). The
+ * stream waits only in that pass. */
+static void
+mark_crc_valid(struct mali_cmd_buffer *cmd, const struct mali_render_state *r, unsigned iter_sb)
+{
+   if (r->crc_rt < 0 || !r->crc_covers_image)
+      return;
+   struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_FRAGMENT);
+   struct cs_index addr = mali_cs_scratch_reg64(b, CRC_SCRATCH);
+   struct cs_index valid = mali_cs_scratch_reg32(b, CRC_SCRATCH + 2);
+
+   cs_flush_stores(b);
+   cs_move64_to(b, addr, r->desc.rt[r->crc_rt].image->crc_header);
+   cs_load32_to(b, valid, addr, CRC_SEED_OFFSET);
+   cs_if(b, MALI_CS_CONDITION_EQUAL, valid) {
+      cs_wait_slot(b, iter_sb);
+      cs_move32_to(b, valid, 1);
+      cs_store32(b, valid, addr, CRC_SEED_OFFSET);
+   }
+   cs_flush_stores(b);
+}
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* End                                                                     */
@@ -456,6 +527,8 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
                             cs_defer(MALI_SB_MASK(cur_sb), next_sb));
       }
    }
+   /* The fragment jobs signalled cur_sb. */
+   mark_crc_valid(cmd, r, cur_sb);
 #else
    struct cs_index next_sb = mali_cs_scratch_reg32(b, 0);
    struct cs_index sb_mask = mali_cs_scratch_reg32(b, 1);

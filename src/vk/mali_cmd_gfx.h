@@ -252,10 +252,19 @@ struct mali_render_state {
    bool first_provoking_vertex;
    bool first_provoking_vertex_set;
 
+   /* v10's CRC (mali_fb_build, mali_cmd_render.c): the pass covers every
+    * tile of the CRC target, and Framebuffer Parameters word 12 and word 1
+    * of the target's Render Target as packed (CRC read and write on). The
+    * fields sit in what was padding, so the layout v11 uses is
+    * unchanged. */
+   bool crc_covers_image;
+   uint32_t crc_fbd_flags;
+
    /* Set by the first draw or full-screen draw of the pass. */
    uint64_t tiler;                  /* Tiler Contexts, 0 if nothing tiled */
    void *tiler_cpu;
    uint32_t td_count;
+   uint32_t crc_rt_flags;           /* v10's CRC, see crc_fbd_flags */
    uint64_t tsd;                    /* the pass's Local Storage descriptor */
    void *tsd_cpu;
    uint32_t tls_size;               /* largest per-thread TLS of the pass */

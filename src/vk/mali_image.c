@@ -312,12 +312,11 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
-   /* CRC on v11 only. Not on v7 and v9 yet: the job manager cannot update
-    * the seed from the GPU, and the CPU-side seed it needs is not written
-    * yet. Not on v10 yet: its stream cannot merge a seed into the clear
-    * colour (no AND or OR), and the scheme it needs instead is not written
-    * yet. */
-   const bool crc = arch == 11 && mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+   /* CRC on the command-stream archs (v10 and v11). Not on v7 and v9 yet:
+    * the job manager cannot update the CRC state from the GPU, and the
+    * CPU-side state it needs is not written yet. */
+   const bool crc = mali_arch_is_csf(arch) &&
+                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    if (mod_explicit && image->plane_count != 1) {
       result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,

@@ -169,37 +169,58 @@ v9_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 }
 
 /*
- * Arch 7 (Bifrost, job manager): the accepted parts are keyed by the
- * (arch major, arch minor, product major) fields of the kbase product id.
- * The Mali-G52 is product major 2, accepted at any arch minor and revision;
- * Mesa's model table names arch minor 2 "G52" and 4 "G52 r1"; the two differ
- * in tile buffer size (tilebuf_budget). The Mali-G76 measures as product id
- * 0x7211, matching Mesa's PAN_PROD_ID(7, 2, 1), and is accepted at any
- * revision. The other arch 7 parts (G51, G31) are not supported, and
- * physical_device_create skips them.
+ * Arch 7 (Bifrost, job manager). The product major in product_id picks the
+ * part, as kbase's product table has them:
+ *
+ *   0x7000  Mali-G51 (TSIX)
+ *   0x7001  Mali-G76 (TNOX)
+ *   0x7002  Mali-G52 (TGOX; arch minor 2, and the G52 r1 at arch minor 4)
+ *   0x7003  Mali-G31 (TDVX)
+ *
+ * Bare names, as for the G52 until now. An arch 7 product kbase does not
+ * list is served too and named "Mali-G52"; its per-part values come from
+ * fallback_model.
  */
-static bool
+static void
 v7_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
-   if ((p->product_id & 0xf00f) == 0x7002) {
-      snprintf(buf, size, "Mali-G52");
-      return true;
+   const char *model;
+   switch (p->product_id & 0xf00f) {
+   case 0x7000:
+      model = "G51";
+      break;
+   case 0x7001:
+      model = "G76";
+      break;
+   case 0x7002:
+      model = "G52";
+      break;
+   case 0x7003:
+      model = "G31";
+      break;
+   default:
+      mesa_logw("malisx2: unknown arch 7 product 0x%04x, naming it Mali-G52", p->product_id);
+      model = "G52";
+      break;
    }
-   if ((p->product_id & 0xff0f) == 0x7201) {
-      snprintf(buf, size, "Mali-G76");
-      return true;
-   }
-   return false;
+   snprintf(buf, size, "Mali-%s", model);
 }
 
 /*
  * Arch 10 (command-stream Valhall). The product major in product_id picks
- * the part, as kbase's product table has them: 0xa007 is the Mali-G610
- * (the RK3588's; Mesa's model table has it as PAN_PROD_ID(10, 8, 7)) and
- * 0xa002 the Mali-G710. Named like the G615 below, with the core count.
- * The other arch 10 parts (G510, G310) are not supported.
+ * the part, as kbase's product table has them:
+ *
+ *   0xa002  Mali-G710 (TODX)
+ *   0xa003  Mali-G510 (TGRX)
+ *   0xa004  Mali-G310 (TVAX; Mesa's model table has it as
+ *           PAN_PROD_ID(10, 12, 4), one entry per core variant)
+ *   0xa007  Mali-G610 (LODX, the RK3588's; PAN_PROD_ID(10, 8, 7))
+ *
+ * Named like the G615 below, with the core count. An arch 10 product kbase
+ * does not list is named as the G610 and G710 are split: G610 below seven
+ * cores, G710 from seven.
  */
-static bool
+static void
 v10_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
    const char *model;
@@ -210,45 +231,60 @@ v10_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    case 0xa002:
       model = "G710";
       break;
+   case 0xa003:
+      model = "G510";
+      break;
+   case 0xa004:
+      model = "G310";
+      break;
    default:
-      return false;
+      mesa_logw("malisx2: unknown arch 10 product 0x%04x, naming it by core count",
+                p->product_id);
+      model = p->core_count < 7 ? "G610" : "G710";
+      break;
    }
    snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
-   return true;
 }
 
+/*
+ * Arch 11. The blob's naming: product 0xb003 (LTUX) is the G615; 0xb002
+ * (TTUX) is the G715, named G615 when it has fewer than 7 cores. The blob's
+ * "G715-Immortalis" variant is not reproduced. An arch 11 product kbase does
+ * not list is named as 0xb002 is.
+ */
+static void
+v11_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
+{
+   const unsigned product = p->product_id & 0xf00f;
+   if (product != 0xb002 && product != 0xb003)
+      mesa_logw("malisx2: unknown arch 11 product 0x%04x, naming it by core count",
+                p->product_id);
+   const char *model = product == 0xb003 || p->core_count < 7 ? "G615" : "G715";
+   snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
+}
+
+/* Every product of the arches built in (7, 9, 10, 11) has a name; any other
+ * arch (Midgard, the arch 6 G71 and G72, arch 12 on) has no back half here
+ * and gets none. */
 bool
 mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
-   if (p->arch_major == 7)
-      return v7_device_name(p, buf, size);
-   if (p->arch_major == 9) {
+   switch (p->arch_major) {
+   case 7:
+      v7_device_name(p, buf, size);
+      return true;
+   case 9:
       v9_device_name(p, buf, size);
       return true;
-   }
-   if (p->arch_major == 10)
-      return v10_device_name(p, buf, size);
-   if (p->arch_major != 11)
-      return false;
-
-   /*
-    * The blob's naming for arch 11: product 0xb003 is the G615;
-    * 0xb002 is the G715, named G615 when it has fewer than 7 cores. The
-    * blob's "G715-Immortalis" variant is not reproduced.
-    */
-   const char *model;
-   switch (p->product_id & 0xf00f) {
-   case 0xb003:
-      model = "G615";
-      break;
-   case 0xb002:
-      model = p->core_count < 7 ? "G615" : "G715";
-      break;
+   case 10:
+      v10_device_name(p, buf, size);
+      return true;
+   case 11:
+      v11_device_name(p, buf, size);
+      return true;
    default:
       return false;
    }
-   snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
-   return true;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -677,21 +713,47 @@ dual_src_blend_for_arch(uint32_t arch)
    }
 }
 
-/* textureCompressionBC: every BCn format a sampled image, linearly
- * filtered and a blit source (Vulkan's required format support). v7 and v9
- * have that when the GPU has all of BC1-7 (mali_format_table.c); v11
- * answers no for every BCn format. */
+/* Whether every format from first to last is a sampled image, linearly
+ * filtered and a blit source (Vulkan's required format support for the
+ * texture compression features). */
 static bool
-bc_formats_complete(const struct mali_physical_device *pdev)
+formats_complete(const struct mali_physical_device *pdev, VkFormat first, VkFormat last)
 {
    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
                                      VK_FORMAT_FEATURE_BLIT_SRC_BIT |
                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-   for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
+   for (VkFormat f = first; f <= last; f++) {
       if ((mali_format_image_features(pdev, f) & need) != need)
          return false;
    }
    return true;
+}
+
+/* textureCompressionBC: v7 and v9 have every BCn format when the GPU has
+ * all of BC1-7 (mali_format_table.c); v10 and v11 answer no for every BCn
+ * format. */
+static bool
+bc_formats_complete(const struct mali_physical_device *pdev)
+{
+   return formats_complete(pdev, VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK);
+}
+
+/* textureCompressionETC2 and textureCompressionASTC_LDR: the GPU's
+ * TEXTURE_FEATURES_0 has a bit per compressed format (mali_format_table.c),
+ * so a part without them says so. The G615 (0xc7fe001e), the G52 and the
+ * G57 (0xf7fffffe) have every ETC2, EAC and 2D ASTC LDR format. */
+static bool
+etc2_formats_complete(const struct mali_physical_device *pdev)
+{
+   return formats_complete(pdev, VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK,
+                           VK_FORMAT_EAC_R11G11_SNORM_BLOCK);
+}
+
+static bool
+astc_ldr_formats_complete(const struct mali_physical_device *pdev)
+{
+   return formats_complete(pdev, VK_FORMAT_ASTC_4x4_UNORM_BLOCK,
+                           VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
 }
 
 /*
@@ -786,12 +848,12 @@ get_features(struct vk_features *f, uint32_t arch)
       .largePoints = true,
       .alphaToOne = false,
       .multiViewport = false,
-      /* No minimum revision on v7 or v9: Mesa's model table lists none
-       * for the G52, G57 or G68 (it does for the G51 and G72). */
+      /* These four follow the GPU (physical_device_create): the model's
+       * anisotropy revision and the compressed formats it samples. */
       .samplerAnisotropy = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
-      .textureCompressionBC = false,  /* bc_formats_complete */
+      .textureCompressionBC = false,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = false,
       .vertexPipelineStoresAndAtomics = false,
@@ -919,28 +981,114 @@ sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
 }
 
 /*
- * v11 (G615): 32 KiB when the low byte of core_features is 3 or 4, else
- * 16 KiB. v10: 32 KiB on the G610 (product major 7), as Mesa's model table
- * has it; 16 KiB on the G710, which the table does not list. v9: a fixed 16 KiB for every part. The four Arm drivers we have
- * for arch 9 (G77, and G57 from three vendors) all store the same constant
- * whatever core_features says, and Mesa's model table gives the G57 and
- * G68 the same 16 KiB.
+ * Per-part values (tile buffer sizes, the anisotropy revision, the Bifrost
+ * compiler's choice of instruction forms) come from Mesa's model table,
+ * looked up by GPU_ID and, on the command-stream parts, the CORE_FEATURES
+ * variant (pan_get_model). A part the table does not list gets an entry of
+ * our own (fallback_model), so pdev->model is set for every GPU we serve.
  *
- * v7: Mesa's model table gives the G52 (arch minor 2) 16 KiB of colour
- * tile buffer and the G52 r1 (arch minor 4) 8 KiB. Any arch minor from 4
- * on is taken as the r1, any below as the G52.
+ * Tile buffer, colour and depth/stencil, in bytes:
+ *
+ * - v9: 16 KiB and 8 KiB for every part. The four Arm drivers we have for
+ *   arch 9 (G77, and G57 from three vendors) all store a 16 KiB budget
+ *   whatever core_features says, and Mesa's model table gives the G57 and
+ *   G68 16 and 8 KiB.
+ * - Otherwise the model's sizes: on v7 16/8 KiB for the G52 (arch minor 2)
+ *   and G76, 8/8 KiB for the G52 r1 (arch minor 4), G51 and G31; on v10
+ *   32/16 KiB for the G610 and the G310's variants 3 and 4, 16/8 KiB for its
+ *   variants 0 to 2; on v11 32/16 KiB for the G615 and G715 (variant 4).
+ * - A part the table does not list (fallback_tilebuf): 32/16 KiB for the
+ *   arch 10 and 11 products whose every listed entry has that (product
+ *   majors 2 and 7 on v10, the G710 and G610, which share their shader core;
+ *   2 and 3 on v11, the G715 and G615), which is what the tile size choice
+ *   used for them before the table was consulted; for any other product the
+ *   smallest sizes the table gives any part of the arch (8/8 KiB on v7,
+ *   16/8 KiB on v10 and v11). The tile size is chosen to fit half the
+ *   buffer, so a size below the hardware's costs only tile count, while one
+ *   above it would overflow the tile buffer. The G510 is one of these: Mesa
+ *   does not list it. (Arm's r44p1 driver sizes its sample-count budget on
+ *   arch 10 and 11 by the variant alone, 32 KiB for variants 3 and 4 and
+ *   16 KiB otherwise; Mesa's entries agree with that for the variants they
+ *   list, apart from the G610's 32 KiB at variant 0.)
  */
-static unsigned
-tilebuf_budget(const struct mali_kbase_gpu_props *p)
+struct mali_tilebuf {
+   unsigned color;
+   unsigned z;
+};
+
+static struct mali_tilebuf
+fallback_tilebuf(const struct mali_kbase_gpu_props *p)
 {
-   if (p->arch_major == 7)
-      return p->arch_minor >= 4 ? 8192 : 16384;
+   const unsigned product_major = p->product_id & 0xf;
+   switch (p->arch_major) {
+   case 7:
+      return (struct mali_tilebuf){8192, 8192};
+   case 10:
+      if (product_major == 2 || product_major == 7)
+         return (struct mali_tilebuf){32768, 16384};
+      return (struct mali_tilebuf){16384, 8192};
+   case 11:
+      if (product_major == 2 || product_major == 3)
+         return (struct mali_tilebuf){32768, 16384};
+      return (struct mali_tilebuf){16384, 8192};
+   default:
+      return (struct mali_tilebuf){16384, 8192};
+   }
+}
+
+static struct mali_tilebuf
+tilebuf_sizes(const struct mali_kbase_gpu_props *p, const struct pan_model *model)
+{
    if (p->arch_major == 9)
-      return 16384;
-   if (p->arch_major == 10)
-      return (p->product_id & 0xf00f) == 0xa007 ? 32768 : 16384;
-   unsigned variant = p->core_features & 0xff;
-   return (variant == 3 || variant == 4) ? 32768 : 16384;
+      return (struct mali_tilebuf){16384, 8192};
+   if (model)
+      return (struct mali_tilebuf){model->tilebuffer.color_size, model->tilebuffer.z_size};
+   return fallback_tilebuf(p);
+}
+
+/*
+ * The model-table entry for a part Mesa does not list (the G510, G310
+ * variants past 4, the G710, the G77, G78 and G78AE, and any product kbase
+ * does not list either), from the GPU's own ID:
+ *
+ * - gpu_prod_id is the part's arch major, arch minor and product major, so
+ *   the Bifrost compiler's choice of instruction forms (bifrost_get_quirks,
+ *   which reads the arch minor from it: the full CLPER form exists from
+ *   arch 7.2 on) follows the hardware. Without an entry it assumes arch
+ *   minor 0, the oldest forms.
+ * - Anisotropic filtering at every revision on Valhall, where every part in
+ *   Mesa's table has it, and at none on an unlisted Bifrost part, since the
+ *   table's Bifrost entries differ (the G51 has it from r1p1).
+ * - The tile buffer of fallback_tilebuf.
+ * - Rates that are only read for the compiler's statistics, which divide
+ *   by them: per field, the smallest the table gives a part of arch 7 or
+ *   9 to 11.
+ */
+static void
+fallback_model(struct pan_model *m, const struct mali_kbase_gpu_props *p)
+{
+   const struct mali_tilebuf tb = fallback_tilebuf(p);
+   *m = (struct pan_model){
+      .gpu_prod_id = PAN_PROD_ID(p->arch_major, p->arch_minor, p->product_major),
+      .gpu_variant = p->arch_major >= 10 ? p->core_features & 0xff : 0,
+      .name = "Mali (not in Mesa's model table)",
+      .min_rev_anisotropic = p->arch_major == 7 ? ~0u : 0,
+      .tilebuffer = {.color_size = tb.color, .z_size = tb.z},
+      .rates = {.pixel = 2, .texel = 2, .varying = 8, .cvt = 16, .fma = 8, .sfu = 4},
+   };
+}
+
+/* Mesa's Bifrost compiler emits the old, quad-only CLPER form on arch 7
+ * below arch minor 2 (the G51 and G31; BIFROST_LIMITED_CLPER in
+ * bifrost_get_quirks, which reads the arch minor from the model), except in
+ * read_invocation, which the waterfall loops of non-uniform resource
+ * indexing and of divergent texel offsets use: that always emits the full
+ * form, which those GPUs do not have (mali_shader.c refuses such a
+ * shader). */
+bool
+mali_physical_device_limited_clper(const struct mali_physical_device *pdev)
+{
+   return pdev->arch == 7 && pdev->model && ((pdev->model->gpu_prod_id >> 8) & 0xff) < 2;
 }
 
 /* For image format queries (mali_formats.c, declared in mali_image.h). */
@@ -951,17 +1099,23 @@ VkSampleCountFlags
 mali_physical_device_sample_counts(const struct mali_physical_device *pdev,
                                    unsigned bytes_per_pixel)
 {
-   return sample_counts(bytes_per_pixel, tilebuf_budget(&pdev->props));
+   return sample_counts(bytes_per_pixel, tilebuf_sizes(&pdev->props, pdev->model).color);
 }
 
-/* For the tile size choice on v7, where the two G52 revisions differ
- * (mali_fb.c, declared in mali_image.h). */
+/* For the tile size choice (mali_fb.c, declared in mali_image.h). */
 unsigned mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev);
+unsigned mali_physical_device_tilebuf_z_bytes(const struct mali_physical_device *pdev);
 
 unsigned
 mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev)
 {
-   return tilebuf_budget(&pdev->props);
+   return tilebuf_sizes(&pdev->props, pdev->model).color;
+}
+
+unsigned
+mali_physical_device_tilebuf_z_bytes(const struct mali_physical_device *pdev)
+{
+   return tilebuf_sizes(&pdev->props, pdev->model).z;
 }
 
 static void
@@ -979,9 +1133,13 @@ hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
  * commit made every driver update start with an empty cache. It hashes
  * the architecture's shader cache ID (a hash of every source that can
  * change that architecture's shader binaries, src/vk/gen_shader_cache_id.py:
- * MALI_SHADER_CACHE_ID for the G615, MALI_SHADER_CACHE_ID_V10 for the G610
- * and G710, MALI_SHADER_CACHE_ID_V9 for the G57, MALI_SHADER_CACHE_ID_V7 for
- * the G52) and the GPU ID.
+ * MALI_SHADER_CACHE_ID for arch 11, MALI_SHADER_CACHE_ID_V10,
+ * MALI_SHADER_CACHE_ID_V9 and MALI_SHADER_CACHE_ID_V7) and the GPU ID. The
+ * GPU ID matters within an arch: Mesa's Bifrost compiler emits different
+ * instructions below arch 7.2 (the G51 and G31; bifrost_get_quirks), so a
+ * G52's cache must not load on a G31. kraid's output depends on the arch
+ * alone. vk_pipeline_cache also refuses data whose deviceID (the GPU ID)
+ * differs.
  */
 static void
 pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cache_id_size,
@@ -1002,7 +1160,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
                struct vk_properties *props)
 {
    const struct mali_kbase_gpu_props *p = &pdev->props;
-   const VkSampleCountFlags samples = sample_counts(4, tilebuf_budget(p));
+   const VkSampleCountFlags samples =
+      sample_counts(4, tilebuf_sizes(p, pdev->model).color);
 
    /* min(max_workgroup_size, max_barrier_size); 1024 on the device.
     * Fall back to Vulkan's minimum if the kernel did not say. */
@@ -1497,8 +1656,14 @@ physical_device_create(struct mali_instance *instance, const char *path,
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
-   struct mali_physical_device *pdev =
-      vk_zalloc(&instance->vk.alloc, sizeof(*pdev), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   /* The physical device and the model entry fallback_model fills when
+    * Mesa's table has none; freed together (mali_physical_device_destroy
+    * frees the first member's address). */
+   struct pdev_alloc {
+      struct mali_physical_device pdev;
+      struct pan_model model;
+   } *pa = vk_zalloc(&instance->vk.alloc, sizeof(*pa), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   struct mali_physical_device *pdev = pa ? &pa->pdev : NULL;
    if (!pdev) {
       mali_kbase_destroy(kb);
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -1514,6 +1679,10 @@ physical_device_create(struct mali_instance *instance, const char *path,
    pdev->model = pan_get_model(pdev->props.gpu_id,
                                pdev->arch >= 10 ? pdev->props.core_features & 0xff : 0,
                                pdev->props.core_count, pdev->props.gpu_features);
+   if (!pdev->model) {
+      fallback_model(&pa->model, &pdev->props);
+      pdev->model = &pa->model;
+   }
    const enum mali_kbase_frontend frontend = kb->frontend;
    mali_kbase_destroy(kb);
 
@@ -1525,9 +1694,8 @@ physical_device_create(struct mali_instance *instance, const char *path,
    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
-                "one this driver was built for (the Mali-G615 of arch 11, the "
-                "Mali-G610 or G710 of arch 10, arch 9, or the Mali-G52 or "
-                "Mali-G76 of arch 7)", path,
+                "one this driver was built for (arch 7 or 9 on a job-manager "
+                "kernel, arch 10 or 11 on a command-stream kernel)", path,
                 pdev->props.product_id, pdev->props.arch_major);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -1551,6 +1719,20 @@ physical_device_create(struct mali_instance *instance, const char *path,
    struct vk_properties props;
    get_features(&features, pdev->arch);
    features.textureCompressionBC = bc_formats_complete(pdev);
+   features.textureCompressionETC2 = etc2_formats_complete(pdev);
+   features.textureCompressionASTC_LDR = astc_ldr_formats_complete(pdev);
+   /* Mesa's model table: the revision anisotropic filtering starts at
+    * (r1p1 on the G51, every revision on the other parts we serve). */
+   features.samplerAnisotropy = pan_rev(pdev->props.gpu_id) >= pdev->model->min_rev_anisotropic;
+   if (mali_physical_device_limited_clper(pdev)) {
+      /* The two features whose shaders need read_invocation, which the
+       * G51 and G31 cannot run (mali_physical_device_limited_clper):
+       * non-uniform sampled-image indexing, and texel offsets that are not
+       * constants (the Offset and ConstOffsets operands, which can differ
+       * between invocations). */
+      features.shaderSampledImageArrayNonUniformIndexing = false;
+      features.shaderImageGatherExtended = false;
+   }
    get_properties(pdev, name, &props);
 
    const struct vk_device_extension_table extensions =

@@ -317,8 +317,10 @@ unsigned mali_format_planes(VkFormat format, enum pipe_format planes[MALI_IMAGE_
 VkSampleCountFlags mali_physical_device_sample_counts(const struct mali_physical_device *pdev,
                                                       unsigned bytes_per_pixel);
 
-/* The colour tile buffer in bytes (16 KiB on the G52, 8 KiB on the G52 r1;
- * mali_physical_device.c). */
+/* The colour and depth/stencil tile buffers in bytes, from Mesa's model
+ * table or our own entry for a part it does not list
+ * (mali_physical_device.c). */
 unsigned mali_physical_device_tilebuf_color_bytes(const struct mali_physical_device *pdev);
+unsigned mali_physical_device_tilebuf_z_bytes(const struct mali_physical_device *pdev);
 
 #endif

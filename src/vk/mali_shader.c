@@ -1232,7 +1232,23 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
       struct nir_lower_non_uniform_access_options opts = {
          .types = non_uniform_types,
       };
+#if PAN_ARCH < 9
+      bool loops = false;
+      NIR_PASS(loops, nir, nir_lower_non_uniform_access, &opts);
+      /* Each loop reads the first active invocation's index with
+       * read_invocation, which Mesa's Bifrost compiler emits as the full
+       * CLPER form whatever the GPU; the G51 and G31 have only the quad
+       * form. The features that let a shader need one are not offered
+       * there (mali_physical_device.c). */
+      if (loops && mali_physical_device_limited_clper(mali_device_physical(dev)))
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "the %s shader indexes a resource or offsets a texel fetch "
+                          "differently per invocation, which this GPU's compiler target "
+                          "cannot do",
+                          mesa_shader_stage_name(nir->info.stage));
+#else
       NIR_PASS(_, nir, nir_lower_non_uniform_access, &opts);
+#endif
    }
 
 #if PAN_ARCH >= 9

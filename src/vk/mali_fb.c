@@ -229,14 +229,9 @@ tile_dims(uint32_t pixels, uint32_t *w, uint32_t *h)
 /* The colour and depth tile buffer sizes of every arch 9 part. Mesa's
  * model table lists the G57 and G68 with these sizes and has no G77, G78
  * or G78AE entry, and Arm's drivers use one 16 KiB colour budget for all
- * arch 9 parts. The table is not consulted on v9: a part it lacks would
- * get the v11 budgets below, twice these. */
+ * arch 9 parts. */
 #define V9_TILEBUF_COLOR 16384
 #define V9_TILEBUF_Z     8192
-
-/* The depth tile buffer size of the G52 and the G52 r1 (Mesa's model
- * table). Their colour tile buffers differ (mali_physical_device.c). */
-#define V7_TILEBUF_Z     8192
 
 /* pan_select_fb_tile_size for single-sampled framebuffers: the largest
  * power-of-two tile whose colour and depth fit half the tile buffer (the
@@ -246,11 +241,12 @@ select_tile_size(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
 {
    uint32_t rt_budget, z_budget;
    if (PAN_ARCH == 7) {
-      /* The colour tile buffer is 16 KiB on the G52 and 8 KiB on the G52
-       * r1 (Mesa's model table), the depth tile buffer 8 KiB on both. Half
-       * of each, as pan_query_optimal_tib_size does on v7. */
-      rt_budget = mali_physical_device_tilebuf_color_bytes(mali_device_physical(cmd->dev)) / 2;
-      z_budget = V7_TILEBUF_Z / 2;
+      /* The part's tile buffers (mali_physical_device.c: 16 and 8 KiB on
+       * the G52 and G76, 8 and 8 KiB on the G52 r1, G51 and G31). Half of
+       * each, as pan_query_optimal_tib_size does on v7. */
+      const struct mali_physical_device *pdev = mali_device_physical(cmd->dev);
+      rt_budget = mali_physical_device_tilebuf_color_bytes(pdev) / 2;
+      z_budget = mali_physical_device_tilebuf_z_bytes(pdev) / 2;
    } else if (PAN_ARCH < 10) {
       rt_budget = V9_TILEBUF_COLOR / 2;
       z_budget = V9_TILEBUF_Z / 2;

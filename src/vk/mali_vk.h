@@ -76,9 +76,11 @@ struct mali_physical_device {
    uint32_t arch;
 
    /* Mesa's model-table entry for this GPU (core count and feature bits
-    * included in the match), or NULL when the table has none. The compiler
-    * takes it with the arch: Bifrost's workarounds are chosen from the
-    * model's architecture minor version. */
+    * included in the match), or, for a part the table does not list, our
+    * own built from the GPU's ID (mali_physical_device.c fallback_model):
+    * set for every GPU we serve. The compiler takes it with the arch:
+    * Bifrost's workarounds are chosen from the model's architecture minor
+    * version. */
    const struct pan_model *model;
 
    VkPhysicalDeviceMemoryProperties memory;
@@ -128,6 +130,11 @@ VkResult mali_wsi_alloc_scanout(struct mali_physical_device *pdev, VkFormat form
 /* The deviceName for a GPU, or false if it is not a GPU this driver was
  * built for. */
 bool mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size);
+
+/* Whether Mesa's Bifrost compiler targets the GPU's quad-only CLPER form
+ * (arch 7 below arch minor 2: the G51 and G31), where a shader that needs
+ * read_invocation cannot be compiled (mali_physical_device.c). */
+bool mali_physical_device_limited_clper(const struct mali_physical_device *pdev);
 
 /* Log sink for the kbase layer: kbase messages go to the Vulkan log. */
 void mali_kbase_log_to_vk(void *user, const char *msg);

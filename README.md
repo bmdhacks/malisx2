@@ -21,6 +21,12 @@ compiler (Mesa's Bifrost compiler on v7); the driver is built on Mesa's
 shared Vulkan runtime. Midgard, the arch 6 Bifrost parts (G71, G72) and
 arch 13 on are not served.
 
+On v11 and v12, geometry and tessellation shaders are run through Mesa's
+libpoly: geometry shaders by the vertex shader of the draw, tessellation
+by compute jobs on the vertex/tiler stream (`src/vk/cl/mali_tess.cl`).
+Patches whose tessellation levels are constant when the pipeline is
+created use a pattern tessellated on the CPU instead.
+
 ## Building
 
 The driver builds against Mesa sources checked out at `mesa/`: branch
@@ -86,7 +92,15 @@ timestamps per render pass, dispatch and draw, captures of the submitted
 command streams, or the shaders it compiles. `cpuprof` writes no files:
 each application thread logs, about once a second, how much CPU time it
 spent inside the driver and in which entry points. It wraps the device's
-entry points, so it adds a little time of its own to every call.
+entry points, so it adds a little time of its own to every call. With
+`timing`, the vertex/tiler stream's internal dispatches (the tessellator's
+passes) are timed too.
+
+For comparing paths, `MALISX2_NO_FUSED_GS`, `MALISX2_NO_FUSED_TCS`,
+`MALISX2_NO_TESS_RECORDS` and `MALISX2_NO_TESS_MERGE` turn off, in turn,
+geometry shaders run by the vertex shader, the vertex shader run by the
+tessellation control shader, the tessellator's stitch records, and the
+merged tessellator passes of draws of at most 64 patches.
 
 ## Rules
 

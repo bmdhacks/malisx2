@@ -164,6 +164,10 @@ struct mali_cmd_buffer {
       uint64_t gpu;
    } tls;
 
+   /* WLS of the compute stream's dispatches and of the vertex/tiler
+    * stream's (cmd_vt_dispatch). */
+   struct mali_wls_state wls, wls_vt;
+
    /* RUN_COMPUTEs, RUN_IDVSs and render passes recorded (tests,
     * statistics). */
    uint32_t dispatches;

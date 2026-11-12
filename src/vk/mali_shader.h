@@ -523,6 +523,11 @@ struct mali_gs_shaders {
    struct mali_shader *rast;
    struct poly_gs_info info;
    uint64_t vs_outputs;         /* VARYING_BIT_* the vertex shader stores */
+   /* The geometry shader drawn by the rasterization shader alone
+    * (mali_shader.c fused_gs_rast): vertices per input primitive, 0 if
+    * not, and the list primitive drawn. */
+   uint32_t fused_slots;
+   uint32_t fused_prim;
 };
 
 /*
@@ -545,6 +550,10 @@ struct mali_tess_shaders {
     * gl_tess_spacing). */
    uint8_t mode, spacing;
    bool ccw, points;
+   /* The control shader writes constant tessellation levels: these, outer
+    * 0..3 then inner 0..1 (mali_tess_pattern.h). */
+   bool const_levels;
+   float levels[6];
 };
 #endif
 

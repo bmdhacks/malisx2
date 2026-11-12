@@ -149,6 +149,28 @@ slab_new(struct mali_device *dev, uint64_t size, bool recycle)
 static void
 slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
 {
+   if (s->wls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_wls_slab_count < MALI_FREE_WLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_wls_slabs);
+         dev->free_wls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
+   if (s->tls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_tls_slab_count < MALI_FREE_TLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_tls_slabs);
+         dev->free_tls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
    if (s->recycle) {
       simple_mtx_lock(&dev->slab_lock);
 #if PAN_ARCH < 9
@@ -195,6 +217,7 @@ release_memory(struct mali_cmd_buffer *cmd)
 #endif
    cmd->tls.size = 0;
    cmd->tls.gpu = 0;
+   cmd->wls = (struct mali_wls_state){0};
 }
 
 struct mali_ptr

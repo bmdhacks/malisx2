@@ -291,17 +291,32 @@ MALI_PER_ARCH(cmd_tls_buffer)(struct mali_cmd_buffer *cmd, uint32_t tls_size)
 #endif
    if (per_thread > cmd->tls.size) {
       uint64_t total = (uint64_t)per_thread * slots * tp.core_id_range;
-      /* TLS memory: GPU group 9. */
-      struct mali_cmd_slab *s = calloc(1, sizeof(*s));
-      const struct mali_kbase_alloc_info ai = {
-         .size = total,
-         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS),
-         .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
-      };
-      if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
-         free(s);
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return 0;
+      /* A free buffer of the device large enough, the smallest such. */
+      struct mali_cmd_slab *s = NULL;
+      simple_mtx_lock(&dev->slab_lock);
+      list_for_each_entry(struct mali_cmd_slab, f, &dev->free_tls_slabs, link) {
+         if (f->bo.size >= total && (!s || f->bo.size < s->bo.size))
+            s = f;
+      }
+      if (s) {
+         list_del(&s->link);
+         dev->free_tls_slab_count--;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s) {
+         /* TLS memory: GPU group 9. */
+         s = calloc(1, sizeof(*s));
+         const struct mali_kbase_alloc_info ai = {
+            .size = total,
+            .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS),
+            .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
+         };
+         if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
+            free(s);
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            return 0;
+         }
+         s->tls = true;
       }
       list_addtail(&s->link, &cmd->slabs);
       cmd->tls.size = per_thread;

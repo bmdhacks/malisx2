@@ -472,6 +472,8 @@ struct mali_cmd_buffer {
       uint64_t gpu;
    } tls;
 
+   struct mali_wls_state wls;
+
    uint32_t dispatches;
    uint32_t draws;
    uint32_t passes;

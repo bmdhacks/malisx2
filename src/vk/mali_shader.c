@@ -2851,6 +2851,36 @@ renumber_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+struct outputs_scan {
+   uint64_t written;
+   bool attr_loads;
+};
+
+static bool
+scan_outputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct outputs_scan *o = data;
+   if (intr->intrinsic == nir_intrinsic_store_output)
+      o->written |= BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location);
+   if (intr->intrinsic == nir_intrinsic_load_attr_pan)
+      o->attr_loads = true;
+   return false;
+}
+
+/* nir_shader_gather_info, but for a shader with load_attr_pan (no offset
+ * source, which it cannot read: a vertex shader that runs the software
+ * vertex shader, fused_gs_rast) only outputs_written, from its stores. */
+static void
+gather_vs_info(nir_shader *nir)
+{
+   struct outputs_scan o = {0};
+   nir_shader_intrinsics_pass(nir, scan_outputs, nir_metadata_all, &o);
+   if (o.attr_loads)
+      nir->info.outputs_written = o.written;
+   else
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+}
+
 static VkResult
 gs_variant(struct mali_device *dev, const struct mali_shader_compile_info *info,
            const blake3_hash key, unsigned index, mesa_shader_stage stage, nir_shader *nir,
@@ -2902,7 +2932,7 @@ gs_variant(struct mali_device *dev, const struct mali_shader_compile_info *info,
    if (stage == MESA_SHADER_VERTEX) {
       s->vs.clip_distances = nir->info.clip_distance_array_size;
       lower_cull_distance_vs(nir);
-      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      gather_vs_info(nir);
       uint64_t written = nir->info.outputs_written;
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, renumber_output, nir_metadata_all, &written);
       pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
@@ -2923,6 +2953,412 @@ gs_variant(struct mali_device *dev, const struct mali_shader_compile_info *info,
    }
    *out = s;
    return VK_SUCCESS;
+}
+
+/*
+ * A geometry shader drawn by one vertex shader, no compute job: the draw is
+ * a list (triangles, lines or points) of S vertices per input primitive,
+ * S = 3 (vertices_out - 2), 2 (vertices_out - 1) or vertices_out, and its
+ * vertex raw = primitive * S + t * corners + c is corner c of the t-th
+ * primitive the geometry shader emits for that input primitive. The shader
+ * runs the vertex shader for the primitive's input vertices (into
+ * registers), then the geometry shader, keeping the outputs of the vertex
+ * it is for; a primitive the geometry shader does not emit gets a zero
+ * position (culled). One stream, no transform feedback, no instancing of
+ * the geometry shader, direct 32-bit I/O.
+ */
+struct fused_gs {
+   bool ok;
+   uint64_t gs_out, vs_out;
+   nir_alu_type types[64];
+   uint8_t comps[64];
+};
+
+static bool
+fused_gs_check(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct fused_gs *st = data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_output: {
+      const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+      if (!nir_src_is_const(intr->src[1]) || nir_src_as_uint(intr->src[1]) ||
+          intr->src[0].ssa->bit_size != 32 || sem.num_slots != 1 || sem.location >= 64) {
+         st->ok = false;
+         break;
+      }
+      if (b->shader->info.stage == MESA_SHADER_GEOMETRY) {
+         st->gs_out |= BITFIELD64_BIT(sem.location);
+         st->types[sem.location] = nir_intrinsic_src_type(intr);
+         st->comps[sem.location] = MAX2(st->comps[sem.location], nir_intrinsic_component(intr) +
+                                                                   intr->src[0].ssa->num_components);
+      } else {
+         st->vs_out |= BITFIELD64_BIT(sem.location);
+      }
+      break;
+   }
+   case nir_intrinsic_load_per_vertex_input:
+      if (!nir_src_is_const(intr->src[1]) || intr->def.bit_size != 32 ||
+          nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(intr->src[1]) >= 64)
+         st->ok = false;
+      break;
+   case nir_intrinsic_emit_vertex:
+   case nir_intrinsic_end_primitive:
+      if (nir_intrinsic_stream_id(intr))
+         st->ok = false;
+      break;
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_emit_vertex_with_counter:
+   case nir_intrinsic_end_primitive_with_counter:
+      st->ok = false;
+      break;
+   default:
+      break;
+   }
+   return false;
+}
+
+/* The vertex shader's vertex and instance as its function's parameters,
+ * and its outputs into the shader variable vs_out[slot]. */
+static bool
+fused_vs_lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_variable *out = data;
+   if (intr->intrinsic == nir_intrinsic_load_global_invocation_id) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *id = nir_vec3(b, nir_load_param(b, 0), nir_load_param(b, 1), nir_imm_int(b, 0));
+      nir_def_replace(&intr->def, nir_u2uN(b, id, intr->def.bit_size));
+      return true;
+   }
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   const unsigned c = nir_intrinsic_component(intr);
+   nir_def *v = intr->src[0].ssa;
+   nir_def *ch[4];
+   for (unsigned i = 0; i < 4; i++)
+      ch[i] = i >= c && i < c + v->num_components ? nir_channel(b, v, i - c) : nir_undef(b, 1, 32);
+   nir_deref_instr *d = nir_build_deref_array_imm(b, nir_build_deref_var(b, out), loc);
+   nir_store_deref(b, d, nir_vec(b, ch, 4), (nir_intrinsic_write_mask(intr) << c) & 0xf);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+
+/* The vertex index of draw vertex id (libpoly's poly_nir_load_vertex_id),
+ * with the index buffer read in the branch that needs it: a vertex shader
+ * may have libpoly's speculatable loads moved out of it, which reads
+ * address 0 for a draw without an index buffer. */
+static nir_def *
+fused_vertex_id(nir_builder *b, nir_def *id)
+{
+   nir_def *vp = nir_load_vertex_param_buffer_poly(b);
+   nir_def *size = nir_load_global(
+      b, 1, 32, nir_iadd_imm(b, vp, offsetof(struct poly_vertex_params, index_size_B)),
+      .align_mul = 4);
+   nir_def *index;
+   nir_push_if(b, nir_ine_imm(b, size, 0));
+   {
+      nir_def *ib = nir_load_global(
+         b, 1, 64, nir_iadd_imm(b, vp, offsetof(struct poly_vertex_params, index_buffer)),
+         .align_mul = 8);
+      nir_def *range = nir_load_global(
+         b, 1, 32, nir_iadd_imm(b, vp, offsetof(struct poly_vertex_params, index_buffer_range_el)),
+         .align_mul = 4);
+      nir_def *i = nir_bcsel(b, nir_ult(b, id, range), id, nir_imm_int(b, 0));
+      nir_def *addr = nir_iadd(b, ib, nir_u2u64(b, nir_imul(b, i, size)));
+      nir_def *v32, *v16, *v8;
+      nir_push_if(b, nir_ieq_imm(b, size, 4));
+      v32 = nir_load_global(b, 1, 32, addr, .align_mul = 4);
+      nir_push_else(b, NULL);
+      nir_push_if(b, nir_ieq_imm(b, size, 2));
+      v16 = nir_u2u32(b, nir_load_global(b, 1, 16, addr, .align_mul = 2));
+      nir_push_else(b, NULL);
+      v8 = nir_u2u32(b, nir_load_global(b, 1, 8, addr, .align_mul = 1));
+      nir_pop_if(b, NULL);
+      nir_def *v = nir_if_phi(b, v16, v8);
+      nir_pop_if(b, NULL);
+      index = nir_if_phi(b, v32, v);
+   }
+   nir_pop_if(b, NULL);
+   index = nir_if_phi(b, index, id);
+   return nir_iadd(b, index, nir_load_first_vertex(b));
+}
+
+static bool
+fused_vs_ids(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_vertex_id &&
+       intr->intrinsic != nir_intrinsic_load_raw_vertex_id)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+   nir_def_replace(&intr->def, fused_vertex_id(b, id));
+   return true;
+}
+
+struct fused_rast_state {
+   const struct fused_gs *gs;
+   enum mesa_prim cls;            /* emitted primitive: points, lines, triangles */
+   unsigned n_in;
+   nir_variable *vs_out[32];      /* per input vertex: uvec4[64] */
+   nir_variable *cur[64], *ring[3][64], *sel[64];
+   nir_variable *len, *count, *found;
+   nir_def *prim, *t, *corner, *last;
+};
+
+static nir_def *
+fused_input(nir_builder *b, struct fused_rast_state *st, nir_def *vertex, unsigned slot)
+{
+   nir_def *v = nir_load_array_var_imm(b, st->vs_out[st->n_in - 1], slot);
+   for (int k = st->n_in - 2; k >= 0; k--)
+      v = nir_bcsel(b, nir_ieq_imm(b, vertex, k), nir_load_array_var_imm(b, st->vs_out[k], slot), v);
+   return v;
+}
+
+static void
+fused_select(nir_builder *b, struct fused_rast_state *st, unsigned r)
+{
+   /* r: ring entry of the corner (0 newest). */
+   u_foreach_bit64(loc, st->gs->gs_out)
+      nir_store_var(b, st->sel[loc], nir_load_var(b, st->ring[r][loc]), 0xf);
+}
+
+static bool
+fused_rast_lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct fused_rast_state *st = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_per_vertex_input: {
+      const unsigned slot =
+         nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(intr->src[1]);
+      nir_def *v = fused_input(b, st, intr->src[0].ssa, slot);
+      nir_def_replace(&intr->def,
+                      nir_channels(b, v, BITFIELD_MASK(intr->def.num_components)
+                                            << nir_intrinsic_component(intr)));
+      return true;
+   }
+   case nir_intrinsic_load_primitive_id:
+      nir_def_replace(&intr->def, st->prim);
+      return true;
+   case nir_intrinsic_load_invocation_id:
+      nir_def_replace(&intr->def, nir_imm_int(b, 0));
+      return true;
+   case nir_intrinsic_store_output: {
+      const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+      const unsigned c = nir_intrinsic_component(intr);
+      nir_def *v = intr->src[0].ssa;
+      nir_def *ch[4];
+      for (unsigned i = 0; i < 4; i++)
+         ch[i] = i >= c && i < c + v->num_components ? nir_channel(b, v, i - c)
+                                                     : nir_undef(b, 1, 32);
+      nir_store_var(b, st->cur[loc], nir_vec(b, ch, 4), (nir_intrinsic_write_mask(intr) << c) & 0xf);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   case nir_intrinsic_end_primitive:
+      nir_store_var(b, st->len, nir_imm_int(b, 0), 1);
+      nir_instr_remove(&intr->instr);
+      return true;
+   case nir_intrinsic_emit_vertex: {
+      u_foreach_bit64(loc, st->gs->gs_out) {
+         nir_store_var(b, st->ring[2][loc], nir_load_var(b, st->ring[1][loc]), 0xf);
+         nir_store_var(b, st->ring[1][loc], nir_load_var(b, st->ring[0][loc]), 0xf);
+         nir_store_var(b, st->ring[0][loc], nir_load_var(b, st->cur[loc]), 0xf);
+      }
+      const unsigned verts = st->cls == MESA_PRIM_TRIANGLES ? 3
+                             : st->cls == MESA_PRIM_LINES   ? 2
+                                                            : 1;
+      nir_def *len = nir_iadd_imm(b, nir_load_var(b, st->len), 1);
+      nir_store_var(b, st->len, len, 1);
+      nir_push_if(b, nir_uge_imm(b, len, verts));
+      {
+         nir_def *n = nir_load_var(b, st->count);
+         nir_push_if(b, nir_ieq(b, n, st->t));
+         {
+            nir_store_var(b, st->found, nir_imm_true(b), 1);
+            if (verts == 1) {
+               fused_select(b, st, 0);
+            } else if (verts == 2) {
+               nir_push_if(b, nir_ieq_imm(b, st->corner, 0));
+               fused_select(b, st, 1);
+               nir_push_else(b, NULL);
+               fused_select(b, st, 0);
+               nir_pop_if(b, NULL);
+            } else {
+               /* Triangle i of the strip, i = len - 3: v_i is ring 2,
+                * v_i+1 ring 1, v_i+2 ring 0; odd ones as Vulkan orders
+                * them for the provoking vertex mode. */
+               nir_def *odd = nir_i2b(b, nir_iand_imm(b, nir_iadd_imm(b, len, -3), 1));
+               nir_def *r0 = nir_bcsel(b, nir_iand(b, odd, st->last), nir_imm_int(b, 1),
+                                       nir_imm_int(b, 2));
+               nir_def *r1 = nir_bcsel(b, odd, nir_bcsel(b, st->last, nir_imm_int(b, 2),
+                                                         nir_imm_int(b, 0)),
+                                       nir_imm_int(b, 1));
+               nir_def *r2 = nir_bcsel(b, nir_iand(b, odd, nir_inot(b, st->last)),
+                                       nir_imm_int(b, 1), nir_imm_int(b, 0));
+               nir_def *r = nir_bcsel(b, nir_ieq_imm(b, st->corner, 0), r0,
+                                      nir_bcsel(b, nir_ieq_imm(b, st->corner, 1), r1, r2));
+               for (unsigned k = 0; k < 3; k++) {
+                  nir_push_if(b, nir_ieq_imm(b, r, k));
+                  fused_select(b, st, k);
+                  nir_pop_if(b, NULL);
+               }
+            }
+         }
+         nir_pop_if(b, NULL);
+         nir_store_var(b, st->count, nir_iadd_imm(b, n, 1), 1);
+      }
+      nir_pop_if(b, NULL);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* The fused rasterization shader from the geometry shader and the vertex
+ * shader (both lowered as for libpoly, the vertex shader to its inputs).
+ * NULL if the shaders are not ones it does. */
+static nir_shader *
+fused_gs_rast(struct mali_device *dev, const nir_shader *gs_in, const nir_shader *vs_in,
+              struct mali_gs_shaders *out)
+{
+   const unsigned vout = gs_in->info.gs.vertices_out;
+   const enum mesa_prim op = gs_in->info.gs.output_primitive;
+   const enum mesa_prim cls = op == MESA_PRIM_TRIANGLE_STRIP ? MESA_PRIM_TRIANGLES
+                              : op == MESA_PRIM_LINE_STRIP   ? MESA_PRIM_LINES
+                                                             : MESA_PRIM_POINTS;
+   const unsigned n_in = mesa_vertices_per_prim(gs_in->info.gs.input_primitive);
+   const unsigned corners = mesa_vertices_per_prim(cls);
+   const unsigned per_prim = cls == MESA_PRIM_TRIANGLES ? (vout >= 2 ? vout - 2 : 0)
+                             : cls == MESA_PRIM_LINES   ? (vout >= 1 ? vout - 1 : 0)
+                                                        : vout;
+   if (gs_in->xfb_info || gs_in->info.gs.invocations > 1 ||
+       (gs_in->info.gs.active_stream_mask & ~1) || !per_prim || n_in > 6 ||
+       vs_in->constant_data_size || gs_in->constant_data_size)
+      return NULL;
+
+   struct fused_gs fg = {.ok = true};
+   nir_shader_intrinsics_pass((nir_shader *)gs_in, fused_gs_check, nir_metadata_all, &fg);
+   nir_shader_intrinsics_pass((nir_shader *)vs_in, fused_gs_check, nir_metadata_all, &fg);
+   if (!fg.ok || !(fg.gs_out & VARYING_BIT_POS))
+      return NULL;
+
+   /* The vertex shader as a function of (vertex, instance) storing vs_out. */
+   nir_shader *vs = nir_shader_clone(NULL, vs_in);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, fused_vs_ids, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, vs, nir_lower_returns);
+   nir_variable *vs_out = nir_variable_create(vs, nir_var_shader_temp,
+                                              glsl_array_type(glsl_uvec4_type(), 64, 0), "vs_out");
+   nir_function_impl *vi = nir_shader_get_entrypoint(vs);
+   vi->function->num_params = 2;
+   vi->function->params = rzalloc_array(vs, nir_parameter, 2);
+   for (unsigned i = 0; i < 2; i++) {
+      vi->function->params[i].num_components = 1;
+      vi->function->params[i].bit_size = 32;
+   }
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, fused_vs_lower, nir_metadata_control_flow, vs_out);
+
+   nir_shader *r = nir_shader_clone(NULL, gs_in);
+   NIR_PASS(_, r, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(r);
+   struct fused_rast_state st = {.gs = &fg, .cls = cls, .n_in = n_in};
+   u_foreach_bit64(loc, fg.gs_out) {
+      st.cur[loc] = nir_local_variable_create(impl, glsl_uvec4_type(), "cur");
+      st.sel[loc] = nir_local_variable_create(impl, glsl_uvec4_type(), "sel");
+      for (unsigned k = 0; k < 3; k++)
+         st.ring[k][loc] = nir_local_variable_create(impl, glsl_uvec4_type(), "ring");
+   }
+   st.len = nir_local_variable_create(impl, glsl_uint_type(), "len");
+   st.count = nir_local_variable_create(impl, glsl_uint_type(), "count");
+   st.found = nir_local_variable_create(impl, glsl_bool_type(), "found");
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   /* The draw has no vertex offset (draw_gs): vertex 0 up. */
+   nir_def *raw = nir_load_vertex_id(&b);
+   const unsigned slots = per_prim * corners;
+   st.prim = nir_udiv_imm(&b, raw, slots);
+   nir_def *c = nir_umod_imm(&b, raw, slots);
+   st.t = nir_udiv_imm(&b, c, corners);
+   st.corner = nir_umod_imm(&b, c, corners);
+   st.last = nir_i2b(&b, nir_load_provoking_last(&b));
+   nir_def *inst = nir_load_instance_id(&b);
+   nir_store_var(&b, st.len, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, st.count, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, st.found, nir_imm_false(&b), 1);
+   u_foreach_bit64(loc, fg.gs_out) {
+      nir_store_var(&b, st.cur[loc], nir_imm_ivec4(&b, 0, 0, 0, 0), 0xf);
+      nir_store_var(&b, st.sel[loc], nir_imm_ivec4(&b, 0, 0, 0, 0), 0xf);
+      for (unsigned k = 0; k < 3; k++)
+         nir_store_var(&b, st.ring[k][loc], nir_imm_ivec4(&b, 0, 0, 0, 0), 0xf);
+   }
+   nir_def *topology = nir_load_input_topology_poly(&b);
+   nir_def *flat_first = nir_ieq_imm(&b, nir_load_provoking_last(&b), 0);
+   nir_def *nr = gs_primitives_per_instance(&b);
+   const enum mesa_prim in_cls = gs_in->info.gs.input_primitive;
+   for (unsigned k = 0; k < n_in; k++) {
+      nir_def *vert = nir_imm_int(&b, k), *v;
+      switch (in_cls) {
+      case MESA_PRIM_POINTS:
+         v = st.prim;
+         break;
+      case MESA_PRIM_LINES:
+         v = poly_vertex_id_for_line_class(&b, topology, st.prim, vert, nr);
+         break;
+      case MESA_PRIM_TRIANGLES:
+         v = poly_vertex_id_for_tri_class(&b, topology, st.prim, vert, flat_first);
+         break;
+      case MESA_PRIM_LINES_ADJACENCY:
+         v = poly_vertex_id_for_line_adj_class(&b, topology, st.prim, vert);
+         break;
+      default:
+         v = poly_vertex_id_for_tri_adj_class(&b, topology, st.prim, vert, nr, flat_first);
+         break;
+      }
+      st.vs_out[k] = nir_variable_create(r, nir_var_shader_temp,
+                                         glsl_array_type(glsl_uvec4_type(), 64, 0), "vs_out");
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      _mesa_hash_table_insert(remap, vs_out, st.vs_out[k]);
+      nir_def *params[2] = {v, inst};
+      nir_inline_function_impl(&b, vi, params, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+   }
+   nir_index_ssa_defs(impl);
+
+   NIR_PASS(_, r, nir_shader_intrinsics_pass, fused_rast_lower, nir_metadata_none, &st);
+
+   b.cursor = nir_after_impl(impl);
+   nir_def *found = nir_load_var(&b, st.found);
+   u_foreach_bit64(loc, fg.gs_out) {
+      if (loc == VARYING_SLOT_PSIZ && cls != MESA_PRIM_POINTS)
+         continue;
+      nir_def *v = nir_load_var(&b, st.sel[loc]);
+      if (loc == VARYING_SLOT_POS)
+         v = nir_bcsel(&b, found, v, nir_imm_ivec4(&b, 0, 0, 0, 0));
+      const unsigned n = MAX2(fg.comps[loc], 1);
+      nir_store_output(&b, nir_trim_vector(&b, v, n), nir_imm_int(&b, 0),
+                       .src_type = fg.types[loc], .io_semantics.location = loc,
+                       .io_semantics.num_slots = 1, .write_mask = BITFIELD_MASK(n));
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   ralloc_free(vs);
+
+   r->info.stage = MESA_SHADER_VERTEX;
+   memset(&r->info.vs, 0, sizeof(r->info.vs));
+   r->info.inputs_read = 0;
+   r->options = MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_VERTEX);
+   NIR_PASS(_, r, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
+   if (cls == MESA_PRIM_POINTS)
+      nir_lower_default_point_size(r);
+   gather_vs_info(r);
+
+   out->fused_slots = slots;
+   out->fused_prim = cls;
+   return r;
 }
 
 VkResult
@@ -2953,6 +3389,7 @@ MALI_PER_ARCH(shader_compile_gs)(struct mali_device *dev,
    nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
    out->vs_outputs = vs->info.outputs_written;
    NIR_PASS(_, vs, pan_nir_lower_vs_inputs);
+   nir_shader *vs_inputs = nir_shader_clone(NULL, vs);
    NIR_PASS(_, vs, poly_nir_lower_vs_before_gs);
    NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
    guard_invocations(vs, vs_vertices_per_instance);
@@ -2973,6 +3410,22 @@ MALI_PER_ARCH(shader_compile_gs)(struct mali_device *dev,
    lower_nir_io(gs);
    NIR_PASS(_, gs, nir_opt_constant_folding);
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+
+   /* One draw, if the shaders allow it. */
+   nir_shader *fused = getenv("MALISX2_NO_FUSED_GS") ? NULL
+                                                     : fused_gs_rast(dev, gs, vs_inputs, out);
+   ralloc_free(vs_inputs);
+   if (fused) {
+      ralloc_free(vs);
+      ralloc_free(gs);
+      vs = gs = NULL;
+      out->info.mode = out->fused_prim;
+      gs_desc.used_set_mask |= vs_desc.used_set_mask;
+      result = gs_variant(dev, gs_info, key, 3, MESA_SHADER_VERTEX, fused, &gs_desc, &out->rast);
+      if (result != VK_SUCCESS)
+         goto fail;
+      return VK_SUCCESS;
+   }
    if (!poly_nir_lower_gs(gs, &count, &rast, &pre_gs, &out->info)) {
       result = vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV, "geometry shader lowering failed");
       goto fail;
@@ -3030,7 +3483,7 @@ fail:
  * (shader_compile_gs's first part). */
 static VkResult
 sw_vs_lower(struct mali_device *dev, const struct mali_shader_compile_info *info,
-            struct mali_shader_desc_info *desc, uint64_t *outputs)
+            struct mali_shader_desc_info *desc, uint64_t *outputs, nir_shader **inputs_clone)
 {
    nir_shader *vs = info->nir;
    struct mali_shader tmp = {0};
@@ -3047,6 +3500,8 @@ sw_vs_lower(struct mali_device *dev, const struct mali_shader_compile_info *info
    nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
    *outputs = vs->info.outputs_written;
    NIR_PASS(_, vs, pan_nir_lower_vs_inputs);
+   if (inputs_clone)
+      *inputs_clone = nir_shader_clone(NULL, vs);
    NIR_PASS(_, vs, poly_nir_lower_vs_before_gs);
    NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
    guard_invocations(vs, vs_vertices_per_instance);
@@ -3076,6 +3531,136 @@ tess_stage_lower(struct mali_device *dev, const struct mali_shader_compile_info 
    return VK_SUCCESS;
 }
 
+/* The constant tessellation levels a control shader writes, if each level
+ * component is only ever written one constant value. */
+struct tess_levels_state {
+   bool ok;
+   uint8_t written;
+   float v[6];
+};
+
+static bool
+collect_tess_levels(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct tess_levels_state *st = data;
+   if (intr->intrinsic != nir_intrinsic_store_output &&
+       intr->intrinsic != nir_intrinsic_store_per_vertex_output)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   if (loc != VARYING_SLOT_TESS_LEVEL_OUTER && loc != VARYING_SLOT_TESS_LEVEL_INNER)
+      return false;
+   nir_src *offset = nir_get_io_offset_src(intr);
+   nir_def *val = intr->src[0].ssa;
+   if (intr->intrinsic != nir_intrinsic_store_output || !nir_src_is_const(*offset) ||
+       val->bit_size != 32) {
+      st->ok = false;
+      return false;
+   }
+   const unsigned base = (loc == VARYING_SLOT_TESS_LEVEL_OUTER ? 0 : 4) +
+                         nir_src_as_uint(*offset) * 4 + nir_intrinsic_component(intr);
+   const unsigned mask = nir_intrinsic_write_mask(intr);
+   for (unsigned i = 0; i < val->num_components; i++) {
+      if (!(mask & BITFIELD_BIT(i)))
+         continue;
+      const unsigned c = base + i;
+      nir_scalar sc = nir_scalar_resolved(val, i);
+      if (c >= 6 || !nir_scalar_is_const(sc)) {
+         st->ok = false;
+         return false;
+      }
+      const float f = nir_scalar_as_float(sc);
+      if ((st->written & BITFIELD_BIT(c)) && st->v[c] != f)
+         st->ok = false;
+      st->written |= BITFIELD_BIT(c);
+      st->v[c] = f;
+   }
+   return false;
+}
+
+static bool
+fused_tcs_check(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   bool *ok = data;
+   if (intr->intrinsic == nir_intrinsic_load_per_vertex_input) {
+      if (!nir_src_is_const(intr->src[1]) || intr->def.bit_size != 32 ||
+          nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(intr->src[1]) >= 64)
+         *ok = false;
+   } else if (intr->intrinsic == nir_intrinsic_load_input) {
+      *ok = false;
+   }
+   return false;
+}
+
+static bool
+fused_tcs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct fused_rast_state *st = data;
+   if (intr->intrinsic != nir_intrinsic_load_per_vertex_input)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   const unsigned slot = nir_intrinsic_io_semantics(intr).location + nir_src_as_uint(intr->src[1]);
+   nir_def *v = fused_input(b, st, intr->src[0].ssa, slot);
+   nir_def_replace(&intr->def, nir_channels(b, v, BITFIELD_MASK(intr->def.num_components)
+                                                    << nir_intrinsic_component(intr)));
+   return true;
+}
+
+/*
+ * The vertex shader run by the control shader for its patch's n_in input
+ * vertices, into registers, instead of as a job storing them: each control
+ * invocation runs it for all of them. Before poly_nir_lower_tcs, which
+ * turns the patch and instance into the workgroup's.
+ */
+static bool
+fuse_vs_tcs(nir_shader *tcs, const nir_shader *vs_in, unsigned n_in)
+{
+   if (!n_in || n_in > 32 || vs_in->constant_data_size)
+      return false;
+   bool ok = true;
+   nir_shader_intrinsics_pass(tcs, fused_tcs_check, nir_metadata_all, &ok);
+   struct fused_gs fg = {.ok = true};
+   nir_shader_intrinsics_pass((nir_shader *)vs_in, fused_gs_check, nir_metadata_all, &fg);
+   if (!ok || !fg.ok)
+      return false;
+
+   nir_shader *vs = nir_shader_clone(NULL, vs_in);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, fused_vs_ids, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, vs, nir_lower_returns);
+   nir_variable *vs_out = nir_variable_create(vs, nir_var_shader_temp,
+                                              glsl_array_type(glsl_uvec4_type(), 64, 0), "vs_out");
+   nir_function_impl *vi = nir_shader_get_entrypoint(vs);
+   vi->function->num_params = 2;
+   vi->function->params = rzalloc_array(vs, nir_parameter, 2);
+   for (unsigned i = 0; i < 2; i++) {
+      vi->function->params[i].num_components = 1;
+      vi->function->params[i].bit_size = 32;
+   }
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, fused_vs_lower, nir_metadata_control_flow, vs_out);
+
+   struct fused_rast_state st = {.n_in = n_in};
+   struct fused_rast_state *stp = &st;
+   nir_variable *outs[32];
+   nir_function_impl *impl = nir_shader_get_entrypoint(tcs);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *prim = nir_load_primitive_id(&b), *inst = nir_load_instance_id(&b);
+   for (unsigned k = 0; k < n_in; k++) {
+      outs[k] = nir_variable_create(tcs, nir_var_shader_temp,
+                                    glsl_array_type(glsl_uvec4_type(), 64, 0), "vs_out");
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      _mesa_hash_table_insert(remap, vs_out, outs[k]);
+      nir_def *params[2] = {nir_iadd_imm(&b, nir_imul_imm(&b, prim, n_in), k), inst};
+      nir_inline_function_impl(&b, vi, params, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+   }
+   nir_index_ssa_defs(impl);
+   ralloc_free(vs);
+   for (unsigned k = 0; k < n_in; k++)
+      st.vs_out[k] = outs[k];
+   NIR_PASS(_, tcs, nir_shader_intrinsics_pass, fused_tcs_inputs, nir_metadata_none, stp);
+   return true;
+}
+
 VkResult
 MALI_PER_ARCH(shader_compile_tess)(struct mali_device *dev,
                                    const struct mali_shader_compile_info *vs_info,
@@ -3084,21 +3669,41 @@ MALI_PER_ARCH(shader_compile_tess)(struct mali_device *dev,
                                    const blake3_hash key, struct mali_tess_shaders *out)
 {
    nir_shader *vs = vs_info->nir, *tcs = tcs_info->nir, *tes = tes_info->nir;
+   nir_shader *vs_inputs = NULL;
    struct mali_shader_desc_info vs_desc, tcs_desc, tes_desc;
    VkResult result;
    memset(out, 0, sizeof(*out));
 
-   result = sw_vs_lower(dev, vs_info, &vs_desc, &out->vs_outputs);
+   result = sw_vs_lower(dev, vs_info, &vs_desc, &out->vs_outputs, &vs_inputs);
    if (result != VK_SUCCESS)
       goto fail;
 
    result = tess_stage_lower(dev, tcs_info, &tcs_desc);
    if (result != VK_SUCCESS)
       goto fail;
+   /* The vertex shader in the control shader, for a patch size the
+    * pipeline fixes. */
+   {
+      const struct vk_graphics_pipeline_state *gs = tcs_info->state;
+      const unsigned n_in = gs && gs->ts &&
+                                  !BITSET_TEST(gs->dynamic, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS) &&
+                                  !getenv("MALISX2_NO_FUSED_TCS")
+                               ? gs->ts->patch_control_points
+                               : 0;
+      if (vs_inputs && fuse_vs_tcs(tcs, vs_inputs, n_in)) {
+         ralloc_free(vs);
+         vs = NULL;
+         tcs_desc.used_set_mask |= vs_desc.used_set_mask;
+      }
+      ralloc_free(vs_inputs);
+      vs_inputs = NULL;
+   }
    out->tcs_output_patch_size = tcs->info.tess.tcs_vertices_out;
    out->tcs_per_vertex_outputs = poly_tcs_per_vertex_outputs(tcs);
    out->tcs_patch_outputs = util_last_bit(tcs->info.patch_outputs_written);
    out->tcs_output_stride = poly_tcs_output_stride(tcs);
+   struct tess_levels_state lv = {.ok = true};
+   nir_shader_intrinsics_pass(tcs, collect_tess_levels, nir_metadata_all, &lv);
    NIR_PASS(_, tcs, poly_nir_lower_tcs, true);
    as_compute(dev, tcs);
    tcs->info.workgroup_size[0] = MAX2(out->tcs_output_patch_size, 1);
@@ -3110,10 +3715,19 @@ MALI_PER_ARCH(shader_compile_tess)(struct mali_device *dev,
    out->spacing = tes->info.tess.spacing;
    out->ccw = tes->info.tess.ccw;
    out->points = tes->info.tess.point_mode;
+   {
+      const uint8_t need = out->mode == TESS_PRIMITIVE_ISOLINES  ? 0x03
+                           : out->mode == TESS_PRIMITIVE_QUADS ? 0x3f
+                                                               : 0x17;
+      out->const_levels = lv.ok && (lv.written & need) == need;
+      memcpy(out->levels, lv.v, sizeof(out->levels));
+   }
    NIR_PASS(_, tes, poly_nir_lower_tes, true);
    tes->options = MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_VERTEX);
 
-   result = gs_variant(dev, vs_info, key, 0, MESA_SHADER_COMPUTE, vs, &vs_desc, &out->sw_vs);
+   result = VK_SUCCESS;
+   if (vs)
+      result = gs_variant(dev, vs_info, key, 0, MESA_SHADER_COMPUTE, vs, &vs_desc, &out->sw_vs);
    vs = NULL;
    if (result == VK_SUCCESS)
       result = gs_variant(dev, tcs_info, key, 4, MESA_SHADER_COMPUTE, tcs, &tcs_desc, &out->tcs);
@@ -3129,6 +3743,7 @@ fail:
    ralloc_free(vs);
    ralloc_free(tcs);
    ralloc_free(tes);
+   ralloc_free(vs_inputs);
    MALI_PER_ARCH(tess_shaders_unref)(dev, out);
    return result;
 }

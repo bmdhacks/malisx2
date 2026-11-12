@@ -59,6 +59,19 @@ struct mali_cmd_slab {
    /* Kept on the device's free list for reuse: a standard slab, or on v7
     * a 1 MiB slab (else a dedicated BO). */
    bool recycle;
+   /* A MALI_WLS_SLAB_SIZE slab, kept on the device's free_wls_slabs. */
+   bool wls;
+   /* A TLS buffer, kept on the device's free_tls_slabs. */
+   bool tls;
+};
+
+#define MALI_WLS_SLAB_SIZE (4ull << 20)
+#define MALI_FREE_WLS_SLABS_MAX 16
+#define MALI_FREE_TLS_SLABS_MAX 4
+
+/* The slab a command buffer carves its dispatches' WLS buffers from. */
+struct mali_wls_state {
+   uint64_t gpu, size, used;
 };
 
 struct mali_ptr {
@@ -380,6 +393,10 @@ MALI_PER_ARCH_DECL(void, cmd_dispatch_meta,
  * first use; NULL with the command buffer's error set on failure. */
 MALI_PER_ARCH_DECL(const struct mali_shader *, cmd_meta_shader,
                    (struct mali_cmd_buffer *cmd, unsigned m));
+
+/* Compiles the tessellator's shaders for a domain (0 isolines, 1
+ * triangles, 2 quads) ahead of the first draw. */
+MALI_PER_ARCH_DECL(void, meta_tess_warm, (struct mali_device *dev, unsigned domain));
 
 /* The internal copy/fill shaders, blend shaders and internal fragment
  * shaders of a device, freed at device destruction (mali_cmd_copy.c). */

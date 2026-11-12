@@ -176,7 +176,7 @@ mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
 }
 
 /* Frees the device's cached command-buffer slabs (both back halves fill
- * dev->free_slabs). */
+ * dev->free_slabs) and the command-stream back half's WLS and TLS slabs. */
 static void
 cmd_slabs_finish(struct mali_device *dev)
 {
@@ -186,6 +186,18 @@ cmd_slabs_finish(struct mali_device *dev)
       free(s);
    }
    dev->free_slab_count = 0;
+   list_for_each_entry_safe(struct mali_cmd_slab, s, &dev->free_wls_slabs, link) {
+      list_del(&s->link);
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+   dev->free_wls_slab_count = 0;
+   list_for_each_entry_safe(struct mali_cmd_slab, s, &dev->free_tls_slabs, link) {
+      list_del(&s->link);
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+   dev->free_tls_slab_count = 0;
 }
 
 /*
@@ -201,7 +213,11 @@ device_fe_state_init(struct mali_device *dev)
 {
    simple_mtx_init(&dev->slab_lock, mtx_plain);
    list_inithead(&dev->free_slabs);
+   list_inithead(&dev->free_wls_slabs);
+   list_inithead(&dev->free_tls_slabs);
    simple_mtx_init(&dev->meta_lock, mtx_plain);
+   mtx_init(&dev->meta_mtx, mtx_plain);
+   cnd_init(&dev->meta_cond);
 
    pthread_condattr_t ca;
    pthread_condattr_init(&ca);
@@ -211,14 +227,34 @@ device_fe_state_init(struct mali_device *dev)
    pthread_mutex_init(&dev->lock, NULL);
 }
 
+#if MALI_WITH_POLY
+static int
+tess_warm_thread(void *data)
+{
+   struct mali_device *dev = data;
+   const unsigned arch = mali_device_physical(dev)->arch;
+   /* Triangles and quads, the domains of nearly every application. */
+   static const unsigned domains[] = {2, 1, 0};
+   for (unsigned i = 0; i < ARRAY_SIZE(domains) && !dev->tess_warm_cancel; i++)
+      mali_csf_arch_dispatch(arch, meta_tess_warm, dev, domains[i]);
+   return 0;
+}
+#endif
+
 static void
 device_fe_state_finish(struct mali_device *dev)
 {
+   if (dev->tess_warm_started) {
+      dev->tess_warm_cancel = true;
+      thrd_join(dev->tess_warm, NULL);
+   }
    mali_arch_dispatch(mali_device_physical(dev)->arch, meta_finish, dev);
    cmd_slabs_finish(dev);
 
    pthread_cond_destroy(&dev->cond);
    pthread_mutex_destroy(&dev->lock);
+   cnd_destroy(&dev->meta_cond);
+   mtx_destroy(&dev->meta_mtx);
    simple_mtx_destroy(&dev->meta_lock);
    simple_mtx_destroy(&dev->slab_lock);
 }
@@ -288,6 +324,8 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
       mali_bo_pool_finish(&dev->exec_pool);
       if (dev->poly_heap.size)
          mali_kbase_free(dev->kbase, &dev->poly_heap);
+      if (dev->tess_records.size)
+         mali_kbase_free(dev->kbase, &dev->tess_records);
    }
    mali_kbase_destroy(dev->kbase);
    vk_device_finish(&dev->vk);
@@ -521,6 +559,12 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
          dev->queue_count++;
       }
    }
+
+#if MALI_WITH_POLY
+   if (mali_arch_is_csf(pdev->arch) && dev->vk.enabled_features.tessellationShader)
+      dev->tess_warm_started =
+         thrd_create(&dev->tess_warm, tess_warm_thread, dev) == thrd_success;
+#endif
 
    *pDevice = mali_device_to_handle(dev);
    return VK_SUCCESS;

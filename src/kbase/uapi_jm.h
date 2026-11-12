@@ -115,6 +115,30 @@ struct kb_jm_stream_create {
 
 #define KB_JM_IOCTL_STREAM_CREATE _IOW(KB_IOCTL_TYPE, 24, struct kb_jm_stream_create)
 
+/* MEM_IMPORT as Huawei's job-manager kernels (Kirin) define it: the
+ * standard request plus one input field, so the struct is 32 bytes and the
+ * ioctl number differs from the standard one, which these kernels answer
+ * with ENOTTY. header_page_number is the page from which the kernel
+ * scrambles the buffer's addresses (for compressed-framebuffer headers);
+ * 0 means no page is scrambled. */
+union kb_jm_ioctl_mem_import_huawei {
+   struct {
+      uint64_t flags;
+      uint64_t phandle;
+      uint32_t type;
+      uint32_t padding;
+      uint64_t header_page_number;
+   } in;
+   struct {
+      uint64_t flags;
+      uint64_t gpu_va;
+      uint64_t va_pages;
+   } out;
+};
+
+#define KB_JM_IOCTL_MEM_IMPORT_HUAWEI \
+   _IOWR(KB_IOCTL_TYPE, 22, union kb_jm_ioctl_mem_import_huawei)
+
 /* struct base_dependency: one entry of an atom's pre_dep[2]. */
 struct kb_jm_dep {
    uint8_t atom_id;
@@ -338,6 +362,10 @@ KB_CHECK_OFF(struct kb_jm_jit_alloc_info, heap_info_gpu_addr, 40);
 
 KB_CHECK_SIZE(struct kb_jm_external_resource, 8);
 
+KB_CHECK_SIZE(union kb_jm_ioctl_mem_import_huawei, 32);
+KB_CHECK_OFF(union kb_jm_ioctl_mem_import_huawei, in.header_page_number, 24);
+KB_CHECK_OFF(union kb_jm_ioctl_mem_import_huawei, out.va_pages, 16);
+
 /* The ioctl numbers the T820 blob and our test fixtures were built
  * against, as an independent check of the encoding (uapi.h's
  * KB_CHECK_SIZE/KB_CHECK_OFF/_Static_assert pattern). */
@@ -346,5 +374,6 @@ _Static_assert(KB_JM_IOCTL_JOB_SUBMIT == 0x40108002, "JOB_SUBMIT");
 _Static_assert(KB_JM_IOCTL_POST_TERM == 0x8004, "POST_TERM");
 _Static_assert(KB_JM_IOCTL_SOFT_EVENT_UPDATE == 0x4010801c, "SOFT_EVENT_UPDATE");
 _Static_assert(KB_JM_IOCTL_STREAM_CREATE == 0x40208018, "STREAM_CREATE");
+_Static_assert(KB_JM_IOCTL_MEM_IMPORT_HUAWEI == 0xc0208016, "MEM_IMPORT (Huawei)");
 
 #endif /* MALI_KBASE_UAPI_JM_H */

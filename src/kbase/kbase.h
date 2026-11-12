@@ -283,6 +283,10 @@ struct mali_kbase {
    /* Job manager only: MEM_JIT_INIT failed with ENOMEM (no room for the
     * zone in the GPU's VA) and the context runs without a JIT zone. */
    bool jm_no_jit;
+   /* Job manager only: the kernel answered MEM_IMPORT only in Huawei's
+    * 32-byte form, so imports skip the standard request. Set by the first
+    * import that finds out; read and written with relaxed atomics. */
+   bool jm_huawei_mem_import;
    /* SET_FLAGS succeeded: the kernel context exists. */
    bool context_created;
    /* mali_kbase_abandon was called. */

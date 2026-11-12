@@ -494,6 +494,37 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetIndexRangeMALISX2(VkCommandBuffer comma
                                                            uint32_t minIndex, uint32_t maxIndex);
 
 /*
+ * malisx2's own command on v7, from vkGetDeviceProcAddr: what happens to
+ * the fragments of the draws recorded after it, in this command buffer,
+ * whose depth falls outside the viewport's depth range. With
+ * VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2 set, those below minDepth are
+ * discarded when VK_DEPTH_CULL_BELOW_BIT_MALISX2 is set and clamped to it
+ * when not, and those above maxDepth likewise with
+ * VK_DEPTH_CULL_ABOVE_BIT_MALISX2 (which keeps up to 1e-5 past maxDepth:
+ * float rounding puts geometry modelled on the far plane a ULP or two past
+ * it); the pipeline's depthClampEnable and depth clip state no longer
+ * decide it. 0 returns to the pipeline's state. A command buffer starts at
+ * 0.
+ *
+ * This is the near and far handling of the fixed-function tiler (the
+ * Primitive's low and high depth cull), which Vulkan only offers coupled
+ * (depth clamp or depth clip on both sides). An emulator that needs
+ * fragments in front of the near plane clipped but those behind the far
+ * plane clamped otherwise writes clip distances, which v7 can only apply as
+ * a fragment discard (mali_shader.c lower_clip_distance_fs): that turns off
+ * forward pixel kill and early depth updates for every draw.
+ */
+enum {
+   VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2 = 1u << 0,
+   VK_DEPTH_CULL_BELOW_BIT_MALISX2 = 1u << 1,
+   VK_DEPTH_CULL_ABOVE_BIT_MALISX2 = 1u << 2,
+};
+typedef void(VKAPI_PTR *PFN_vkCmdSetDepthCullMALISX2)(VkCommandBuffer commandBuffer,
+                                                     uint32_t flags);
+VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetDepthCullMALISX2(VkCommandBuffer commandBuffer,
+                                                         uint32_t flags);
+
+/*
  * malisx2's own device extension on v7, in place of
  * VK_EXT_descriptor_indexing (whose required features and 500000
  * update-after-bind limits v7's 16-bit descriptor tables cannot meet). v9

@@ -1314,6 +1314,7 @@ MALI_PER_ARCH(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
    cmd->jm.xfer_fresh = false;
    cmd->jm.idx_hint.set = false;
    cmd->jm.idx_last.valid = false;
+   cmd->jm.depth_cull = 0;
 #endif
    return VK_SUCCESS;
 }

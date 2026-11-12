@@ -22,12 +22,14 @@
 #include "mali_measure.h"
 #include "mali_vk.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "util/log.h"
 #include "util/os_time.h"
+#include "vk_command_buffer.h"
 
 /* X(name, short name, return, parameters, arguments). The name is the
  * dispatch table field; ALIAS(name, alias) also wraps the KHR/EXT field
@@ -151,6 +153,7 @@ static const char *const names[E_COUNT] = {
 static const char *const part_names[MALI_CPUPROF_PART_COUNT] = {
    [MALI_CPUPROF_IDXSCAN] = "(idxscan",
    [MALI_CPUPROF_DRAWPREP] = "(drawprep",
+   [MALI_CPUPROF_IDXREUSE] = "(idxreuse",
 };
 
 struct thread_stats {
@@ -158,6 +161,7 @@ struct thread_stats {
    uint32_t calls[E_COUNT];
    uint64_t part_ns[MALI_CPUPROF_PART_COUNT];
    uint32_t part_calls[MALI_CPUPROF_PART_COUNT];
+   uint64_t vtx_draws, vtx_indices, vtx_shaded, vtx_sparse_draws, vtx_sparse_shaded;
    uint64_t since;
 };
 
@@ -188,6 +192,12 @@ report(struct thread_stats *t, uint64_t now)
       n += snprintf(line + n, sizeof(line) - n, " %s %u %.2f)", part_names[i],
                     t->part_calls[i], t->part_ns[i] / 1e6 / secs);
    }
+   if (t->vtx_draws && n < (int)sizeof(line) - 160)
+      snprintf(line + n, sizeof(line) - n,
+               " (vtx draws %" PRIu64 " indices %" PRIu64 " shaded %" PRIu64
+               " sparse %" PRIu64 " draws %" PRIu64 " shaded)",
+               t->vtx_draws, t->vtx_indices, t->vtx_shaded, t->vtx_sparse_draws,
+               t->vtx_sparse_shaded);
    mesa_logi("%s", line);
    memset(t, 0, sizeof(*t));
    t->since = now;
@@ -199,6 +209,24 @@ mali_cpuprof_part(enum mali_cpuprof_part part, uint64_t t0)
    struct thread_stats *t = &stats;
    t->part_ns[part] += os_time_get_nano() - t0;
    t->part_calls[part]++;
+}
+
+/* v7: an indexed draw of `indices` indices whose vertex job shades `range`
+ * vertices (its index range) per instance. Reported as "(vtx ...)": indices
+ * drawn, vertices shaded, and the vertices shaded by sparse draws (range
+ * more than 4x the index count). */
+static void
+mali_cpuprof_vertices(uint32_t indices, uint32_t range, uint32_t instances)
+{
+   struct thread_stats *t = &stats;
+   const uint64_t shaded = (uint64_t)range * instances;
+   t->vtx_draws++;
+   t->vtx_indices += (uint64_t)indices * instances;
+   t->vtx_shaded += shaded;
+   if (range > 4ull * indices) {
+      t->vtx_sparse_draws++;
+      t->vtx_sparse_shaded += shaded;
+   }
 }
 
 static inline void
@@ -237,6 +265,26 @@ CPUPROF_VOID(X)
 CPUPROF_RESULT(X)
 #undef X
 
+/* mali_jm_cmd_buffer.c (v7 builds) */
+bool mali_v7_last_draw_range(struct vk_command_buffer *vk, uint32_t first_index,
+                             uint32_t count, uint32_t *range);
+
+/* vkCmdDrawIndexed on a v7 GPU: timed as above, then the indices drawn
+ * against the vertices its vertex job shades (the draw's index range). */
+static VKAPI_ATTR void VKAPI_CALL
+w_CmdDrawIndexed_vtx(VkCommandBuffer cb, uint32_t index_count, uint32_t instance_count,
+                     uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+{
+   w_CmdDrawIndexed(cb, index_count, instance_count, first_index, vertex_offset,
+                    first_instance);
+   VK_FROM_HANDLE(vk_command_buffer, vk, cb);
+   const struct mali_physical_device *pdev =
+      container_of(vk->base.device->physical, struct mali_physical_device, vk);
+   uint32_t range;
+   if (pdev->arch == 7 && mali_v7_last_draw_range(vk, first_index, index_count, &range))
+      mali_cpuprof_vertices(index_count, range, instance_count);
+}
+
 void
 mali_cpuprof_install(struct vk_device_dispatch_table *t)
 {
@@ -255,7 +303,9 @@ mali_cpuprof_install(struct vk_device_dispatch_table *t)
    }
    CPUPROF_VOID(X) CPUPROF_RESULT(X)
 #undef X
-#define A(name, alias)                                                           \
+   if (t->CmdDrawIndexed == w_CmdDrawIndexed)
+      t->CmdDrawIndexed = w_CmdDrawIndexed_vtx;
+#define A(name, alias)                                                         \
    if (t->alias)                                                                 \
       t->alias = t->name;
    CPUPROF_ALIASES(A)

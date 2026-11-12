@@ -17,7 +17,8 @@
  * With ring=N at most N timing files and N captures are kept: the oldest
  * is deleted when a new one would exceed that, and the manifest marks it
  * deleted. Files are written with stdio (fopen and friends) so that
- * libadrenotools' file redirection can move them inside an app.
+ * libadrenotools' file redirection can move them inside an app; with
+ * "direct" they are opened with open(2), which it does not redirect.
  */
 
 #ifndef _GNU_SOURCE
@@ -27,6 +28,7 @@
 #include "mali_measure.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -124,6 +126,8 @@ mali_measure_config_parse(const char *str, struct mali_measure_config *c,
             c->shaders = true;
          } else if (len == 7 && !strncmp(p, "cpuprof", 7)) {
             c->cpuprof = true;
+         } else if (len == 6 && !strncmp(p, "direct", 6)) {
+            c->direct = true;
          } else if (len == 3 && !strncmp(p, "off", 3)) {
             c->timing = c->draws = c->csf = c->shaders = c->cpuprof = false;
          } else {
@@ -335,7 +339,7 @@ open_timing_file(struct mali_measure *m, uint64_t seqno)
    snprintf(f.name, sizeof(f.name), "timing-%04u.csv", m->timing_index++);
    char path[600];
    mali_measure_path(m, f.name, path, sizeof(path));
-   m->timing = fopen(path, "w");
+   m->timing = mali_measure_fopen(&m->cfg, path, "w");
    if (!m->timing) {
       write_failed(m, f.name);
       return NULL;
@@ -514,7 +518,7 @@ mali_measure_write_manifest(struct mali_measure *m)
    char path[600], tmp[610];
    mali_measure_path(m, "manifest.json", path, sizeof(path));
    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-   FILE *fp = fopen(tmp, "w");
+   FILE *fp = mali_measure_fopen(&m->cfg, tmp, "w");
    if (!fp) {
       write_failed(m, "manifest.json");
       return;
@@ -652,6 +656,31 @@ mali_measure_event(struct mali_device *dev, const char *fmt, ...)
    pthread_mutex_unlock(&m->lock);
 }
 
+FILE *
+mali_measure_fopen(const struct mali_measure_config *cfg, const char *path,
+                   const char *mode)
+{
+   if (!cfg->direct)
+      return fopen(path, mode);
+   int flags = O_WRONLY | O_CREAT | O_CLOEXEC | (mode[0] == 'a' ? O_APPEND : O_TRUNC);
+   int fd = open(path, flags, 0644);
+   if (fd < 0)
+      return NULL;
+   FILE *fp = fdopen(fd, mode);
+   if (!fp)
+      close(fd);
+   return fp;
+}
+
+static bool shader_direct;
+
+FILE *
+mali_measure_shader_fopen(const char *path, const char *mode)
+{
+   struct mali_measure_config c = {.direct = shader_direct};
+   return mali_measure_fopen(&c, path, mode);
+}
+
 const char *
 mali_measure_shader_dir(void)
 {
@@ -665,6 +694,7 @@ mali_measure_shader_dir(void)
       struct mali_measure_config c;
       read = true;
       if (config_read(&c) && c.shaders) {
+         shader_direct = c.direct;
          snprintf(dir, sizeof(dir), "%s/shaders", c.dir);
          ok = make_dirs(dir);
          if (!ok)

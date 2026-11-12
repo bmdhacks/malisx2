@@ -798,8 +798,10 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
 #if PAN_ARCH >= 10
       cfg.flags_2.write_mask = written;
       cfg.flags_2.read_mask = 0;
+#if PAN_ARCH >= 11
       cfg.flags_2.no_shader_depth_read = true;
       cfg.flags_2.no_shader_stencil_read = true;
+#endif
 #else
       /* A full-screen job's draw takes its vertex packet as a Malloc
        * Vertex draw does (Mesa's v9 jm_emit_tiler_draw); frame shaders

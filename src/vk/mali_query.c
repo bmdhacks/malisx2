@@ -6,7 +6,7 @@
 /*
  * Query pools, the host side: vkCreateQueryPool, vkDestroyQueryPool and
  * vkGetQueryPoolResults, for timestamp and occlusion queries. Built once
- * per back half (v11 and the job manager's v7 and v9), like mali_sync.c:
+ * per back half (v10, v11 and the job manager's v7 and v9), like mali_sync.c:
  * what is recorded into command buffers differs (mali_cmd_query.c on the
  * command-stream frontend, mali_jm_query.c on the job manager), the pool
  * and its host reads do not. The layout is in mali_query.h.

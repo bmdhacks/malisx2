@@ -478,7 +478,7 @@ MALI_PER_ARCH_DECL(uint64_t, cmd_gfx_fau,
                     const void *sysvals, const void *push, uint32_t push_size));
 
 /* The same block written at out, whose GPU address is self, for blocks the
- * caller allocates itself (v11 indirect draws: one per draw). */
+ * caller allocates itself (v10/v11 indirect draws: one per draw). */
 #if !defined(PAN_ARCH) || PAN_ARCH >= 10
 MALI_PER_ARCH_DECL(void, gfx_fau_fill,
                    (const struct mali_shader *s, const void *sysvals, const void *push,
@@ -488,8 +488,10 @@ MALI_PER_ARCH_DECL(void, gfx_fau_fill,
 /* ---------------------------------------------------------------------- */
 /* mali_cmd_draw.c                                                         */
 
-/* Set RUN_IDVS bit 55 (default true; tests only change it). */
+#if defined(PAN_ARCH) && PAN_ARCH >= 11
+/* Set RUN_IDVS bit 55 (v11 only; default true; tests only change it). */
 extern bool mali_idvs_bit55;
+#endif
 
 /* A primitive barrier inside the render pass (by-region dependencies). */
 MALI_PER_ARCH_DECL(void, cmd_fb_barrier, (struct mali_cmd_buffer *cmd));

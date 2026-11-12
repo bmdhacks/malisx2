@@ -72,7 +72,7 @@ idep_mali_kbase = declare_dependency(
 # Mesa's generator; the stubs themselves come from waist.txt.
 # Device-level commands (vkCmd*, vkQueue*, vkCreate{Sampler,ImageView,
 # BufferView,*Pipelines}, vkUpdateDescriptorSets, ...) get a dispatch table
-# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v11, so every
+# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v10/mali_v11, so every
 # arch's MALI_PER_ARCH-named functions can sit in the same .so without
 # colliding; mali_CreateDevice picks the table that matches the device
 # (mali_device.c).
@@ -87,7 +87,7 @@ mali_entrypoints = custom_target(
     '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@',
     '--prefix', 'mali', '--prefix', 'mali_waist',
     '--device-prefix', 'mali_v7', '--device-prefix', 'mali_v9',
-    '--device-prefix', 'mali_v11',
+    '--device-prefix', 'mali_v10', '--device-prefix', 'mali_v11',
     '--beta', with_vulkan_beta.to_string(),
   ],
   depend_files : vk_entrypoints_gen_depend_files,
@@ -115,21 +115,20 @@ mali_version_h = vcs_tag(
 # binaries (vk/gen_shader_cache_id.py), not from the commit, so a driver
 # update that leaves the compiler alone keeps applications' pipeline caches.
 # One hash per architecture: a change only the v9 build sees leaves the
-# v11 one alone.
+# v10 and v11 ones alone.
 # The script runs on every build and rewrites the header only on a change.
 mali_shader_cache_id_h = custom_target(
   'mali_shader_cache_id.h',
   output : 'mali_shader_cache_id.h',
   command : [prog_python, files('vk/gen_shader_cache_id.py'),
              '--root', meson.project_source_root(),
-             '--arch', '@0@'.format(pan_arch), '--arch', '9', '--arch', '7',
+             '--arch', '11', '--arch', '10', '--arch', '9', '--arch', '7',
              '--out-h', '@OUTPUT@'],
   build_always_stale : true,
 )
 
 _vk_c_args = [
   pre_args, malisx2_c_args,
-  '-DMALI_PAN_ARCH=@0@'.format(pan_arch),
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
 ]
 
@@ -140,7 +139,8 @@ _vk_c_args = [
 # (mali_cmd_copy.c, on each back half's dispatch) and the image copies,
 # clears and blits (mali_cmd_image.c, on each back half's dispatch and
 # render pass). Each copy names its
-# functions mali_v7_*, mali_v9_* or mali_v11_* (MALI_PER_ARCH, vk/mali_arch.h).
+# functions mali_v7_*, mali_v9_*, mali_v10_* or mali_v11_* (MALI_PER_ARCH,
+# vk/mali_arch.h).
 _vk_per_arch_files = files(
   'vk/mali_blend.c', 'vk/mali_cmd_copy.c', 'vk/mali_cmd_image.c', 'vk/mali_cmd_meta_gfx.c',
   'vk/mali_cmd_state.c',
@@ -153,9 +153,12 @@ _vk_inc = [inc_include, inc_src, inc_malisx2, include_directories('vk'),
 _vk_per_arch_deps = [idep_vulkan_lite_runtime_headers, idep_vulkan_util_headers,
                      idep_mesautil, idep_nir_headers, idep_mali_compiler]
 
-# Everything of the front half except the per-arch files and what the waist
-# stubs do when called (mali_waist.c), which the driver and the tests pick
-# separately. The command-stream (CSF) back half here is the v11 one.
+# Everything of the front half that is built once, whatever the GPU: the
+# instance, physical device and device, memory, buffers, images, formats,
+# descriptor set layouts, shader lowering, events, sync files, the window
+# systems and the measurement output. Nothing here depends on the arch;
+# what does is in the per-arch files and the back halves below, reached
+# through each arch's device dispatch table or mali_arch_dispatch.
 # The display's scanout buffers come from GBM on the DRM node
 # (mali_wsi_linux.c); libdrm comes with the WSI.
 dep_gbm = with_platform_android ? dependency('', required : false) \
@@ -171,45 +174,58 @@ malisx2_vk = static_library(
   # Shader lowering and memory pools, descriptor set layouts.
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
         'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
-  # Command buffers, the CSF queue, submit and sync.
-  files('vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
-        'vk/mali_queue.c', 'vk/mali_sync.c'),
   # VkEvent: the host side and the object, for every arch; the vkCmd*
-  # commands are mali_cmd_event.c above (v11) and mali_jm_event.c (v7, v9).
+  # commands are mali_cmd_event.c (v10, v11) and mali_jm_event.c (v7, v9).
   files('vk/mali_event.c'),
-  # Query pools: the pool and its host reads, and the v11 commands.
-  files('vk/mali_cmd_query.c', 'vk/mali_query.c'),
-  # Render passes and draws (the CSF side; the shared builders and the
-  # image transfers are per-arch files).
-  files('vk/mali_cmd_draw.c', 'vk/mali_cmd_draw_indirect.c', 'vk/mali_cmd_render.c'),
-  # Sync files and the Android window system; mali_android.c only on Android.
+  # Sync files (the command-stream back half's kcpu queue) and the window
+  # systems: the gralloc and swapchain-image side of mali_wsi.c that does
+  # not depend on the arch, mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
   with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c'),
-  # Timing, command-stream capture and the CPU profile (MALISX2_MEASURE).
-  files('measurement/config.c', 'measurement/cpuprof.c', 'measurement/recorder.c',
-        'measurement/timing.c'),
+  # The measurement layer's configuration, output and CPU profile
+  # (MALISX2_MEASURE); the recording side is per back half.
+  files('measurement/config.c', 'measurement/cpuprof.c'),
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
   c_args : _vk_c_args,
   dependencies : [idep_vulkan_lite_runtime_headers, idep_vulkan_util_headers,
-                  idep_mesautil, idep_nir_headers, idep_pan_format,
-                  idep_mali_compiler, idep_pan_packers] +
+                  idep_mesautil, idep_nir_headers, idep_mali_compiler] +
                  (with_platform_android ? [] : [idep_vulkan_wsi_headers]),
   gnu_symbol_visibility : 'hidden',
 )
 
-# The per-arch files at v11, for the G615 (mali_v11_*).
-malisx2_vk_v11 = static_library(
-  'mali_vk_v11',
-  _vk_per_arch_files,
-  mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
-  include_directories : _vk_inc,
-  c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=11', '-DMALI_PAN_ARCH=11'],
-  dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch['11'],
-                  idep_pan_packers_by_arch['11']],
-  gnu_symbol_visibility : 'hidden',
+# The command-stream (CSF) back half: command buffers, dispatches, events,
+# queries, render passes, draws, the queue, submit and sync, the per-arch
+# side of mali_wsi.c, and the recording side of the measurement layer.
+# Built at PAN_ARCH 10 (Mali-G610, G710) and 11 (Mali-G615) with the
+# per-arch files; each copy names its own functions mali_v10_* or
+# mali_v11_* (MALI_CSF_NAMES, vk/mali_arch.h).
+_vk_csf_files = files(
+  'vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
+  'vk/mali_cmd_query.c', 'vk/mali_query.c',
+  'vk/mali_cmd_draw.c', 'vk/mali_cmd_draw_indirect.c', 'vk/mali_cmd_render.c',
+  'vk/mali_queue.c', 'vk/mali_sync.c', 'vk/mali_wsi.c',
+  'measurement/recorder.c', 'measurement/timing.c',
 )
+
+malisx2_vk_csf = {}
+foreach arch : ['10', '11']
+  malisx2_vk_csf += {arch : static_library(
+    'mali_vk_v' + arch,
+    _vk_csf_files, _vk_per_arch_files,
+    mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
+    mali_version_h,
+    include_directories : _vk_inc,
+    c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=' + arch,
+              '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version())],
+    dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch[arch],
+                    idep_pan_packers_by_arch[arch]],
+    gnu_symbol_visibility : 'hidden',
+  )}
+endforeach
+malisx2_vk_v10 = malisx2_vk_csf['10']
+malisx2_vk_v11 = malisx2_vk_csf['11']
 
 # The files both job-manager back halves build, at PAN_ARCH 7 and 9:
 # command buffers, dispatches, render passes, the tiler heap, queries, the
@@ -288,8 +304,9 @@ endforeach
 # For the driver .so and the tests: the front half, the runtime, kbase, the
 # compiler. The waist behaviour is added by the user of the dependency.
 idep_mali_vk = declare_dependency(
-  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v9, malisx2_vk_v7],
+  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v10, malisx2_vk_v9, malisx2_vk_v7],
   link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['11'],
+               libpanfrost_pixel_format_by_arch['10'],
                libpanfrost_pixel_format_by_arch['9'],
                libpanfrost_pixel_format_by_arch['7']],
   sources : [mali_entrypoints[0]],

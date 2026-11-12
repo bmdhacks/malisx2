@@ -4,7 +4,8 @@
  */
 
 /*
- * GPU timing of passes, dispatches and draws.
+ * GPU timing of passes, dispatches and draws on the command-stream back
+ * half, built once per command-stream arch (v10, v11).
  *
  * Recording: a region is two STORE_STATE{Timestamp} instructions on one
  * subqueue's stream, each deferred on every iterator scoreboard entry
@@ -56,57 +57,6 @@ mali_measure_cmd_create(struct mali_cmd_buffer *cmd)
    list_inithead(&mc->link);
    util_dynarray_init(&mc->regions, NULL);
    cmd->measure = mc;
-}
-
-/* With m->lock held. */
-void
-mali_measure_harvest(struct mali_measure *m, struct mali_measure_cmd *mc)
-{
-   if (mc->active) {
-      util_dynarray_foreach(&mc->regions, struct mali_measure_region, r)
-         mali_measure_row(m, mc, r);
-   }
-   list_del(&mc->link);
-   list_inithead(&mc->link);
-   mc->pending = false;
-}
-
-/*
- * completed(): has every region mc holds finished on the device? dev->jm
- * (non-NULL only on a job-manager device) asks the JM queue's completed
- * submission counter (mali_jm_measure_reached, mali_jm_queue.c -- jd is
- * only ever passed back to it, never dereferenced here, so this needs no
- * job-manager type); a CSF device (dev->csf) checks the subqueues'
- * sync-object "done" slots mc->sq_mask names, as before. Neither path
- * touches cmd, so this is safe for a mc created by either frontend.
- */
-static bool
-completed(struct mali_measure *m, const struct mali_measure_cmd *mc)
-{
-   if (m->dev->jm) {
-      const uint32_t arch = mali_device_physical(m->dev)->arch;
-      return mali_jm_arch_dispatch(arch, jm_measure_reached, m->dev->jm, mc->submit);
-   }
-   struct mali_csf_queue *q = m->dev->csf ? m->dev->csf->queue : NULL;
-   if (!q)
-      return true;
-   volatile struct mali_cs_sync64 *done = mali_queue_done(q);
-   u_foreach_bit(i, mc->sq_mask) {
-      if (done[i].seqno < mc->submit)
-         return false;
-   }
-   return true;
-}
-
-void
-mali_measure_collect(struct mali_measure *m, bool force)
-{
-   list_for_each_entry_safe(struct mali_measure_cmd, mc, &m->pending, link) {
-      if (force || completed(m, mc))
-         mali_measure_harvest(m, mc);
-   }
-   if (m->timing)
-      fflush(m->timing);
 }
 
 static void
@@ -168,15 +118,13 @@ emit_timestamp(struct mali_cmd_buffer *cmd, enum mali_subqueue sq, uint64_t va, 
 }
 
 /*
- * cmd->measure's region allocation is specific to this file's (CSF,
- * v11-fixed) struct mali_cmd_buffer layout and mali_cmd_alloc(): the
- * job-manager back half has its own copy of this logic in timing_jm.c
- * against its own struct mali_cmd_buffer (mali_jm.h), because a function
- * compiled once here would read cmd->measure, and call mali_cmd_alloc(),
- * at this file's (v11) offsets and definition even when handed a
- * job-manager cmd pointer. Only mali_measure_harvest and completed() are
- * shared (above): they never touch cmd, only the frontend-neutral struct
- * mali_measure_cmd a cmd->measure already points at.
+ * cmd->measure's region allocation is specific to the command-stream
+ * struct mali_cmd_buffer and mali_cmd_alloc(): the job-manager back half
+ * has its own copy of this logic in timing_jm.c against its own struct
+ * mali_cmd_buffer (mali_jm.h). What never touches cmd, only the
+ * frontend-neutral struct mali_measure_cmd a cmd->measure already points
+ * at (mali_measure_harvest, mali_measure_completed, mali_measure_collect),
+ * is built once, in config.c.
  */
 uint32_t
 mali_measure_begin(struct mali_cmd_buffer *cmd, enum mali_measure_kind kind,
@@ -278,7 +226,7 @@ mali_measure_submit(struct mali_device *dev, struct mali_queue *queue,
       if (mc->pending) {
          /* Submitted again before its last results were read: read them
           * if they are there, else they are lost. */
-         if (completed(m, mc)) {
+         if (mali_measure_completed(m, mc)) {
             mali_measure_harvest(m, mc);
          } else {
             m->dropped++;

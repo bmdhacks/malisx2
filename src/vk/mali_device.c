@@ -11,6 +11,7 @@
 
 #include "mali_vk.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,7 @@
 #include "vk_alloc.h"
 #include "vk_util.h"
 
-#include "mali_cmd_buffer.h"
+#include "mali_cmd_gfx.h"
 #include "mali_queue.h"
 #include "mali_measure.h"
 #include "mali_waist.h"
@@ -31,6 +32,8 @@
 
 #include "util/hash_table.h"
 #include "util/stack_array.h"
+#include "mali_image.h"
+#include "mali_layout_check.h"
 #include "mali_pipeline.h"
 
 #ifndef __ANDROID__
@@ -110,11 +113,86 @@ mali_device_intern_key(struct mali_device *dev, const void *data, size_t size)
    return id;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Layout                                                                  */
+
+/*
+ * The structures this file and the rest of the code built once share with
+ * the command-stream back half, as this build sees them: each build of
+ * that back half (v10 and v11) checks its own view against these when the
+ * driver is linked (mali_layout_check.h, mali_cmd_buffer.c).
+ */
+static void __attribute__((used))
+layout_define(void)
+{
+   MALI_LAYOUT_DEFINE(device_size, sizeof(struct mali_device));
+   MALI_LAYOUT_DEFINE(device_csf, offsetof(struct mali_device, csf));
+   MALI_LAYOUT_DEFINE(device_measure, offsetof(struct mali_device, measure));
+   MALI_LAYOUT_DEFINE(queue_size, sizeof(struct mali_queue));
+   MALI_LAYOUT_DEFINE(csf_device_size, sizeof(struct mali_csf_device));
+   MALI_LAYOUT_DEFINE(csf_device_sb, offsetof(struct mali_csf_device, sb));
+   MALI_LAYOUT_DEFINE(csf_device_queue, offsetof(struct mali_csf_device, queue));
+   MALI_LAYOUT_DEFINE(csf_queue_size, sizeof(struct mali_csf_queue));
+   MALI_LAYOUT_DEFINE(csf_queue_sync_mem, offsetof(struct mali_csf_queue, sync_mem));
+   MALI_LAYOUT_DEFINE(cs_subqueue_ctx_size, sizeof(struct mali_cs_subqueue_ctx));
+   MALI_LAYOUT_DEFINE(sync_size, sizeof(struct mali_sync));
+   MALI_LAYOUT_DEFINE(image_size, sizeof(struct mali_image));
+   MALI_LAYOUT_DEFINE(image_crc_header, offsetof(struct mali_image, crc_header));
+   MALI_LAYOUT_DEFINE(measure_cmd_size, sizeof(struct mali_measure_cmd));
+   MALI_LAYOUT_DEFINE(measure_region_size, sizeof(struct mali_measure_region));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Device loss (every back half)                                           */
+
+/*
+ * The runtime is told first (vk_device_set_lost, once), then waiters see
+ * dev->lost: the runtime asserts that anything returning
+ * VK_ERROR_DEVICE_LOST has already reported the loss.
+ */
+void
+mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
+{
+   char msg[256];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(msg, sizeof(msg), fmt, ap);
+   va_end(ap);
+
+   if (p_atomic_cmpxchg(&dev->lost_reported, 0, 1) == 0) {
+      /* Always in the log, whatever the build (the runtime's own message
+       * is debug-only). Device loss is never hidden. */
+      mesa_loge("malisx2: device lost: %s", msg);
+      vk_device_set_lost(&dev->vk, "%s", msg);
+      mali_measure_event(dev, "device lost: %s", msg);
+   }
+
+   pthread_mutex_lock(&dev->lock);
+   if (!dev->lost_msg[0])
+      snprintf(dev->lost_msg, sizeof(dev->lost_msg), "%s", msg);
+   dev->lost = true;
+   pthread_cond_broadcast(&dev->cond);
+   pthread_mutex_unlock(&dev->lock);
+}
+
+/* Frees the device's cached command-buffer slabs (both back halves fill
+ * dev->free_slabs). */
+static void
+cmd_slabs_finish(struct mali_device *dev)
+{
+   list_for_each_entry_safe(struct mali_cmd_slab, s, &dev->free_slabs, link) {
+      list_del(&s->link);
+      mali_kbase_free(dev->kbase, &s->bo);
+      free(s);
+   }
+   dev->free_slab_count = 0;
+}
+
 /*
  * Device state every frontend needs alike: the command-buffer slab
  * cache, internal shader caches, and the sync-object lock, condition and
  * device-loss state. Set up before the frontend's own
- * device-init (mali_csf_device_init today; a JM equivalent later) so that
+ * device-init (mali_csf_device_init or mali_jm's device_init) so that
  * state exists under either frontend, and torn down after it, since
  * nothing here depends on dev->csf.
  */
@@ -137,7 +215,7 @@ static void
 device_fe_state_finish(struct mali_device *dev)
 {
    mali_arch_dispatch(mali_device_physical(dev)->arch, meta_finish, dev);
-   mali_cmd_slabs_finish(dev);
+   cmd_slabs_finish(dev);
 
    pthread_cond_destroy(&dev->cond);
    pthread_mutex_destroy(&dev->lock);
@@ -157,13 +235,15 @@ queue_init(struct mali_device *dev, struct mali_queue *queue,
    const uint32_t arch = mali_device_physical(dev)->arch;
    const bool jm = mali_arch_is_jm(arch);
    result = jm ? mali_jm_arch_dispatch(arch, queue_init, dev, queue)
-               : mali_csf_queue_init(dev, queue);
+               : mali_csf_arch_dispatch(arch, csf_queue_init, dev, queue);
    if (result != VK_SUCCESS) {
       vk_queue_finish(&queue->vk);
       return result;
    }
-   queue->vk.driver_submit = !jm ? mali_queue_submit
-                             : arch == 7 ? mali_v7_queue_submit : mali_v9_queue_submit;
+   queue->vk.driver_submit = arch == 7    ? mali_v7_queue_submit
+                             : arch == 9  ? mali_v9_queue_submit
+                             : arch == 10 ? mali_v10_queue_submit
+                                          : mali_v11_queue_submit;
    return VK_SUCCESS;
 }
 
@@ -173,7 +253,7 @@ queue_finish(struct mali_device *dev, struct mali_queue *queue)
    if (queue->jm)
       mali_jm_arch_dispatch(mali_device_physical(dev)->arch, queue_finish, dev, queue);
    else
-      mali_csf_queue_finish(dev, queue);
+      mali_csf_arch_dispatch(mali_device_physical(dev)->arch, csf_queue_finish, dev, queue);
    vk_queue_finish(&queue->vk);
 }
 
@@ -193,7 +273,7 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    if (dev->jm)
       mali_jm_arch_dispatch(mali_device_physical(dev)->arch, device_finish, dev);
    else
-      mali_csf_device_finish(dev);
+      mali_csf_arch_dispatch(mali_device_physical(dev)->arch, csf_device_finish, dev);
    /* Frontend-neutral device state: command memory, internal shaders
     * (their code lives in the pools below), the sync lock/condition. */
    device_fe_state_finish(dev);
@@ -256,7 +336,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /*
     * Four layers, first match wins: the device's own arch (mali_v7_*,
-    * mali_v9_* or mali_v11_*, MALI_PER_ARCH in the per-arch and
+    * mali_v9_*, mali_v10_* or mali_v11_*, MALI_PER_ARCH in the per-arch and
     * command-stream files), then our arch-independent entry points, then
     * Mesa's common entry points (added by vk_device_init), then the waist
     * stubs. Only the first layer depends on pdev->arch; everything below
@@ -265,9 +345,10 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    struct vk_device_dispatch_table dispatch;
    vk_device_dispatch_table_from_entrypoints(
       &dispatch,
-      pdev->arch == 7 ? &mali_v7_device_entrypoints
-      : pdev->arch == 9 ? &mali_v9_device_entrypoints
-                        : &mali_v11_device_entrypoints,
+      pdev->arch == 7    ? &mali_v7_device_entrypoints
+      : pdev->arch == 9  ? &mali_v9_device_entrypoints
+      : pdev->arch == 10 ? &mali_v10_device_entrypoints
+                         : &mali_v11_device_entrypoints,
       true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &mali_device_entrypoints, false);
 #ifndef __ANDROID__
@@ -385,16 +466,20 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    /* Command buffers and the queue's shared state: the frontend the
-    * physical device's arch has (CSF on v11, the job manager on v7 and v9). */
+    * physical device's arch has (CSF on v10 and v11, the job manager on v7
+    * and v9). */
    if (pdev->arch == 7) {
       dev->vk.command_buffer_ops = &mali_v7_cmd_buffer_ops;
       result = mali_v7_device_init(dev);
    } else if (pdev->arch == 9) {
       dev->vk.command_buffer_ops = &mali_v9_cmd_buffer_ops;
       result = mali_v9_device_init(dev);
+   } else if (pdev->arch == 10) {
+      dev->vk.command_buffer_ops = &mali_v10_cmd_buffer_ops;
+      result = mali_v10_csf_device_init(dev);
    } else {
-      dev->vk.command_buffer_ops = &mali_cmd_buffer_ops;
-      result = mali_csf_device_init(dev);
+      dev->vk.command_buffer_ops = &mali_v11_cmd_buffer_ops;
+      result = mali_v11_csf_device_init(dev);
    }
    if (result != VK_SUCCESS) {
       device_destroy(dev, pAllocator);

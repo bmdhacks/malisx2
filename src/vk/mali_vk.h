@@ -398,8 +398,8 @@ void mali_event_pool_finish(struct mali_device *dev);
  * The job-manager back half (v7 and v9), as code built once (mali_device.c,
  * mali_physical_device.c) reaches it: device and queue setup
  * (mali_jm_queue.c), command buffers (mali_jm_cmd_buffer.c) and the sync
- * type (mali_sync.c built at v7 and v9). The v11 counterparts are in
- * mali_queue.h and mali_cmd_buffer.h.
+ * type (mali_sync.c built at v7 and v9). The command-stream (v10, v11)
+ * counterparts are in mali_queue.h and below.
  */
 struct vk_command_buffer_ops;
 struct vk_queue_submit;
@@ -415,13 +415,31 @@ extern const struct vk_command_buffer_ops mali_v7_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v9_cmd_buffer_ops;
 extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
+extern const struct vk_sync_type mali_v10_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
 
 /* Each arch's sync types, binary first and then the timeline semaphore type
  * wrapped around it (mali_sync.c); the physical device picks by arch. */
 const struct vk_sync_type *const *mali_v7_sync_types(void);
 const struct vk_sync_type *const *mali_v9_sync_types(void);
+const struct vk_sync_type *const *mali_v10_sync_types(void);
 const struct vk_sync_type *const *mali_v11_sync_types(void);
+
+/* Log a failed sync-file import or export (mali_sync.c, every arch; the
+ * per-arch headers declare each build's own). */
+MALI_PER_ARCH_DECL(void, sync_file_log_error,
+                   (struct mali_device *dev, const char *op, int fd, const char *why));
+
+/* The command-stream back half's command buffers (mali_cmd_buffer.c, built
+ * at v10 and v11). */
+extern const struct vk_command_buffer_ops mali_v10_cmd_buffer_ops;
+extern const struct vk_command_buffer_ops mali_v11_cmd_buffer_ops;
+
+/* Report device loss to the runtime and the log (once), then mark it and
+ * wake every waiter. Takes dev->lock; call without it. Every back half
+ * calls it (mali_device.c). */
+void mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
+   __attribute__((format(printf, 2, 3)));
 
 static inline struct mali_physical_device *
 mali_device_physical(struct mali_device *dev)

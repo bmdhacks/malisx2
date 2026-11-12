@@ -51,7 +51,7 @@
  * subqueue enum. The v7 and v9 per-arch files include this header only for
  * the shader dump directory (mali_measure_shader_dir). */
 #if !defined(PAN_ARCH) || PAN_ARCH >= 10
-#include "mali_cs.h"
+#include "mali_cs_defs.h"
 #endif
 
 struct mali_cmd_buffer;
@@ -352,5 +352,7 @@ void mali_measure_path(const struct mali_measure *m, const char *name, char *out
 
 /* Read the completed pending command buffers (all of them with force). */
 void mali_measure_collect(struct mali_measure *m, bool force);
+/* Has every region of mc finished on the device? With m->lock held. */
+bool mali_measure_completed(struct mali_measure *m, const struct mali_measure_cmd *mc);
 
 #endif

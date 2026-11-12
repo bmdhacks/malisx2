@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Derived from Mesa src/panfrost/lib/meson.build. The pixel-format tables
 # (pan_format.c) are built once per entry of pan_archs; idep_pan_format
-# below still names the pan_arch one, unchanged from a single-arch build.
+# below names the pan_arch one (the tests' arch).
 
 libpanfrost_pixel_format_by_arch = {}
 idep_pan_format_by_arch = {}
@@ -23,8 +23,7 @@ foreach arch : pan_archs
   )}
 endforeach
 
-# The format library for pan_arch, the arch the driver's vk/ sources build
-# for today: unchanged name and content from before pan_archs existed.
+# The format library for pan_arch (the tests' arch).
 libpanfrost_pixel_format = libpanfrost_pixel_format_by_arch['@0@'.format(pan_arch)]
 idep_pan_format = idep_pan_format_by_arch['@0@'.format(pan_arch)]
 

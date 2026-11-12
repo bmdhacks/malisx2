@@ -8,7 +8,7 @@
  * (The pipeline, descriptor-set and push-constant binds are in
  * mali_cmd_state.c, shared with the job-manager back half.)
  *
- * The recording follows panvk v11 (Mesa csf/panvk_vX_cmd_buffer.c), which
+ * The recording follows panvk (Mesa csf/panvk_vX_cmd_buffer.c), which
  * "which source wins" makes the reference for command-stream encoding,
  * scoreboards and the subqueue-to-stage mapping; the blob records the same
  * way in substance. Every stream ends with a wait on all its scoreboard
@@ -31,10 +31,59 @@
 #include "mali_arch.h"
 #include "mali_descriptor_set.h"
 #include "mali_image.h"
+#include "mali_layout_check.h"
 #include "mali_measure.h"
 #include "mali_pipeline.h"
 #include "mali_queue.h"
 #include "mali_vk.h"
+
+/* ---------------------------------------------------------------------- */
+/* Layout                                                                  */
+
+/*
+ * This back half is built at v10 and v11 into one driver, and the
+ * structures below must come out the same in both (no field may depend on
+ * PAN_ARCH): the v11 build defines the command buffer's layout and the v10
+ * build checks its own against it, and both check what they share with the
+ * code built once against that build's view (mali_device.c). A difference
+ * fails the link (mali_layout_check.h).
+ */
+static void __attribute__((used))
+layout_check(void)
+{
+#if PAN_ARCH == 11
+#define CMD_LAYOUT MALI_LAYOUT_DEFINE
+#else
+#define CMD_LAYOUT MALI_LAYOUT_EXPECT
+#endif
+   CMD_LAYOUT(cmd_buffer_size, sizeof(struct mali_cmd_buffer));
+   CMD_LAYOUT(cmd_buffer_cs, offsetof(struct mali_cmd_buffer, cs));
+   CMD_LAYOUT(cmd_cs_size, sizeof(struct mali_cmd_cs));
+   CMD_LAYOUT(cmd_cs_iter_sb, offsetof(struct mali_cmd_cs, iter_sb));
+   CMD_LAYOUT(cmd_buffer_gfx, offsetof(struct mali_cmd_buffer, gfx));
+   CMD_LAYOUT(cmd_buffer_render, offsetof(struct mali_cmd_buffer, gfx.render));
+   CMD_LAYOUT(render_state_size, sizeof(struct mali_render_state));
+   CMD_LAYOUT(gfx_draw_state_size, sizeof(struct mali_gfx_draw_state));
+   CMD_LAYOUT(cmd_buffer_measure, offsetof(struct mali_cmd_buffer, measure));
+   CMD_LAYOUT(cmd_buffer_oq_done, offsetof(struct mali_cmd_buffer, oq_done));
+#undef CMD_LAYOUT
+
+   MALI_LAYOUT_EXPECT(device_size, sizeof(struct mali_device));
+   MALI_LAYOUT_EXPECT(device_csf, offsetof(struct mali_device, csf));
+   MALI_LAYOUT_EXPECT(device_measure, offsetof(struct mali_device, measure));
+   MALI_LAYOUT_EXPECT(queue_size, sizeof(struct mali_queue));
+   MALI_LAYOUT_EXPECT(csf_device_size, sizeof(struct mali_csf_device));
+   MALI_LAYOUT_EXPECT(csf_device_sb, offsetof(struct mali_csf_device, sb));
+   MALI_LAYOUT_EXPECT(csf_device_queue, offsetof(struct mali_csf_device, queue));
+   MALI_LAYOUT_EXPECT(csf_queue_size, sizeof(struct mali_csf_queue));
+   MALI_LAYOUT_EXPECT(csf_queue_sync_mem, offsetof(struct mali_csf_queue, sync_mem));
+   MALI_LAYOUT_EXPECT(cs_subqueue_ctx_size, sizeof(struct mali_cs_subqueue_ctx));
+   MALI_LAYOUT_EXPECT(sync_size, sizeof(struct mali_sync));
+   MALI_LAYOUT_EXPECT(image_size, sizeof(struct mali_image));
+   MALI_LAYOUT_EXPECT(image_crc_header, offsetof(struct mali_image, crc_header));
+   MALI_LAYOUT_EXPECT(measure_cmd_size, sizeof(struct mali_measure_cmd));
+   MALI_LAYOUT_EXPECT(measure_region_size, sizeof(struct mali_measure_region));
+}
 
 /* ---------------------------------------------------------------------- */
 /* Memory                                                                  */
@@ -97,17 +146,6 @@ slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
    }
    mali_kbase_free(dev->kbase, &s->bo);
    free(s);
-}
-
-void
-mali_cmd_slabs_finish(struct mali_device *dev)
-{
-   list_for_each_entry_safe(struct mali_cmd_slab, s, &dev->free_slabs, link) {
-      list_del(&s->link);
-      mali_kbase_free(dev->kbase, &s->bo);
-      free(s);
-   }
-   dev->free_slab_count = 0;
 }
 
 struct mali_ptr
@@ -195,6 +233,11 @@ init_streams(struct mali_cmd_buffer *cmd)
       cmd->cs[i].pending_flush = (struct mali_cache_flush){0};
       cmd->cs[i].pending_signal = false;
       cmd->cs[i].idle = false;
+#if PAN_ARCH == 10
+      /* Every stream starts with the first iterator entry selected
+       * (finish_stream, mali_queue.c). */
+      cmd->cs[i].iter_sb = MALI_SB_ITER_START;
+#endif
       cmd->cs[i].flushed = (struct mali_cache_flush){0};
       memset(cmd->cs[i].carried, 0, sizeof(cmd->cs[i].carried));
       memset(cmd->cs[i].waited, 0, sizeof(cmd->cs[i].waited));
@@ -379,6 +422,14 @@ finish_stream(struct mali_cmd_buffer *cmd, unsigned sq)
                    MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
                    cs_defer(0, MALI_SB_IMM_FLUSH));
    cs_wait_slot(b, MALI_SB_IMM_FLUSH);
+#if PAN_ARCH == 10
+   /* Hand the stream back with the first iterator entry selected, which
+    * the next command buffer's recording assumes (mali_cmd_next_iter_sb). */
+   if (cmd->cs[sq].iter_sb != MALI_SB_ITER_START) {
+      cs_set_scoreboard_entry(b, MALI_SB_ITER_START, MALI_SB_LS);
+      cmd->cs[sq].iter_sb = MALI_SB_ITER_START;
+   }
+#endif
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

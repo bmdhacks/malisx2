@@ -67,7 +67,7 @@ external_memory(const VkImageCreateInfo *info)
  * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
  * pan_mod_afbc_test_props).
  *
- * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
+ * v9, v10 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
  *
  * v7 has narrower rules of its own, colour attachments only
@@ -312,10 +312,12 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
-   /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
-    * GPU, and the CPU-side seed it needs is not written yet. */
-   const bool crc = !mali_arch_is_jm(arch) &&
-                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+   /* CRC on v11 only. Not on v7 and v9 yet: the job manager cannot update
+    * the seed from the GPU, and the CPU-side seed it needs is not written
+    * yet. Not on v10 yet: its stream cannot merge a seed into the clear
+    * colour (no AND or OR), and the scheme it needs instead is not written
+    * yet. */
+   const bool crc = arch == 11 && mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
    if (mod_explicit && image->plane_count != 1) {
       result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,

@@ -34,6 +34,13 @@
  *  - the Depth/stencil descriptor has no separated dependency tracking;
  *  - the depth/stencil update may be weak-early (pan_earlyzs.c forces it
  *    early from v11 only).
+ *
+ * On v10 (genxml v10.xml): DCD Flags 0 has no conservative rasterization
+ * or cull-zero-area either, DCD Flags 1 an 8-bit render target mask, DCD
+ * Flags 2 the tile-buffer masks but not the no-shader-depth/stencil-read
+ * bits, and the Depth/stencil bit v11 calls separated dependency tracking
+ * is "shader read-only Z/S", left clear; the update may be weak-early as
+ * on v9.
  */
 
 #ifndef PAN_ARCH
@@ -680,7 +687,10 @@ pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
 
       if (in->fs) {
-#if PAN_ARCH >= 10
+         /* The same bit is Shader Read Only Z/S on v10, which the
+          * early-ZS choice above never asks for (panvk sets it only for
+          * a read-only tile-buffer read it can prove). */
+#if PAN_ARCH >= 11
          cfg.separated_dependency_tracking = true;
 #endif
          cfg.depth_source = in->fs->info.fs.writes_depth ?
@@ -907,7 +917,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
             !(out->rt_read & out->rt_written) &&
             !(dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT);
          cfg.scissor_to_bounding_box = true;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
          cfg.conservative_rast_mode =
             rs->conservative_mode == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT ?
                MALI_CONSERVATIVE_RAST_MODE_OVER_ESTIMATE :
@@ -932,10 +942,12 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    pan_pack(&dcd2, DCD_FLAGS_2, cfg) {
       cfg.read_mask = out->rt_read;
       cfg.write_mask = out->rt_written;
+#if PAN_ARCH >= 11
       if (fs) {
          cfg.no_shader_depth_read = !attachment_read(fs, dyn->ial.depth_att);
          cfg.no_shader_stencil_read = !attachment_read(fs, dyn->ial.stencil_att);
       }
+#endif
    }
    out->dcd2 = dcd2.opaque[0];
 #else

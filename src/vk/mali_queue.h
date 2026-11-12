@@ -25,7 +25,7 @@
  * operations that genuinely differ per frontend (whether a submit's work
  * has been reached, noticing a fault before the next event, and sync-file
  * import/export, how a host wait sleeps) are declared below as
- * MALI_PER_ARCH() hooks. This header has the v11 (CSF) bodies, defined in
+ * MALI_PER_ARCH() hooks. This header has the CSF (v10, v11) bodies, defined in
  * mali_queue.c, mali_sync_file.c and inline below; the v9 (JM) bodies are
  * in mali_jm.h, mali_jm_queue.c and mali_jm_sync_file.c.
  */
@@ -45,9 +45,8 @@
 
 #include "kbase/kbase.h"
 
-#include "mali_cs.h"
-/* mali_cs.h sets PAN_ARCH from MALI_PAN_ARCH, which mali_arch.h needs. */
 #include "mali_arch.h"
+#include "mali_cs_defs.h"
 #include "mali_vk.h"
 
 struct mali_shader;
@@ -168,23 +167,26 @@ mali_queue_done_va(const struct mali_csf_queue *q, unsigned sq)
           sq * sizeof(struct mali_cs_sync64);
 }
 
-VkResult mali_csf_device_init(struct mali_device *dev);
-void mali_csf_device_finish(struct mali_device *dev);
-
-VkResult mali_csf_queue_init(struct mali_device *dev, struct mali_queue *queue);
-void mali_csf_queue_finish(struct mali_device *dev, struct mali_queue *queue);
+/*
+ * The CSF back half's device and queue setup and its submit, one copy per
+ * command-stream arch (mali_v10_*, mali_v11_*; mali_arch.h). Per-arch code
+ * names them without the prefix; code built once picks one with
+ * mali_csf_arch_dispatch.
+ */
+MALI_PER_CSF_ARCH_DECL(VkResult, csf_device_init, (struct mali_device *dev));
+MALI_PER_CSF_ARCH_DECL(void, csf_device_finish, (struct mali_device *dev));
+MALI_PER_CSF_ARCH_DECL(VkResult, csf_queue_init,
+                       (struct mali_device *dev, struct mali_queue *queue));
+MALI_PER_CSF_ARCH_DECL(void, csf_queue_finish,
+                       (struct mali_device *dev, struct mali_queue *queue));
 
 /* vk_queue::driver_submit. */
-VkResult mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit);
+MALI_PER_CSF_ARCH_DECL(VkResult, queue_submit,
+                       (struct vk_queue *vkq, struct vk_queue_submit *submit));
 
 /* vk_device::check_status: DEVICE_LOST after a queue-group error or a
  * faulted sync object. */
-VkResult mali_device_check_status(struct vk_device *vkdev);
-
-/* Report device loss to the runtime and the log (once), then mark it and
- * wake every waiter. Takes dev->lock; call without it. */
-void mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
-   __attribute__((format(printf, 2, 3)));
+MALI_PER_CSF_ARCH_DECL(VkResult, device_check_status, (struct vk_device *vkdev));
 
 /*
  * With dev->lock held: does this device's frontend have a fault that has
@@ -196,7 +198,9 @@ void mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
  * and a host wait (mali_sync.c), so a wait notices a fault without
  * depending on the event thread to have run first.
  */
+#ifdef PAN_ARCH
 const char *MALI_PER_ARCH(queue_wait)(struct mali_device *dev);
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Sync objects                                                            */
@@ -210,6 +214,8 @@ struct mali_sync {
    int fd;                          /* an imported sync file, or -1 */
 };
 
+/* The per-arch hooks below exist in the per-arch builds only. */
+#ifdef PAN_ARCH
 extern const struct vk_sync_type MALI_PER_ARCH(sync_type);
 
 /* The device's sync types, binary first and then the timeline semaphore
@@ -264,6 +270,7 @@ MALI_PER_ARCH(queue_sleep)(struct mali_device *dev, int64_t until_ns)
    };
    pthread_cond_timedwait(&dev->cond, &dev->lock, &ts);
 }
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Sync files (mali_sync_file.c)                                           */
@@ -303,6 +310,7 @@ mali_queue_fence_va(const struct mali_csf_queue *q)
    return q->sync_mem.gpu_va + MALI_QUEUE_FENCE_OFFSET;
 }
 
+#ifdef PAN_ARCH
 /*
  * Frontend-neutral callers (mali_sync.c, mali_wsi.c) reach the sync-file
  * primitives above through these, so the call sites do not name the CSF
@@ -322,5 +330,6 @@ MALI_PER_ARCH(sync_file_create)(struct mali_device *dev, uint32_t fd_count, cons
 {
    return mali_sync_file_create(dev->csf, fd_count, fds, req, out);
 }
+#endif
 
 #endif

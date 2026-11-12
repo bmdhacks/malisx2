@@ -21,6 +21,8 @@
 #define MALI_PER_ARCH(name) mali_v7_##name
 #elif PAN_ARCH == 9
 #define MALI_PER_ARCH(name) mali_v9_##name
+#elif PAN_ARCH == 10
+#define MALI_PER_ARCH(name) mali_v10_##name
 #elif PAN_ARCH == 11
 #define MALI_PER_ARCH(name) mali_v11_##name
 #else
@@ -83,20 +85,64 @@
 #define mali_jm_wait_locked MALI_PER_ARCH(jm_wait_locked)
 #endif
 
+/*
+ * The command-stream (CSF) back half is built at PAN_ARCH 10 and 11 into
+ * one driver too, so its own functions (mali_cmd_buffer.h, mali_queue.h,
+ * the CSF section of mali_measure.h) get the arch's prefix as well:
+ * mali_v10_* and mali_v11_*. Code built once calls them through
+ * mali_csf_arch_dispatch.
+ */
+#if defined(PAN_ARCH) && PAN_ARCH >= 10 && !defined(MALI_CSF_NAMES)
+#define MALI_CSF_NAMES
+#define mali_cmd_add_deps MALI_PER_ARCH(cmd_add_deps)
+#define mali_cmd_buffer_ops MALI_PER_ARCH(cmd_buffer_ops)
+#define mali_cmd_buffer_span MALI_PER_ARCH(cmd_buffer_span)
+#define mali_cmd_buffer_subqueue_mask MALI_PER_ARCH(cmd_buffer_subqueue_mask)
+#define mali_cmd_compute_flush_waits MALI_PER_ARCH(cmd_compute_flush_waits)
+#define mali_cmd_emit_barrier MALI_PER_ARCH(cmd_emit_barrier)
+#define mali_cmd_frag_flush_pending MALI_PER_ARCH(cmd_frag_flush_pending)
+#define mali_csf_device_finish MALI_PER_ARCH(csf_device_finish)
+#define mali_csf_device_init MALI_PER_ARCH(csf_device_init)
+#define mali_csf_queue_finish MALI_PER_ARCH(csf_queue_finish)
+#define mali_csf_queue_init MALI_PER_ARCH(csf_queue_init)
+#define mali_device_check_status MALI_PER_ARCH(device_check_status)
+#define mali_idvs_bit55 MALI_PER_ARCH(idvs_bit55)
+#define mali_measure_begin MALI_PER_ARCH(measure_begin)
+#define mali_measure_capture_begin MALI_PER_ARCH(measure_capture_begin)
+#define mali_measure_capture_end MALI_PER_ARCH(measure_capture_end)
+#define mali_measure_capture_ring MALI_PER_ARCH(measure_capture_ring)
+#define mali_measure_cmd_create MALI_PER_ARCH(measure_cmd_create)
+#define mali_measure_cmd_destroy MALI_PER_ARCH(measure_cmd_destroy)
+#define mali_measure_cmd_reset MALI_PER_ARCH(measure_cmd_reset)
+#define mali_measure_end MALI_PER_ARCH(measure_end)
+#define mali_measure_extra MALI_PER_ARCH(measure_extra)
+#define mali_measure_info MALI_PER_ARCH(measure_info)
+#define mali_measure_shader MALI_PER_ARCH(measure_shader)
+#define mali_measure_submit MALI_PER_ARCH(measure_submit)
+#define mali_queue_submit MALI_PER_ARCH(queue_submit)
+#endif
+
 #ifndef MALI_ARCH_H
 #define MALI_ARCH_H
 
 /*
  * Declares every arch's variant of a per-arch function:
  *    MALI_PER_ARCH_DECL(void, pack_dummy_sampler, (void *out));
- * declares mali_v7_pack_dummy_sampler, mali_v9_pack_dummy_sampler and
- * mali_v11_pack_dummy_sampler.
+ * declares mali_v7_pack_dummy_sampler, mali_v9_pack_dummy_sampler,
+ * mali_v10_pack_dummy_sampler and mali_v11_pack_dummy_sampler.
  * Per-arch code calls its own with MALI_PER_ARCH(name)(...), code compiled
  * once picks one with mali_arch_dispatch.
  */
 #define MALI_PER_ARCH_DECL(ret, name, params)                                  \
    ret mali_v7_##name params;                                                  \
    ret mali_v9_##name params;                                                  \
+   ret mali_v10_##name params;                                                 \
+   ret mali_v11_##name params
+
+/* The same for a function of the command-stream back half, which is built
+ * at PAN_ARCH 10 and 11 only. */
+#define MALI_PER_CSF_ARCH_DECL(ret, name, params)                              \
+   ret mali_v10_##name params;                                                 \
    ret mali_v11_##name params
 
 /* The same for a function of the job-manager back half, which is built at
@@ -115,7 +161,13 @@
 #define mali_arch_dispatch(arch, name, ...)                                    \
    ((arch) == 7 ? mali_v7_##name(__VA_ARGS__)                                  \
     : (arch) == 9 ? mali_v9_##name(__VA_ARGS__)                                \
+    : (arch) == 10 ? mali_v10_##name(__VA_ARGS__)                              \
     : mali_v11_##name(__VA_ARGS__))
+
+/* The same for the command-stream back half's own functions (arch 10 or
+ * 11). */
+#define mali_csf_arch_dispatch(arch, name, ...)                                \
+   ((arch) == 10 ? mali_v10_##name(__VA_ARGS__) : mali_v11_##name(__VA_ARGS__))
 
 /* The same for the job-manager back half's own functions (arch 7 or 9). */
 #define mali_jm_arch_dispatch(arch, name, ...)                                 \
@@ -123,5 +175,8 @@
 
 /* Whether a device of this arch runs on the job-manager back half. */
 #define mali_arch_is_jm(arch) ((arch) == 7 || (arch) == 9)
+
+/* Whether a device of this arch runs on the command-stream back half. */
+#define mali_arch_is_csf(arch) ((arch) == 10 || (arch) == 11)
 
 #endif

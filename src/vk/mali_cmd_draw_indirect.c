@@ -74,13 +74,41 @@ instance_attribs(const struct mali_gfx_draw_state *d)
    return mask;
 }
 
-/* acc += fi * stride, mod 2^32, for the fi in a register: v11's stream has
+/* acc += fi * stride, mod 2^32, for the fi in a register: the stream has
  * no multiply or shift, so each bit of fi that can change the product is
- * tested with AND and adds stride << bit. */
+ * tested and adds stride << bit. v11 tests each bit with AND. */
 static void
 emit_mul_add(struct cs_builder *b, struct cs_index acc, struct cs_index fi, uint32_t stride,
              struct cs_index bit, struct cs_index tmp)
 {
+#if PAN_ARCH == 10
+   /*
+    * v10 has no AND (no LOGIC_OP32 in genxml v10.xml), so fi is taken apart
+    * from the top bit down, as panvk's emulated multiply does: `bit` holds
+    * what is left of fi. Comparisons are signed, so bit 31 is the sign;
+    * once it is cleared, bit i is set when what is left minus 2^i is not
+    * negative. Bit 0 is what is left at the end.
+    */
+   (void)tmp;
+   cs_add_imm32(b, bit, fi, 0);
+   cs_if(b, MALI_CS_CONDITION_LESS, bit) {
+      cs_add_imm32(b, bit, bit, INT32_MIN);
+      if ((uint32_t)(stride << 31))
+         cs_add_imm32(b, acc, acc, INT32_MIN);
+   }
+   for (int i = 30; i > 0; i--) {
+      const uint32_t add = stride << i;
+      cs_add_imm32(b, bit, bit, -(int32_t)(1u << i));
+      cs_if(b, MALI_CS_CONDITION_LESS, bit)
+         cs_add_imm32(b, bit, bit, (int32_t)(1u << i));
+      if (add) {
+         cs_else(b)
+            cs_add_imm32(b, acc, acc, (int32_t)add);
+      }
+   }
+   cs_if(b, MALI_CS_CONDITION_NEQUAL, bit)
+      cs_add_imm32(b, acc, acc, (int32_t)stride);
+#else
    const unsigned bits = 32 - ffs(stride) + 1;   /* stride << i is 0 from here */
    for (unsigned i = 0; i < bits; i++) {
       cs_move32_to(b, bit, 1u << i);
@@ -88,6 +116,7 @@ emit_mul_add(struct cs_builder *b, struct cs_index acc, struct cs_index fi, uint
       cs_if(b, MALI_CS_CONDITION_NEQUAL, tmp)
          cs_add_imm32(b, acc, acc, (int32_t)(stride << i));
    }
+#endif
    /* Close the last if here: the caller's own if ends right after. */
    cs_flush_pending_if(b);
 }

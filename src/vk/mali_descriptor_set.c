@@ -132,11 +132,11 @@ MALI_PER_ARCH(CreateBufferView)(VkDevice _device, const VkBufferViewCreateInfo *
    struct mali_buffer_packed desc;
    pan_pack(&desc, BUFFER, cfg) {
       cfg.buffer_type = MALI_BUFFER_TYPE_STRUCTURE;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
       cfg.size = size & BITFIELD_MASK(32);
       cfg.size_hi = size >> 32;
 #else
-      /* 32 bits of size on v9: whole texels below 4 GiB. */
+      /* 32 bits of size on v9 and v10: whole texels below 4 GiB. */
       cfg.size = MIN2(size, (UINT32_MAX / stride) * (uint64_t)stride);
 #endif
       cfg.address = mali_buffer_gpu_va(buffer, pCreateInfo->offset);
@@ -295,10 +295,11 @@ pack_buffer(uint64_t addr, uint64_t range, bool ssbo, void *out)
    const uint64_t size = align64(range, ssbo ? 4 : 16);
    pan_cast_and_pack(out, BUFFER, cfg) {
       cfg.address = addr;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
       cfg.size = size & BITFIELD_MASK(32);
       cfg.size_hi = size >> 32;
 #else
+      /* 32 bits of size on v9 and v10. */
       cfg.size = MIN2(size, UINT32_MAX & ~(uint64_t)(ssbo ? 3 : 15));
 #endif
    }

@@ -349,8 +349,9 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
 #if PAN_ARCH >= 10
    const uint32_t width = u_minify(image->vk.extent.width, level);
    const uint32_t height = u_minify(image->vk.extent.height, level);
-#else
-   /* 32-bit sizes and strides (no hi words on v9). */
+#endif
+#if PAN_ARCH < 11
+   /* 32-bit sizes and strides (no hi words before v11). */
    assert(size <= UINT32_MAX && slice_stride <= UINT32_MAX);
 #endif
 
@@ -371,9 +372,11 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
          cfg.header_row_stride = s->row_stride;
          cfg.header_slice_size = s->afbc_header_size;
          cfg.header_slice_stride = 0;
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
          cfg.size_hi = size >> 32;
          cfg.header_slice_stride_hi = 0;
+#endif
+#if PAN_ARCH >= 10
          cfg.width = width;
          cfg.height = height;
 #endif
@@ -394,9 +397,11 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
          cfg.pointer = addr;
          cfg.row_stride = s->row_stride;
          cfg.slice_stride = slice_stride & BITFIELD_MASK(32);
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
          cfg.size_hi = size >> 32;
          cfg.slice_stride_hi = slice_stride >> 32;
+#endif
+#if PAN_ARCH >= 10
          cfg.width = width;
          cfg.height = height;
 #endif
@@ -411,9 +416,11 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
       cfg.pointer = addr;
       cfg.row_stride = s->row_stride;
       cfg.slice_stride = slice_stride & BITFIELD_MASK(32);
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 11
       cfg.size_hi = size >> 32;
       cfg.slice_stride_hi = slice_stride >> 32;
+#endif
+#if PAN_ARCH >= 10
       cfg.width = width;
       cfg.height = height;
 #endif

@@ -38,6 +38,10 @@
 #include "mali_arch.h"
 #include "mali_descriptor_set_layout.h"
 #include "mali_shader.h"
+#if PAN_ARCH == 10
+/* The device's scoreboard facts, for the v10 iterator helpers below. */
+#include "mali_queue.h"
+#endif
 
 struct mali_descriptor_set;
 struct mali_device;
@@ -81,6 +85,11 @@ struct mali_cmd_cs {
     * waited[j]: the highest signal of subqueue j this stream waited on in
     *       this command buffer. */
    bool idle;
+   /* v10 only: the iterator scoreboard entry the stream's jobs signal now
+    * (mali_cmd_next_iter_sb). v11 keeps that in the stream's own state
+    * (NEXT_SB_ENTRY). Placed in the padding after idle, so the struct's
+    * layout is the same on both. */
+   uint8_t iter_sb;
    struct mali_cache_flush flushed;
    int32_t carried[MALI_SUBQUEUE_COUNT];
    int32_t waited[MALI_SUBQUEUE_COUNT];
@@ -192,6 +201,52 @@ mali_cmd_cs(struct mali_cmd_buffer *cmd, enum mali_subqueue sq)
    return &cmd->cs[sq].b;
 }
 
+#if PAN_ARCH == 10
+/*
+ * Iterator scoreboard entries on v10. v11 moves to the next entry with
+ * NEXT_SB_ENTRY and waits on or signals "the current one" with the
+ * indirect defer mode; v10 has neither (genxml v10.xml), only SET_SB_ENTRY
+ * with the entry number in the instruction. panvk v10 keeps the current
+ * entry in memory and branches on it at run time, because its streams can
+ * start in any state. Ours cannot: every stream ends waiting for all its
+ * scoreboard entries and selecting MALI_SB_ITER_START again
+ * (mali_cmd_buffer.c finish_stream), and the queue selects it before the
+ * first command buffer (mali_queue.c), so the rotation is known when the
+ * command buffer is recorded, as long as nothing selects an entry inside
+ * a conditional block or loop of the stream (nothing does).
+ */
+
+/* The iterator entry after sb, wrapping. */
+static inline unsigned
+mali_cs_iter_sb_after(const struct mali_cs_sb_info *sb, unsigned cur)
+{
+   return cur + 1 < MALI_SB_ITER_START + sb->iter_count ? cur + 1 : MALI_SB_ITER_START;
+}
+
+/* panvk v10's cs_iter_sb_update: wait until the next iterator entry is
+ * free and make it the endpoint entry the next jobs signal. Returns the
+ * entry that was current. */
+static inline unsigned
+mali_cmd_next_iter_sb(struct mali_cmd_buffer *cmd, enum mali_subqueue sq)
+{
+   struct mali_cmd_cs *c = &cmd->cs[sq];
+   const unsigned cur = c->iter_sb;
+   const unsigned next = mali_cs_iter_sb_after(&cmd->dev->csf->sb, cur);
+   cs_wait_slot(&c->b, next);
+   cs_set_scoreboard_entry(&c->b, next, MALI_SB_LS);
+   c->iter_sb = next;
+   return cur;
+}
+
+/* What cs_defer_indirect() is on v11 here: wait for the stream's current
+ * iterator entry, signal `signal`. */
+static inline struct cs_async_op
+mali_cmd_defer_iter(const struct mali_cmd_buffer *cmd, enum mali_subqueue sq, unsigned signal)
+{
+   return cs_defer(MALI_SB_MASK(cmd->cs[sq].iter_sb), signal);
+}
+#endif
+
 /* The recorded stream of subqueue sq: its first chunk and that chunk's size
  * in bytes. False when the stream is empty. */
 bool mali_cmd_buffer_span(struct mali_cmd_buffer *cmd, unsigned sq,
@@ -217,9 +272,6 @@ mali_cmd_alloc(struct mali_cmd_buffer *cmd, uint64_t size, uint64_t align)
    }
    return MALI_PER_ARCH(cmd_alloc_slow)(cmd, size, align);
 }
-
-/* Frees the device's cached slabs. */
-void mali_cmd_slabs_finish(struct mali_device *dev);
 
 /* vkCmdBindPipeline, and the pipeline ops' bind (mali_pipeline.c). */
 void MALI_PER_ARCH(cmd_bind_pipeline)(struct mali_cmd_buffer *cmd, struct vk_pipeline *pipeline);

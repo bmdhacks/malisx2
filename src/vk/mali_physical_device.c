@@ -73,27 +73,30 @@
 #define MALI_V7_DRIVER_VERSION MALI_DRIVER_VERSION
 #define MALI_V7_DRIVER_INFO \
    "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V7_SHORT
+/* The G610 and G710 (arch 10): the G615's scheme too. Arm's own drivers for
+ * these parts report the same driverID and their DDK release in the same
+ * fields, so the scheme says nothing an Arm driver could not. */
+#define MALI_V10_DRIVER_VERSION MALI_DRIVER_VERSION
+#define MALI_V10_DRIVER_INFO \
+   "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V10_SHORT
 
 static inline const char *
 driver_info_for_arch(uint32_t arch)
 {
-   return arch == 7 ? MALI_V7_DRIVER_INFO
-          : arch == 9 ? MALI_V9_DRIVER_INFO
-                      : MALI_DRIVER_INFO;
+   return arch == 7    ? MALI_V7_DRIVER_INFO
+          : arch == 9  ? MALI_V9_DRIVER_INFO
+          : arch == 10 ? MALI_V10_DRIVER_INFO
+                       : MALI_DRIVER_INFO;
 }
 
 static inline uint32_t
 driver_version_for_arch(uint32_t arch)
 {
-   return arch == 7 ? MALI_V7_DRIVER_VERSION
-          : arch == 9 ? MALI_V9_DRIVER_VERSION
-                      : MALI_DRIVER_VERSION;
+   return arch == 7    ? MALI_V7_DRIVER_VERSION
+          : arch == 9  ? MALI_V9_DRIVER_VERSION
+          : arch == 10 ? MALI_V10_DRIVER_VERSION
+                       : MALI_DRIVER_VERSION;
 }
-
-/* Arch the driver was built for (meson.build pan_arch). */
-#ifndef MALI_PAN_ARCH
-#error "MALI_PAN_ARCH must be defined"
-#endif
 
 /* VkFence and binary VkSemaphore, then the timeline semaphore type built on
  * them (mali_sync.c, built once per arch; MALI_PER_ARCH(sync_types)() also
@@ -187,6 +190,31 @@ v7_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    return false;
 }
 
+/*
+ * Arch 10 (command-stream Valhall). The product major in product_id picks
+ * the part, as kbase's product table has them: 0xa007 is the Mali-G610
+ * (the RK3588's; Mesa's model table has it as PAN_PROD_ID(10, 8, 7)) and
+ * 0xa002 the Mali-G710. Named like the G615 below, with the core count.
+ * The other arch 10 parts (G510, G310) are not supported.
+ */
+static bool
+v10_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
+{
+   const char *model;
+   switch (p->product_id & 0xf00f) {
+   case 0xa007:
+      model = "G610";
+      break;
+   case 0xa002:
+      model = "G710";
+      break;
+   default:
+      return false;
+   }
+   snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
+   return true;
+}
+
 bool
 mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
@@ -196,7 +224,9 @@ mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
       v9_device_name(p, buf, size);
       return true;
    }
-   if (p->arch_major != MALI_PAN_ARCH)
+   if (p->arch_major == 10)
+      return v10_device_name(p, buf, size);
+   if (p->arch_major != 11)
       return false;
 
    /*
@@ -484,19 +514,19 @@ static const struct vk_device_extension_table mali_device_extensions = {
 static bool
 storage8_for_arch(uint32_t arch)      /* VK_KHR_8bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
 static bool
 storage16_for_arch(uint32_t arch)     /* VK_KHR_16bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
 static bool
 int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int8 */
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
 /*
@@ -511,7 +541,7 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
 static bool
 draw_indirect_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
 /*
@@ -527,7 +557,7 @@ draw_indirect_for_arch(uint32_t arch)
 static bool
 bda_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
 /*
@@ -539,10 +569,10 @@ bda_for_arch(uint32_t arch)
 static bool
 ubo_std_layout_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
 }
 
-/* maxDrawIndirectCount. v11: the stream compares the count as a signed
+/* maxDrawIndirectCount. v10, v11: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
 static uint32_t
@@ -550,7 +580,7 @@ max_draw_indirect_count_for_arch(uint32_t arch)
 {
    if (!draw_indirect_for_arch(arch))
       return 1;
-   return arch == 11 ? INT32_MAX : UINT16_MAX;
+   return arch >= 10 ? INT32_MAX : UINT16_MAX;
 }
 
 static struct vk_device_extension_table
@@ -579,7 +609,7 @@ device_extensions_for_arch(uint32_t arch)
  * blend shader reads it from there (load_blend_input_pan); on v7 Mesa's
  * Bifrost backend does both, as for panvk_v7.
  *
- * Reported on v7, v9 and v11. ARMSX2 then hardware-blends some draws into
+ * Reported on v7, v9, v10 and v11. ARMSX2 then hardware-blends some draws into
  * 16-bit PS2 frames without the PS2's colour truncation, a few levels too
  * bright, as on every other driver that reports it; it saves those draws
  * a framebuffer read. Without it ARMSX2 also takes its render-target-read
@@ -592,6 +622,7 @@ dual_src_blend_for_arch(uint32_t arch)
    switch (arch) {
    case 7:
    case 9:
+   case 10:
    case 11:
       return true;
    default:
@@ -693,7 +724,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v7 and v11 (not v9): clip distances are varyings the fragment
+      /* v7, v10 and v11 (not v9): clip distances are varyings the fragment
        * shader tests and discards on (mali_shader.c, "Clip distances").
        * The test is per pixel, at the pixel centre, so under
        * multisampling the clipped edge is not antialiased; and with a
@@ -701,7 +732,7 @@ get_features(struct vk_features *f, uint32_t arch)
        * discards or writes memory, depth or stencil, clipped fragments
        * still write depth and stencil. Cull distances are not
        * supported. */
-      .shaderClipDistance = arch == 7 || arch == 11,
+      .shaderClipDistance = arch == 7 || arch == 10 || arch == 11,
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
@@ -842,7 +873,8 @@ sample_counts(unsigned bytes_per_pixel, unsigned tilebuf_bytes)
 
 /*
  * v11 (G615): 32 KiB when the low byte of core_features is 3 or 4, else
- * 16 KiB. v9: a fixed 16 KiB for every part. The four Arm drivers we have
+ * 16 KiB. v10: 32 KiB on the G610 (product major 7), as Mesa's model table
+ * has it; 16 KiB on the G710, which the table does not list. v9: a fixed 16 KiB for every part. The four Arm drivers we have
  * for arch 9 (G77, and G57 from three vendors) all store the same constant
  * whatever core_features says, and Mesa's model table gives the G57 and
  * G68 the same 16 KiB.
@@ -858,6 +890,8 @@ tilebuf_budget(const struct mali_kbase_gpu_props *p)
       return p->arch_minor >= 4 ? 8192 : 16384;
    if (p->arch_major == 9)
       return 16384;
+   if (p->arch_major == 10)
+      return (p->product_id & 0xf00f) == 0xa007 ? 32768 : 16384;
    unsigned variant = p->core_features & 0xff;
    return (variant == 3 || variant == 4) ? 32768 : 16384;
 }
@@ -898,8 +932,9 @@ hash_uuid(uint8_t out[VK_UUID_SIZE], const void *data, size_t size)
  * commit made every driver update start with an empty cache. It hashes
  * the architecture's shader cache ID (a hash of every source that can
  * change that architecture's shader binaries, src/vk/gen_shader_cache_id.py:
- * MALI_SHADER_CACHE_ID for the G615, MALI_SHADER_CACHE_ID_V9 for the G57,
- * MALI_SHADER_CACHE_ID_V7 for the G52) and the GPU ID.
+ * MALI_SHADER_CACHE_ID for the G615, MALI_SHADER_CACHE_ID_V10 for the G610
+ * and G710, MALI_SHADER_CACHE_ID_V9 for the G57, MALI_SHADER_CACHE_ID_V7 for
+ * the G52) and the GPU ID.
  */
 static void
 pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cache_id_size,
@@ -1164,7 +1199,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
-   if (p->arch_major == 11) {
+   if (p->arch_major == 10 || p->arch_major == 11) {
       props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
       props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
    }
@@ -1271,6 +1306,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    else if (p->arch_major == 9)
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V9,
                           sizeof(MALI_SHADER_CACHE_ID_V9), p->gpu_id);
+   else if (p->arch_major == 10)
+      pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V10,
+                          sizeof(MALI_SHADER_CACHE_ID_V10), p->gpu_id);
    else
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID,
                           sizeof(MALI_SHADER_CACHE_ID), p->gpu_id);
@@ -1432,17 +1470,18 @@ physical_device_create(struct mali_instance *instance, const char *path,
    const enum mali_kbase_frontend frontend = kb->frontend;
    mali_kbase_destroy(kb);
 
-   /* The arch has to match the frontend the kernel speaks: CSF with v11,
-    * the job manager with v7 and v9. */
+   /* The arch has to match the frontend the kernel speaks: CSF with v10
+    * and v11, the job manager with v7 and v9. */
    const bool arch_ok =
-      (pdev->arch == MALI_PAN_ARCH && frontend == MALI_KBASE_FRONTEND_CSF) ||
+      (mali_arch_is_csf(pdev->arch) && frontend == MALI_KBASE_FRONTEND_CSF) ||
       (mali_arch_is_jm(pdev->arch) && frontend == MALI_KBASE_FRONTEND_JM);
    char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
-                "one this driver was built for (arch %u, arch 9, or the "
-                "Mali-G52 or Mali-G76 of arch 7)", path,
-                pdev->props.product_id, pdev->props.arch_major, MALI_PAN_ARCH);
+                "one this driver was built for (the Mali-G615 of arch 11, the "
+                "Mali-G610 or G710 of arch 10, arch 9, or the Mali-G52 or "
+                "Mali-G76 of arch 7)", path,
+                pdev->props.product_id, pdev->props.arch_major);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
@@ -1488,14 +1527,17 @@ physical_device_create(struct mali_instance *instance, const char *path,
    vk_physical_device_dispatch_table_from_entrypoints(
       &pdev->vk.dispatch_table, &mali_waist_physical_device_entrypoints, false);
 
-   pdev->vk.supported_sync_types = pdev->arch == 7 ? mali_v7_sync_types()
-                                   : pdev->arch == 9 ? mali_v9_sync_types()
-                                                     : mali_v11_sync_types();
+   pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
+                                   : pdev->arch == 9  ? mali_v9_sync_types()
+                                   : pdev->arch == 10 ? mali_v10_sync_types()
+                                                      : mali_v11_sync_types();
 
    /* Compiled shaders are what pipeline caches hold. */
-   pdev->vk.pipeline_cache_import_ops = pdev->arch == 7 ? mali_v7_pipeline_cache_import_ops
-                                        : pdev->arch == 9 ? mali_v9_pipeline_cache_import_ops
-                                                          : mali_v11_pipeline_cache_import_ops;
+   pdev->vk.pipeline_cache_import_ops =
+      pdev->arch == 7    ? mali_v7_pipeline_cache_import_ops
+      : pdev->arch == 9  ? mali_v9_pipeline_cache_import_ops
+      : pdev->arch == 10 ? mali_v10_pipeline_cache_import_ops
+                         : mali_v11_pipeline_cache_import_ops;
 
 #ifndef __ANDROID__
    /* Last: wsi_device_init asks the runtime what the device can export,

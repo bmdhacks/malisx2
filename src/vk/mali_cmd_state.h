@@ -47,7 +47,7 @@
 #define MALI_CMD_STATE_H
 
 #ifndef PAN_ARCH
-#define PAN_ARCH MALI_PAN_ARCH
+#error "mali_cmd_state.h is for code built per arch"
 #endif
 
 #if PAN_ARCH >= 10

@@ -11,7 +11,7 @@
  * descriptors, the frame shaders, vkCmdBeginRendering) is in mali_fb.c.
  *
  * Tiler descriptor shapes, scoreboards and the vertex/tiler -> fragment
- * synchronization follow panvk v11 (csf/panvk_vX_cmd_draw.c:
+ * synchronization follow panvk (csf/panvk_vX_cmd_draw.c:
  * get_tiler_desc, flush_tiling, issue_fragment_jobs). Where the blob and
  * panvk differ and both are valid, the blob's choice is taken when it is
  * simpler or is what this kernel was tested with:
@@ -33,7 +33,14 @@
  *    draws nothing does not touch the counters at all.
  *
  * Transaction elimination (CRC) follows panvk v11's seed scheme; see
- * "CRC" below.
+ * "CRC" below. v10 has no CRC yet (mali_image.c gives its images no CRC
+ * state).
+ *
+ * On v10 (genxml v10.xml) the stream has no NEXT_SB_ENTRY, SET_STATE,
+ * indirect defers or shared scoreboard entries: the iterator entries are
+ * tracked at record time (mali_cmd_buffer.h), deferred instructions name
+ * the current entry themselves, and the vertex/tiler -> fragment
+ * dependency is always the barrier counter.
  */
 
 #include "mali_cmd_state.h"
@@ -44,8 +51,8 @@
 #include "mali_image.h"
 #include "mali_queue.h"
 
-#if PAN_ARCH != 11
-#error "mali_cmd_render.c is written for arch v11"
+#if PAN_ARCH < 10
+#error "mali_cmd_render.c is written for the command-stream archs (v10, v11)"
 #endif
 
 /* ---------------------------------------------------------------------- */
@@ -84,10 +91,14 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
 /* ---------------------------------------------------------------------- */
 /* Tiler contexts                                                          */
 
-/* v11 cs_iter_sb_update with nothing inside (panvk cs_next_iter_sb). */
+/* cs_iter_sb_update with nothing inside (panvk cs_next_iter_sb). */
 static void
 next_iter_sb(struct mali_cmd_buffer *cmd, struct cs_builder *b)
 {
+#if PAN_ARCH == 10
+   (void)b;
+   mali_cmd_next_iter_sb(cmd, MALI_SUBQUEUE_VERTEX_TILER);
+#else
    const struct mali_csf_device *csf = cmd->dev->csf;
    struct cs_index next_sb = mali_cs_scratch_reg32(b, 0);
    struct cs_index sb_mask = mali_cs_scratch_reg32(b, 1);
@@ -100,6 +111,7 @@ next_iter_sb(struct mali_cmd_buffer *cmd, struct cs_builder *b)
    cs_move32_to(b, sb_mask, csf->sb.all_iters_mask);
    cs_bit_clear32(b, sb_mask, sb_mask, next_sb);
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
+#endif
 }
 
 /*
@@ -285,6 +297,7 @@ emit_crc_updates(struct mali_cmd_buffer *cmd, const struct mali_render_state *r,
    if (r->crc_rt < 0)
       return;
 
+#if PAN_ARCH >= 11
    struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_FRAGMENT);
    struct cs_index addr = mali_cs_scratch_reg64(b, CRC_SCRATCH);
    struct cs_index seed = mali_cs_scratch_reg32(b, CRC_SCRATCH + 2);
@@ -303,6 +316,11 @@ emit_crc_updates(struct mali_cmd_buffer *cmd, const struct mali_render_state *r,
    cs_move64_to(b, addr, fbd + pan_size(FRAMEBUFFER) + 2 * 4);
    cs_store32(b, lo, addr, 0);
    /* The caller waits for the store before the fragment job. */
+#else
+   /* No image has CRC state on v10 (mali_image.c). */
+   (void)fbd;
+   UNREACHABLE("no CRC target on v10");
+#endif
 }
 
 /* ---------------------------------------------------------------------- */
@@ -311,9 +329,11 @@ emit_crc_updates(struct mali_cmd_buffer *cmd, const struct mali_render_state *r,
 /* Vertex/tiler side of the end (panvk flush_tiling): finish tiling, the
  * deferred HEAP_OPERATION{Vertex/Tiler Completed} behind every draw of the
  * pass, and the signal the fragment side waits on: a deferred increment of
- * the shared scoreboard entry (the blob on this GPU), or without shared
- * entries a deferred SYNC_ADD64 on the vertex/tiler barrier counter
- * (panvk). */
+ * the shared scoreboard entry (the blob on the G615), or without shared
+ * entries (always on v10) a deferred SYNC_ADD64 on the vertex/tiler
+ * barrier counter (panvk). The deferral waits for the iterator entry the
+ * pass's draws signal: v11's indirect defer, or on v10 that entry by
+ * number (panvk v10 matches on it at run time; here it is known). */
 static void
 flush_tiling(struct mali_cmd_buffer *cmd)
 {
@@ -328,19 +348,25 @@ flush_tiling(struct mali_cmd_buffer *cmd)
       cmd->gfx.render.ubo_stores = false;
    }
    cs_finish_tiling(b);
+#if PAN_ARCH >= 11
    if (cmd->dev->csf->shared_sb) {
       cs_vt_end(b, cs_defer_indirect());
       mali_cs_shared_sb_inc(b, MALI_SHARED_SB_VT_TO_FRAG, cs_defer_indirect());
       return;
    }
+   const struct cs_async_op deferred = cs_defer_indirect();
+#else
+   const struct cs_async_op deferred =
+      mali_cmd_defer_iter(cmd, MALI_SUBQUEUE_VERTEX_TILER, MALI_SB_DEFERRED_SYNC);
+#endif
 
    struct cs_index addr = mali_cs_scratch_reg64(b, 0);
    struct cs_index one = mali_cs_scratch_reg64(b, 2);
    cs_move64_to(b, addr, mali_queue_syncobj_va(cmd->dev->csf->queue,
                                                 MALI_SUBQUEUE_VERTEX_TILER));
    cs_move64_to(b, one, 1);
-   cs_vt_end(b, cs_defer_indirect());
-   cs_sync64_add(b, true, MALI_CS_SYNC_SCOPE_CSG, one, addr, cs_defer_indirect());
+   cs_vt_end(b, deferred);
+   cs_sync64_add(b, true, MALI_CS_SYNC_SCOPE_CSG, one, addr, deferred);
    cmd->cs[MALI_SUBQUEUE_VERTEX_TILER].relative_sync_point++;
 }
 
@@ -367,10 +393,13 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
     * this job; in this order the tiling wait, which the firmware takes
     * microseconds to pass even when it is already satisfied, overlaps the
     * previous fragment job. */
+#if PAN_ARCH >= 11
    if (csf->shared_sb) {
       if (r->tiler)
          mali_cs_shared_sb_dec(b, MALI_SHARED_SB_VT_TO_FRAG);
-   } else {
+   } else
+#endif
+   {
       struct cs_index addr = mali_cs_scratch_reg64(b, 0);
       struct cs_index ref = mali_cs_scratch_reg64(b, 2);
       cs_move64_to(b, addr, mali_queue_syncobj_va(cmd->dev->csf->queue,
@@ -405,6 +434,29 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
     * order: wait on the current iterator entry (the RUN_FRAGMENTs and the
     * previous pass's FINISH_FRAGMENT), signal the next (panvk). Exactly one
     * fragment-completed increment per tiled pass, on the last context. */
+#if PAN_ARCH == 10
+   struct cs_index tiler = mali_cs_scratch_reg64(b, 2);
+   struct cs_index completed = mali_cs_scratch_reg_tuple(b, 4, 4);
+   struct cs_index top = mali_cs_scratch_reg64(b, 4);
+   struct cs_index bottom = mali_cs_scratch_reg64(b, 6);
+
+   /* panvk v10's cs_iter_sb_update case: the next entry once free becomes
+    * the endpoint, and the FINISH_FRAGMENTs wait on the current one and
+    * signal the next, which the next pass's fragment jobs then signal
+    * too. */
+   const unsigned cur_sb = mali_cmd_next_iter_sb(cmd, MALI_SUBQUEUE_FRAGMENT);
+   const unsigned next_sb = cmd->cs[MALI_SUBQUEUE_FRAGMENT].iter_sb;
+   (void)csf;
+   if (r->td_count) {
+      cs_move64_to(b, tiler, r->tiler);
+      for (uint32_t i = 0; i < r->td_count; i++) {
+         cs_load_to(b, completed, tiler, BITFIELD_MASK(4),
+                    i * pan_size(TILER_CONTEXT) + 10 * 4);
+         cs_finish_fragment(b, i == r->td_count - 1, top, bottom,
+                            cs_defer(MALI_SB_MASK(cur_sb), next_sb));
+      }
+   }
+#else
    struct cs_index next_sb = mali_cs_scratch_reg32(b, 0);
    struct cs_index sb_mask = mali_cs_scratch_reg32(b, 1);
    struct cs_index tiler = mali_cs_scratch_reg64(b, 2);
@@ -436,6 +488,7 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    cs_move32_to(b, sb_mask, csf->sb.all_iters_mask);
    cs_bit_clear32(b, sb_mask, sb_mask, next_sb);
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
+#endif
 }
 
 void

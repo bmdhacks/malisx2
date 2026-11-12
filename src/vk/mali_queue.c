@@ -62,37 +62,7 @@
 #include "mali_vk.h"
 
 /* ---------------------------------------------------------------------- */
-/* Device loss                                                             */
-
-/*
- * The runtime is told first (vk_device_set_lost, once), then waiters see
- * dev->lost: the runtime asserts that anything returning
- * VK_ERROR_DEVICE_LOST has already reported the loss.
- */
-void
-mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
-{
-   char msg[256];
-   va_list ap;
-   va_start(ap, fmt);
-   vsnprintf(msg, sizeof(msg), fmt, ap);
-   va_end(ap);
-
-   if (p_atomic_cmpxchg(&dev->lost_reported, 0, 1) == 0) {
-      /* Always in the log, whatever the build (the runtime's own message
-       * is debug-only). Device loss is never hidden. */
-      mesa_loge("malisx2: device lost: %s", msg);
-      vk_device_set_lost(&dev->vk, "%s", msg);
-      mali_measure_event(dev, "device lost: %s", msg);
-   }
-
-   pthread_mutex_lock(&dev->lock);
-   if (!dev->lost_msg[0])
-      snprintf(dev->lost_msg, sizeof(dev->lost_msg), "%s", msg);
-   dev->lost = true;
-   pthread_cond_broadcast(&dev->cond);
-   pthread_mutex_unlock(&dev->lock);
-}
+/* Device loss (mali_device_set_lost is in mali_device.c)                  */
 
 /* With dev->lock held. A done slot with its error word set means a stream
  * faulted; that is device loss whether or not the kernel told us. Returns
@@ -387,13 +357,21 @@ mali_csf_device_init(struct mali_device *dev)
       sb_count = (dev->kbase->glb.streams[0].features >> 8) & 0xff;
    if (sb_count <= MALI_SB_ITER_START)
       sb_count = 8;
-   sb_count = MIN2(sb_count, 16);
+   /* At most 16 on v11, 8 on v10 (cs_builder's CS_MAX_SB_COUNT; panvk v10
+    * uses 8: three fixed entries and five iterators). */
+   sb_count = MIN2(sb_count, CS_MAX_SB_COUNT);
    csf->sb.count = sb_count;
    csf->sb.all_mask = (uint16_t)BITFIELD_MASK(sb_count);
    csf->sb.iter_count = sb_count - MALI_SB_ITER_START;
    csf->sb.all_iters_mask = (uint16_t)BITFIELD_RANGE(MALI_SB_ITER_START, csf->sb.iter_count);
 
+#if PAN_ARCH >= 11
    csf->shared_sb = dev->kbase->props.gpu_features & 0x8;
+#else
+   /* SHARED_SB_INC/DEC are v11 instructions (genxml v10.xml has neither):
+    * the pass dependency goes through the vertex/tiler barrier counter. */
+   csf->shared_sb = false;
+#endif
 
    dev->csf = csf;
    dev->fe = csf;
@@ -610,12 +588,21 @@ queue_initial_words(struct mali_csf_queue *q, unsigned sq, struct ring_words *w)
                 q->sync_mem.gpu_va + MALI_QUEUE_CTX_OFFSET(sq));
 
    const uint32_t iter0 = MALI_SB_ITER_START;
+#if PAN_ARCH == 10
+   /* v10 selects the endpoint and "other" entries with one instruction
+    * and has no indirect wait mask or deferred entry: every deferred
+    * instruction names its entries (panvk v10 init_subqueue). Command
+    * buffers start from iter0 (mali_cmd_buffer.h). */
+   (void)csf;
+   cs_set_scoreboard_entry(b, iter0, MALI_SB_LS);
+#else
    cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_ENDPOINT, iter0);
    cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_MASK_WAIT, MALI_SB_MASK(iter0));
    cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_OTHER, MALI_SB_LS);
    cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED, MALI_SB_DEFERRED_SYNC);
    cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM,
                       csf->sb.all_iters_mask & ~MALI_SB_MASK(iter0));
+#endif
 
    for (unsigned j = 0; j < MALI_SUBQUEUE_COUNT; j++)
       cs_move64_to(b, mali_cs_progress_seqno_reg(b, j), 0);

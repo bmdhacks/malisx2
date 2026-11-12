@@ -388,8 +388,8 @@ static const char *const sq_names[MALI_SUBQUEUE_COUNT] = {
  * A job-manager region's mali_measure_region::sq is MALI_JM_SLOT_FRAG
  * (0) or MALI_JM_SLOT_VTC (1) (mali_jm.h), not an enum mali_subqueue
  * value, and these rows use "vtc"/"frag" labels on JM rather than the
- * CSF names above. This file builds once, at this build's fixed v11
- * MALI_PAN_ARCH, so it cannot include the job-manager mali_jm.h; the two
+ * CSF names above. This file builds once, without a PAN_ARCH, so it
+ * cannot include the job-manager mali_jm.h; the two
  * slot values 0 and 1 are repeated here as plain indices instead of
  * the symbolic ones mali_jm.h defines.
  */
@@ -680,4 +680,59 @@ mali_measure_cpuprof(void)
 {
    struct mali_measure_config c;
    return config_read(&c) && c.cpuprof;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Reading command buffers' regions (both back halves)                     */
+
+/* With m->lock held. */
+void
+mali_measure_harvest(struct mali_measure *m, struct mali_measure_cmd *mc)
+{
+   if (mc->active) {
+      util_dynarray_foreach(&mc->regions, struct mali_measure_region, r)
+         mali_measure_row(m, mc, r);
+   }
+   list_del(&mc->link);
+   list_inithead(&mc->link);
+   mc->pending = false;
+}
+
+/*
+ * mali_measure_completed(): has every region mc holds finished on the
+ * device? dev->jm (non-NULL only on a job-manager device) asks the JM
+ * queue's completed
+ * submission counter (mali_jm_measure_reached, mali_jm_queue.c -- jd is
+ * only ever passed back to it, never dereferenced here, so this needs no
+ * job-manager type); a CSF device (dev->csf) checks the subqueues'
+ * sync-object "done" slots mc->sq_mask names, as before. Neither path
+ * touches cmd, so this is safe for a mc created by either frontend.
+ */
+bool
+mali_measure_completed(struct mali_measure *m, const struct mali_measure_cmd *mc)
+{
+   if (m->dev->jm) {
+      const uint32_t arch = mali_device_physical(m->dev)->arch;
+      return mali_jm_arch_dispatch(arch, jm_measure_reached, m->dev->jm, mc->submit);
+   }
+   struct mali_csf_queue *q = m->dev->csf ? m->dev->csf->queue : NULL;
+   if (!q)
+      return true;
+   volatile struct mali_cs_sync64 *done = mali_queue_done(q);
+   u_foreach_bit(i, mc->sq_mask) {
+      if (done[i].seqno < mc->submit)
+         return false;
+   }
+   return true;
+}
+
+void
+mali_measure_collect(struct mali_measure *m, bool force)
+{
+   list_for_each_entry_safe(struct mali_measure_cmd, mc, &m->pending, link) {
+      if (force || mali_measure_completed(m, mc))
+         mali_measure_harvest(m, mc);
+   }
+   if (m->timing)
+      fflush(m->timing);
 }

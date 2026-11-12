@@ -103,7 +103,8 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
     * bc_formats_complete): hakuX asks per format (BC1-3), Dolphin for the
     * feature, and then they upload their BC textures as they are, a
     * quarter to an eighth of the BGRA8 they decode them to otherwise. Not
-    * on v11.
+    * on v10 or v11: no BCn texture has been sampled on either through this
+    * driver yet.
     */
    if (is_bc_format(format) && PAN_ARCH != 7 && PAN_ARCH != 9)
       return 0;

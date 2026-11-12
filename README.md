@@ -8,8 +8,12 @@ ARMSX2 and the Android Vulkan loader use; every other entry point logs and
 fails.
 
 Target: Mali-G615 (Mesa architecture v11, command-stream frontend), on the
-Anbernic RG 477V. Shaders are compiled with Mesa's kraid compiler; the
-driver is built on Mesa's shared Vulkan runtime.
+Anbernic RG 477V. The same library also drives the Mali-G610 and G710
+(v10, command-stream frontend; the RK3588's GPU), the Mali-G57 (v9, job
+manager) and the Mali-G52 and G76 (v7, job manager), picked by the GPU's
+architecture when the device is created. Shaders are compiled with Mesa's
+kraid compiler (Mesa's Bifrost compiler on v7); the driver is built on
+Mesa's shared Vulkan runtime.
 
 ## Building
 

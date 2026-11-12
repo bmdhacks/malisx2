@@ -4,7 +4,7 @@
  */
 
 /*
- * What a v11 draw puts in the vertex/tiler stream before its RUN_IDVS, for
+ * What a draw puts in the vertex/tiler stream before its RUN_IDVS, for
  * the direct draws (mali_cmd_draw.c) and the indirect ones
  * (mali_cmd_draw_indirect.c): the staging-register moves of the draw's
  * dirty state, collected and copied into the stream in one piece, the
@@ -21,8 +21,8 @@
 
 #include "mali_cmd_state.h"
 
-#if PAN_ARCH != 11
-#error "mali_cmd_draw.h is written for arch v11"
+#if PAN_ARCH < 10
+#error "mali_cmd_draw.h is written for the command-stream archs (v10, v11)"
 #endif
 
 #define IDVS(reg) MALI_IDVS_SR_##reg
@@ -130,8 +130,9 @@ emit_ubo_push_general(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 /* ---------------------------------------------------------------------- */
 /* Draw                                                                    */
 
-/* RUN_IDVS with bit 55 set. Selects as panvk v11: varying stage from
- * group 0/1 (SPD_1), fragment from group 2, both with TSD_0. */
+/* RUN_IDVS, with bit 55 set on v11 (mali_cmd_draw.c). Selects as panvk:
+ * varying stage from group 0/1 (SPD_1), fragment from group 2, both with
+ * TSD_0. */
 static uint64_t
 run_idvs_ins(uint32_t flags_override)
 {
@@ -146,8 +147,10 @@ run_idvs_ins(uint32_t flags_override)
       I.fragment_srt_select = true;
       I.fragment_tsd_select = false;
    }
+#if PAN_ARCH >= 11
    if (mali_idvs_bit55)
       ins.opaque[1] |= 1u << (55 - 32);
+#endif
    uint64_t v;
    memcpy(&v, &ins, sizeof(v));
    return v;
@@ -347,7 +350,9 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
          batch_move32(e, IDVS(DCD2), bd->dcd2);
          lines = bd->lines;
       }
+#if PAN_ARCH >= 11
       batch_move32(e, IDVS(TILER_FLAGS2), 0);
+#endif
       batch_move32(e, IDVS(VARY_SIZE), bd->vary_size);
       /* Point size 1.0 unless the shader writes it; line width. */
       batch_move32(e, IDVS(PRIMITIVE_SIZE), fui(lines ? dyn->rs.line.width : 1.0f));

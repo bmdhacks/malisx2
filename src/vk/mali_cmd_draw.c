@@ -16,14 +16,16 @@
  * for command-stream encoding; the per-pipeline words are the ones our
  * pipeline compile baked in (mali_pipeline_state.c). Differences:
  *
- *  - RUN_IDVS sets bit 55, which v11.xml does not define, as every blob
- *    RUN_IDVS does (read as "Tiler Flags2 Enable", the RUN_FULLSCREEN
+ *  - RUN_IDVS sets bit 55 on v11, which v11.xml does not define, as every
+ *    blob RUN_IDVS does (read as "Tiler Flags2 Enable", the RUN_FULLSCREEN
  *    field at the same bit). TILER_FLAGS2 is written as 0 before every
- *    draw either way.
+ *    draw either way. v10 has no TILER_FLAGS2 register (genxml v10.xml:
+ *    the IDVS staging registers end below it, and RUN_FULLSCREEN has no
+ *    such field), so neither the bit nor the register is written there.
  *  - The FAU blocks carry our sysval layout (mali_shader.h), built only
  *    when their inputs changed.
  *
- * Register use on the vertex/tiler subqueue is the v11 IDVS staging set;
+ * Register use on the vertex/tiler subqueue is the IDVS staging set;
  * state registers persist between draws and are rewritten from dirty
  * bits (MALI_GFX_DIRTY_*). What a draw emits before its RUN_IDVS is in
  * mali_cmd_draw.h, shared with the indirect draws
@@ -38,15 +40,17 @@
 #include "mali_arch.h"
 #include "mali_queue.h"
 
-#if PAN_ARCH != 11
-#error "mali_cmd_draw.c is written for arch v11"
+#if PAN_ARCH < 10
+#error "mali_cmd_draw.c is written for the command-stream archs (v10, v11)"
 #endif
 
 #include "mali_cmd_draw.h"
 
+#if PAN_ARCH >= 11
 /* Bit 55 of RUN_IDVS; the on-device smoke test clears it once to check
  * what it does. */
 bool mali_idvs_bit55 = true;
+#endif
 
 static void
 draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
@@ -184,7 +188,9 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
       cfg.scissor_maximum_y = maxy;
    }
    cs_move64_to(b, cs_reg64(b, IDVS(SCISSOR_BOX)), sc.opaque[0] | (uint64_t)sc.opaque[1] << 32);
+#if PAN_ARCH >= 11
    cs_move32_to(b, cs_reg32(b, IDVS(TILER_FLAGS2)), 0);
+#endif
 
    struct cs_index dcd_reg = mali_cs_scratch_reg64(b, 0);
    cs_move64_to(b, dcd_reg, dcd);
@@ -239,8 +245,10 @@ MALI_PER_ARCH(cmd_fb_barrier)(struct mali_cmd_buffer *cmd)
       cfg.flags_0.occlusion_query = MALI_OCCLUSION_MODE_DISABLED;
       cfg.flags_2.read_mask = 0;
       cfg.flags_2.write_mask = 0;
+#if PAN_ARCH >= 11
       cfg.flags_2.no_shader_depth_read = true;
       cfg.flags_2.no_shader_stencil_read = true;
+#endif
       cfg.depth_stencil = zsd.gpu;
    }
    const VkRect2D all = {{0, 0}, {r->desc.width, r->desc.height}};

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Derived from Mesa src/panfrost/genxml/meson.build. The common packer and
-# one v<N>_pack.h per entry of pan_archs are generated; pan_archs always
-# includes pan_arch (the architecture the driver builds its vk/ sources
-# for), so idep_pan_packers below is unchanged from a single-arch build.
+# one v<N>_pack.h per entry of pan_archs are generated; idep_pan_packers
+# below is pan_arch's (the arch the tests build their command-stream code
+# for; the driver itself takes each arch's from the _by_arch tables).
 
 _vg = mesa_src / 'panfrost' / 'genxml'
 
@@ -35,7 +35,6 @@ foreach arch : pan_archs
   )}
 endforeach
 
-# The packers for pan_arch, the arch the driver's vk/ sources build for
-# today: unchanged name and content from before pan_archs existed.
+# The packers for pan_arch (the tests' arch).
 pan_packers = pan_packers_by_arch['@0@'.format(pan_arch)]
 idep_pan_packers = idep_pan_packers_by_arch['@0@'.format(pan_arch)]

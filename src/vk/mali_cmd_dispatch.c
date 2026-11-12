@@ -6,7 +6,7 @@
 /*
  * Compute dispatch (vkCmdDispatch, vkCmdDispatchBase, and the internal
  * copy/fill shaders) on the command-stream frontend. Encoding follows panvk
- * v11 (Mesa csf/panvk_vX_cmd_dispatch.c), with what our compiled shaders
+ * (Mesa csf/panvk_vX_cmd_dispatch.c), with what our compiled shaders
  * need the command buffer to provide (the FAU block, resource table and
  * TSD are built by mali_cmd_state.h, shared with the job-manager back
  * half):
@@ -25,8 +25,9 @@
  *    group 0 (the blob uses group 3; either is valid).
  *
  * The iterator scoreboard entry moves on before each RUN_COMPUTE
- * (cs_iter_sb_update on v11: NEXT_SB_ENTRY), so consecutive dispatches can
- * overlap; barriers and the end of the command buffer wait for them.
+ * (cs_iter_sb_update: NEXT_SB_ENTRY on v11, SET_SB_ENTRY with the entry
+ * known at record time on v10), so consecutive dispatches can overlap;
+ * barriers and the end of the command buffer wait for them.
  *
  * vkCmdDispatchIndirect loads the three counts from the buffer into the
  * JOB_SIZE registers, stores them into the FAU words the shader reads as
@@ -53,12 +54,16 @@
 /* ---------------------------------------------------------------------- */
 /* Encoding                                                                */
 
-/* v11 cs_iter_sb_update with nothing inside: select the next iterator
- * scoreboard entry for the next asynchronous job, make it the indirect
- * wait mask, and keep the current one out of the stream mask. */
+/* cs_iter_sb_update with nothing inside: select the next iterator
+ * scoreboard entry for the next asynchronous job; on v11 also make it the
+ * indirect wait mask, and keep the current one out of the stream mask. */
 static void
 next_iter_sb(struct mali_cmd_buffer *cmd, struct cs_builder *b)
 {
+#if PAN_ARCH == 10
+   (void)b;
+   mali_cmd_next_iter_sb(cmd, MALI_SUBQUEUE_COMPUTE);
+#else
    const struct mali_csf_device *csf = cmd->dev->csf;
    struct cs_index next_sb = mali_cs_scratch_reg32(b, 0);
    struct cs_index sb_mask = mali_cs_scratch_reg32(b, 1);
@@ -71,6 +76,7 @@ next_iter_sb(struct mali_cmd_buffer *cmd, struct cs_builder *b)
    cs_move32_to(b, sb_mask, csf->sb.all_iters_mask);
    cs_bit_clear32(b, sb_mask, sb_mask, next_sb);
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
+#endif
 }
 
 /* indirect: GPU address of a VkDispatchIndirectCommand, 0 for a direct

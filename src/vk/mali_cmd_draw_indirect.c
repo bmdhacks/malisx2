@@ -142,8 +142,8 @@ emit_invalidate_ro(struct cs_builder *b, uint32_t wait_sb_mask)
  * and max_draws.
  */
 static void
-draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
-              uint64_t count_va, uint32_t max_draws)
+draw_indirect_pass(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
+                   uint64_t count_va, uint32_t max_draws)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    struct mali_render_state *r = &cmd->gfx.render;
@@ -261,6 +261,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    const struct cs_index left = mali_cs_scratch_reg32(b, 6);   /* entries left in the ring */
    const struct cs_index acc = mali_cs_scratch_reg32(b, 7);
    const struct cs_index bit = mali_cs_scratch_reg32(b, 8);
+   /* gl_DrawID: the command's index in the loop (scratch 9 is
+    * emit_invalidate_ro's). */
+   const struct cs_index draw_id = mali_cs_scratch_reg32(b, 10);
    const struct cs_index first_instance = cs_reg32(b, IDVS(INSTANCE_OFFSET));
    const bool laps = entry && ring < max_draws;
 
@@ -279,6 +282,7 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    }
    if (laps)
       cs_move32_to(b, left, ring);
+   cs_move32_to(b, draw_id, 0);
 
    cs_while(b, MALI_CS_CONDITION_GREATER, count) {
       if (laps) {
@@ -329,15 +333,16 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
             for (uint32_t i = 0; i < r->td_count; i++) {
                if (i)
                   cs_add_imm64(b, ctx, ctx, pan_size(TILER_CONTEXT));
-               emit_run_idvs(b, ovr.opaque[0]);
+               emit_run_idvs(b, ovr.opaque[0], draw_id.reg);
             }
             cs_move64_to(b, ctx, r->tiler);
          } else {
-            emit_run_idvs(b, ovr.opaque[0]);
+            emit_run_idvs(b, ovr.opaque[0], draw_id.reg);
          }
       }
 
       cs_add_imm32(b, count, count, -1);
+      cs_add_imm32(b, draw_id, draw_id, 1);
       cs_add_imm64(b, addr, addr, stride);
       if (entry) {
          cs_add_imm64(b, base, base, entry);
@@ -365,6 +370,26 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    cmd->draws++;
    if (unlikely(mh))
       mali_measure_end(cmd, mh);
+}
+
+static void
+draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
+              uint64_t count_va, uint32_t max_draws)
+{
+   const uint32_t passes = viewport_passes(cmd);
+   for (uint32_t i = 0; i < passes; i++) {
+      viewport_pass_begin(cmd, i);
+      draw_indirect_pass(cmd, indexed, params, stride, count_va, max_draws);
+   }
+   viewport_pass_begin(cmd, 0);
+}
+
+/* One indexed draw whose VkDrawIndexedIndirectCommand the GPU writes
+ * (tessellation, mali_cmd_draw.c), without the viewport passes. */
+void
+MALI_PER_ARCH(cmd_draw_indexed_indirect_one)(struct mali_cmd_buffer *cmd, uint64_t params)
+{
+   draw_indirect_pass(cmd, true, params, sizeof(VkDrawIndexedIndirectCommand), 0, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL

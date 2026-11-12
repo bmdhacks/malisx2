@@ -298,6 +298,17 @@ void mali_cmd_emit_barrier(struct mali_cmd_buffer *cmd, const struct mali_cs_dep
  * Called before a fragment job and at the end of the command buffer. */
 void mali_cmd_frag_flush_pending(struct mali_cmd_buffer *cmd);
 
+/* An internal compute job on the vertex/tiler stream, waited for before
+ * the stream goes on (mali_cmd_dispatch.c). */
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch_shader,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                        const void *push, uint32_t push_size, const uint32_t groups[3]));
+MALI_PER_CSF_ARCH_DECL(void, cmd_draw_indexed_indirect_one,
+                       (struct mali_cmd_buffer *cmd, uint64_t params));
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs, uint64_t srt,
+                        uint64_t fau, const uint32_t groups[3]));
+
 /* Compute dispatch (mali_cmd_dispatch.c) and the internal copy shaders
  * (mali_cmd_copy.c): mali_cmd_gfx.h, shared with the job-manager back
  * half. */

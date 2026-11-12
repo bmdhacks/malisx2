@@ -29,9 +29,9 @@
 #define IDVS(reg) MALI_IDVS_SR_##reg
 
 /* The staging registers of a draw's resources. v12 names them per stage
- * (one vertex shader, no position/varying pair: IDVS2); on v10 and v11 the
- * vertex stage reads group 0 for position and group 1 (SPD_1) for
- * varyings, the fragment stage group 2, both TSD_0 (run_idvs_ins). */
+ * (one vertex shader, no position/varying pair: IDVS2); on v11 the vertex
+ * stage reads group 0 for position and group 1 (SPD_1) for varyings, the
+ * fragment stage group 2, both TSD_0 (run_idvs_ins). */
 #if PAN_ARCH >= 12
 #define IDVS_VS_FAU IDVS(VERTEX_FAU)
 #define IDVS_FS_FAU IDVS(FRAGMENT_FAU)
@@ -161,15 +161,21 @@ emit_ubo_push_general(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 
 #if PAN_ARCH >= 12
 /* RUN_IDVS2 with the vertex stage shaded early, as panvk v12. The stages
- * read their own staging registers (IDVS_VS_*, IDVS_FS_*). */
+ * read their own staging registers (IDVS_VS_*, IDVS_FS_*). gl_DrawID is
+ * the register draw_id_reg names, or 0 when it is negative. */
 static uint64_t
-run_idvs_ins(uint32_t flags_override)
+run_idvs_ins(uint32_t flags_override, int draw_id_reg)
 {
    struct mali_cs_run_idvs2_packed ins;
    pan_pack(&ins, CS_RUN_IDVS2, I) {
       I.flags_override = flags_override;
       I.malloc_enable = MALI_CS_MEMORY_ALLOCATION_ENABLE_MALLOC;
-      I.draw_id_register_enable = MALI_CS_DRAW_ID_REGISTER_ENABLE_NO_DRAWID;
+      if (draw_id_reg >= 0) {
+         I.draw_id_register_enable = MALI_CS_DRAW_ID_REGISTER_ENABLE_DRAWID;
+         I.draw_id = draw_id_reg;
+      } else {
+         I.draw_id_register_enable = MALI_CS_DRAW_ID_REGISTER_ENABLE_NO_DRAWID;
+      }
       I.vertex_shading_mode = MALI_IDVS_SHADING_MODE_EARLY;
    }
    uint64_t v;
@@ -177,17 +183,19 @@ run_idvs_ins(uint32_t flags_override)
    return v;
 }
 #else
-/* RUN_IDVS, with bit 55 set on v11 (mali_cmd_draw.c). Selects as panvk:
- * varying stage from group 0/1 (SPD_1), fragment from group 2, both with
- * TSD_0. */
+/* RUN_IDVS, with bit 55 set on v11 (mali_cmd_draw.c). Selects as panvk: varying stage from
+ * group 0/1 (SPD_1), fragment from group 2, both with TSD_0. gl_DrawID is
+ * the register draw_id_reg names, or 0 when it is negative. */
 static uint64_t
-run_idvs_ins(uint32_t flags_override)
+run_idvs_ins(uint32_t flags_override, int draw_id_reg)
 {
    struct mali_cs_run_idvs_packed ins;
    pan_pack(&ins, CS_RUN_IDVS, I) {
       I.flags_override = flags_override;
       I.malloc_enable = true;
-      I.draw_id_register_enable = false;
+      I.draw_id_register_enable = draw_id_reg >= 0;
+      if (draw_id_reg >= 0)
+         I.draw_id = draw_id_reg;
       I.varying_srt_select = false;
       I.varying_fau_select = false;
       I.varying_tsd_select = false;
@@ -205,11 +213,11 @@ run_idvs_ins(uint32_t flags_override)
 #endif
 
 static void
-emit_run_idvs(struct cs_builder *b, uint32_t flags_override)
+emit_run_idvs(struct cs_builder *b, uint32_t flags_override, int draw_id_reg)
 {
    cs_flush_loads(b);
    b->req_resource_mask |= CS_IDVS_RES;
-   const uint64_t ins = run_idvs_ins(flags_override);
+   const uint64_t ins = run_idvs_ins(flags_override, draw_id_reg);
    memcpy(cs_alloc_ins(b), &ins, sizeof(ins));
 }
 
@@ -414,7 +422,8 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 #endif
       batch_move32(e, IDVS(VARY_SIZE), bd->vary_size);
       /* Point size 1.0 unless the shader writes it; line width. */
-      batch_move32(e, IDVS(PRIMITIVE_SIZE), fui(lines ? dyn->rs.line.width : 1.0f));
+      batch_move32(e, IDVS(PRIMITIVE_SIZE),
+                   fui(lines ? CLAMP(dyn->rs.line.width, 1.0f, MALI_MAX_LINE_WIDTH) : 1.0f));
       batch_move32(e, IDVS(GLOBAL_ATTRIBUTE_OFFSET), 0);
       batch_move64(e, IDVS(OQ), d->oq_addr);
    } else if (d->dirty & MALI_GFX_DIRTY_OQ) {
@@ -430,7 +439,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       batch_move64(e, IDVS(VIEWPORT_HIGH), words[0]);
       batch_move64(e, IDVS(VIEWPORT_LOW), words[1]);
 #else
-      const VkViewport *vp = &dyn->vp.viewports[0];
+      const VkViewport *vp = &dyn->vp.viewports[d->vp_pass];
       batch_move32(e, IDVS(LOW_DEPTH_CLAMP), fui(MIN2(vp->minDepth, vp->maxDepth)));
       batch_move32(e, IDVS(HIGH_DEPTH_CLAMP), fui(MAX2(vp->minDepth, vp->maxDepth)));
 #endif
@@ -452,6 +461,29 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 
    d->dirty &= MALI_GFX_DIRTY_INDEX;
    return true;
+}
+
+/* How many times a draw runs: once per viewport for a pipeline whose
+ * vertex shader writes gl_ViewportIndex (mali_shader.c, "Viewport
+ * index"), else once. */
+static inline uint32_t
+viewport_passes(const struct mali_cmd_buffer *cmd)
+{
+   const struct mali_graphics_pipeline *p = cmd->gfx.draw.pipeline;
+   const uint32_t n = cmd->vk.dynamic_graphics_state.vp.viewport_count;
+   return p && p->vs && p->vs->vs.viewport_index && n > 1 ? n : 1;
+}
+
+/* Before pass i of a draw that runs once per viewport, and after the last
+ * one (i = 0): the viewport, the sysvals that name it, and the scissor. */
+static inline void
+viewport_pass_begin(struct mali_cmd_buffer *cmd, uint32_t i)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   if (d->vp_pass == i)
+      return;
+   d->vp_pass = i;
+   d->dirty |= MALI_GFX_DIRTY_VIEWPORT | MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_FS_FAU;
 }
 
 #endif

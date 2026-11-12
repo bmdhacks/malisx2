@@ -541,7 +541,7 @@ static const struct vk_device_extension_table mali_device_extensions = {
     *    runtime keeps the state, and a pipeline that leaves any of it
     *    dynamic has its hardware words packed again at the draw from the
     *    command buffer's state (mali_cmd_state.h mali_gfx_update_dirty).
-    *    Rasterizer discard drops the draw. No logic op and no patch control
+    *    Rasterizer discard drops the draw. No dynamic logic op and no patch control
     *    points (no logicOp, no tessellation);
     *  - demote to helper invocation: every back end's discard is a demote;
     *  - private data: the runtime's, on every object. */
@@ -638,6 +638,19 @@ ubo_std_layout_for_arch(uint32_t arch)
    return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
+/*
+ * The features and extensions added on the command-stream back half for
+ * Eden (geometry and tessellation shaders, polygon modes, cull distances,
+ * multiple viewports, logic ops, wide lines, draw parameters, variable
+ * pointers, float controls, host query reset): on v11 and v12. v10, whose
+ * stream encodes some of what they record differently, is not tried yet.
+ */
+static bool
+csf_ext_for_arch(uint32_t arch)
+{
+   return arch == 11 || arch == 12;
+}
+
 /* maxDrawIndirectCount. v10, v11, v12: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
@@ -708,6 +721,22 @@ device_extensions_for_arch(uint32_t arch)
    /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
    ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
 #endif
+
+   /* The sampler's wrap modes have MIRRORED_CLAMP_TO_EDGE on every arch
+    * (mali_sampler.c). */
+   ext.KHR_sampler_mirror_clamp_to_edge = true;
+
+   /* Float controls: the SPD's flush-to-zero mode and kraid's rounding
+    * modes follow the shader's execution modes (panvk v9+). Host query
+    * reset: mali_ResetQueryPool zeroes the slots, which every CSF submit
+    * makes visible (mali_query.c). Both only on the command-stream
+    * frontend for now. */
+   ext.KHR_shader_float_controls = csf_ext_for_arch(arch);
+   ext.EXT_host_query_reset = csf_ext_for_arch(arch);
+   /* gl_Layer from the vertex shader is the tiler's layer index
+    * (mali_pipeline_state.c), gl_ViewportIndex a pass per viewport
+    * (multiViewport). */
+   ext.EXT_shader_viewport_index_layer = csf_ext_for_arch(arch);
    return ext;
 }
 
@@ -851,11 +880,17 @@ get_features(struct vk_features *f, uint32_t arch)
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,        /* blob: true; no GS in our compiler */
-      .tessellationShader = false,
+      /* libpoly's software geometry shaders (mali_shader.c), in a build
+       * with it (meson -Dpoly), on the command-stream frontend. */
+      .geometryShader = MALI_WITH_POLY && csf_ext_for_arch(arch),
+      /* libpoly's software tessellation (mali_shader.c), with geometry
+       * shaders' build and arch condition. */
+      .tessellationShader = MALI_WITH_POLY && csf_ext_for_arch(arch),
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
-      .logicOp = false,
+      /* Logic ops run in a blend shader (mali_blend.c, nir_color_logicop),
+       * as on panvk. Command-stream frontend only for now. */
+      .logicOp = csf_ext_for_arch(arch),
       .multiDrawIndirect = draw_indirect_for_arch(arch),
       .drawIndirectFirstInstance = draw_indirect_for_arch(arch),
       /* Vulkan 1.2's name for VK_KHR_draw_indirect_count. */
@@ -868,15 +903,28 @@ get_features(struct vk_features *f, uint32_t arch)
        * multisampling the clipped edge is not antialiased; and with a
        * fragment shader that forces early fragment tests and also
        * discards or writes memory, depth or stencil, clipped fragments
-       * still write depth and stencil. Cull distances are not
-       * supported. */
+       * still write depth and stencil. */
       .shaderClipDistance = arch == 7 || mali_arch_is_csf(arch),
-      .fillModeNonSolid = false,
+      /* Cull distances: a discard of every fragment of a primitive whose
+       * cull distance is negative at all its vertices (mali_shader.c,
+       * "Clip distances"). Command-stream frontend. */
+      .shaderCullDistance = csf_ext_for_arch(arch),
+      /* Polygon modes point and line: a point list of the vertices, a
+       * line list of the triangles' edges (mali_cmd_draw.c). Faces are
+       * not culled in either. Command-stream frontend, direct draws (an
+       * indirect one is drawn filled). */
+      .fillModeNonSolid = csf_ext_for_arch(arch),
       .depthBounds = false,
-      .wideLines = false,
+      /* The line width reaches the tiler as PRIMITIVE_SIZE on every draw
+       * (mali_cmd_draw.h); the range is panvk's. Command-stream frontend
+       * only for now. */
+      .wideLines = csf_ext_for_arch(arch),
       .largePoints = true,
       .alphaToOne = false,
-      .multiViewport = false,
+      /* One pass per viewport for a pipeline that writes
+       * gl_ViewportIndex (mali_shader.c, "Viewport index"). Command-stream
+       * frontend. */
+      .multiViewport = csf_ext_for_arch(arch),
       /* These four follow the GPU (physical_device_create): the model's
        * anisotropy revision and the compressed formats it samples. */
       .samplerAnisotropy = true,
@@ -918,6 +966,18 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,
+
+      /* Vulkan 1.1, on the command-stream frontend. BaseVertex and
+       * BaseInstance are system values on every arch (mali_shader.c); the
+       * draw ID is the register RUN_IDVS names, which an indirect draw's
+       * loop counts (mali_cmd_draw_indirect.c). Variable pointers: the
+       * buffer address formats are panvk's, which offers them. */
+      .shaderDrawParameters = csf_ext_for_arch(arch),
+      .variablePointers = csf_ext_for_arch(arch),
+      .variablePointersStorageBuffer = csf_ext_for_arch(arch),
+
+      /* VK_EXT_host_query_reset (device_extensions_for_arch). */
+      .hostQueryReset = csf_ext_for_arch(arch),
 
       /* VK_EXT_rasterization_order_attachment_access, every arch: the
        * draw descriptor's Flags 0 word (mali_pipeline_state.c) carries
@@ -1434,9 +1494,51 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
-   if (mali_arch_is_csf(p->arch_major)) {
+   if (p->arch_major == 10) {
       props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
       props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
+   }
+   if (csf_ext_for_arch(p->arch_major)) {
+      props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
+      props->maxCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
+      props->maxViewports = MESA_VK_MAX_VIEWPORTS;
+#if MALI_WITH_POLY
+      /* Geometry shaders: Asahi's limits for libpoly's (hk_physical_device.c). */
+      props->maxGeometryShaderInvocations = 32;
+      props->maxGeometryInputComponents = 128;
+      props->maxGeometryOutputComponents = 128;
+      props->maxGeometryOutputVertices = 1024;
+      props->maxGeometryTotalOutputComponents = 1024;
+      /* Tessellation: Asahi's limits for libpoly's. */
+      props->maxTessellationGenerationLevel = 64;
+      props->maxTessellationPatchSize = 32;
+      props->maxTessellationControlPerVertexInputComponents = 128;
+      props->maxTessellationControlPerVertexOutputComponents = 128;
+      props->maxTessellationControlPerPatchOutputComponents = 120;
+      props->maxTessellationControlTotalOutputComponents = 4216;
+      props->maxTessellationEvaluationInputComponents = 128;
+      props->maxTessellationEvaluationOutputComponents = 128;
+#endif
+      props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
+
+      props->lineWidthRange[1] = MALI_MAX_LINE_WIDTH;
+      props->lineWidthGranularity = 1.0f / 128.0f;
+
+      /* VK_KHR_shader_float_controls: panvk's values for v9 and later.
+       * One flush-to-zero mode per shader covers FP16 and FP32 together
+       * (ftz_mode, mali_shader.c); no FP64. */
+      props->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+      props->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+      props->shaderSignedZeroInfNanPreserveFloat16 = true;
+      props->shaderSignedZeroInfNanPreserveFloat32 = true;
+      props->shaderDenormPreserveFloat16 = true;
+      props->shaderDenormPreserveFloat32 = true;
+      props->shaderDenormFlushToZeroFloat16 = true;
+      props->shaderDenormFlushToZeroFloat32 = true;
+      props->shaderRoundingModeRTEFloat16 = true;
+      props->shaderRoundingModeRTEFloat32 = true;
+      props->shaderRoundingModeRTZFloat16 = true;
+      props->shaderRoundingModeRTZFloat32 = true;
    }
    if (p->arch_major == 7) {
       props->maxClipDistances = MALI_V7_MAX_CLIP_DISTANCES;

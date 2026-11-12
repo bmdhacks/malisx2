@@ -171,7 +171,41 @@ enum mali_meta_shader {
    MALI_META_INDIRECT_DISPATCH, /* v7 and v9 vkCmdDispatchIndirect: patches the Compute job */
    MALI_META_INDIRECT_DRAW,     /* v7 and v9 indirect draws: patches a draw's jobs */
    MALI_META_INDEX_MINMAX,      /* v7 indirect indexed draws: the indices' range */
+   MALI_META_POLYGON_LINES,     /* CSF polygon mode line: the triangles' edges */
+   /* CSF tessellation (vk/cl/mali_poly.cl): per patch, count the indices of
+    * an isoline, triangle or quad domain, or write them; and between the
+    * two, the offsets and the index buffer. */
+   MALI_META_TESS_COUNT_ISOLINES,
+   MALI_META_TESS_COUNT_TRIANGLES,
+   MALI_META_TESS_COUNT_QUADS,
+   MALI_META_TESS_WRITE_ISOLINES,
+   MALI_META_TESS_WRITE_TRIANGLES,
+   MALI_META_TESS_WRITE_QUADS,
+   MALI_META_TESS_FINISH,
    MALI_META_COUNT,
+};
+
+/* Push constants of the MALI_META_TESS_* shaders: the draw's struct
+ * poly_tess_params. */
+struct mali_meta_tess_push {
+   uint64_t params;
+};
+
+/* Push constants of MALI_META_POLYGON_LINES (mali_cmd_draw.c): triangle t
+ * of a list, strip or fan (mode: MESA_PRIM_TRIANGLES, _STRIP, _FAN) at
+ * index position first + its vertices' positions, read from the index
+ * buffer at src (index_size bytes each) or, with src 0, the positions
+ * themselves; written to dst as the six 32-bit indices of its three edges.
+ * A triangle with the restart index (restart, if not 0) writes restarts. */
+struct mali_meta_lines_push {
+   uint64_t src;
+   uint64_t dst;
+   uint32_t count;     /* triangles */
+   uint32_t first;
+   uint32_t index_size;
+   uint32_t mode;
+   uint32_t restart;
+   uint32_t pad;
 };
 
 /* Push constants of MALI_META_INDIRECT_DISPATCH (mali_jm_cmd_dispatch.c):
@@ -326,6 +360,10 @@ struct mali_device {
    /* Internal shaders, compiled on first use. */
    simple_mtx_t meta_lock;
    struct mali_shader *meta[MALI_META_COUNT];
+   /* The tessellator's heap (mali_cmd_draw.c draw_tess): a struct
+    * poly_heap, then the memory it hands out. Allocated on first use, under
+    * meta_lock. */
+   struct mali_kbase_bo poly_heap;
    /* Internal fragment shaders (mali_cmd_meta_gfx.c), by key. */
    void *meta_gfx;
    /* Blend shaders (mali_blend.c), by key. Under meta_lock. */
@@ -420,6 +458,9 @@ MALI_PER_JM_ARCH_DECL(VkResult, queue_submit,
                       (struct vk_queue *vkq, struct vk_queue_submit *submit));
 extern const struct vk_command_buffer_ops mali_v7_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v9_cmd_buffer_ops;
+/* lineWidthRange's maximum where wideLines is offered (panvk's). */
+#define MALI_MAX_LINE_WIDTH 7.9921875f
+
 extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v10_sync_type;

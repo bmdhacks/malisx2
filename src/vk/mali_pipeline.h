@@ -93,7 +93,9 @@ struct mali_gfx_baked {
     * feed none of these words): the draw encoder must repack. */
    bool uses_dynamic_state;
 
-   enum mesa_prim prim;           /* static topology, MESA_PRIM_COUNT if dynamic */
+   enum mesa_prim prim;           /* static topology, MESA_PRIM_COUNT if dynamic;
+                                   * points or lines for triangles in polygon
+                                   * mode point or line */
    uint32_t tiler_flags;          /* v11 Primitive Flags, v9 and v7 Primitive
                                    * word 0; index type is per draw */
    uint32_t dcd0[2];              /* [0] occlusion query off, [1] counting;
@@ -193,8 +195,11 @@ struct mali_graphics_pipeline {
 
    struct mali_gfx_bind bind;
 
-   struct mali_shader *vs;              /* reference */
+   struct mali_shader *vs;              /* reference; with a geometry shader its
+                                         * rasterization shader */
    struct mali_shader *fs;              /* reference, NULL without a fragment stage */
+   struct mali_gs_shaders *gs;          /* NULL without a geometry stage */
+   struct mali_tess_shaders *tess;      /* NULL without tessellation */
    struct mali_bo_ref zsd_mem;          /* bind.zsd */
 
    /* Which states are dynamic (MESA_VK_DYNAMIC_*). */
@@ -245,6 +250,13 @@ struct mali_gfx_pack_input {
    const struct mali_shader *vs;
    const struct mali_shader *fs;       /* may be NULL */
    uint32_t view_mask;                 /* multiview, 0 without */
+   /* With a geometry shader, the draw is of its output primitives (enum
+    * mesa_prim), as strips cut by restarts; with tessellation, of the
+    * tessellator's (lists). Both mali_cmd_draw.c. */
+   bool has_gs;
+   uint8_t gs_prim;
+   bool has_tess;
+   uint8_t tess_prim;
 };
 
 MALI_PER_ARCH_DECL(void, gfx_pack_state,

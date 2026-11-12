@@ -187,6 +187,73 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
       mali_measure_end(cmd, mh);
 }
 
+/*
+ * An internal compute job on the vertex/tiler stream, for what a draw needs
+ * computed before it runs (polygon mode line, mali_cmd_draw.c): the stream
+ * waits for it before going on, so the next draw reads what it wrote. It
+ * signals the pass's iterator entry like the draws, so the wait is for the
+ * draws before it too. The compute staging registers are the IDVS ones, so
+ * the draws' record of those is gone (every group dirty).
+ */
+void
+MALI_PER_ARCH(cmd_vt_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                                      const void *push, uint32_t push_size,
+                                      const uint32_t groups[3])
+{
+   const uint32_t base[3] = {0, 0, 0};
+   if (!cs || !cs->spd[MALI_SPD_MAIN] || !groups[0] || !groups[1] || !groups[2])
+      return;
+   uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
+   uint64_t srt = mali_compute_res_table(cmd, cs, NULL, NULL, 0);
+   if (vk_command_buffer_has_error(&cmd->vk) || !srt || (cs->fau.total_count && !fau))
+      return;
+   MALI_PER_ARCH(cmd_vt_dispatch)(cmd, cs, srt, fau, groups);
+}
+
+/* The same with the resource table and FAU block given: a shader compiled
+ * against the graphics system values (the geometry shader's compute
+ * shaders, mali_cmd_draw.c). */
+void
+MALI_PER_ARCH(cmd_vt_dispatch)(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                               uint64_t srt, uint64_t fau, const uint32_t groups[3])
+{
+   if (!cs || !cs->spd[MALI_SPD_MAIN] || !groups[0] || !groups[1] || !groups[2])
+      return;
+   const struct mali_thread_props tp = mali_thread_props(cmd->dev);
+   uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, groups);
+   if (vk_command_buffer_has_error(&cmd->vk) || !tsd)
+      return;
+   unsigned axis, inc;
+   mali_compute_task_axis(&tp, cs, groups, &axis, &inc);
+
+   struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_VERTEX_TILER);
+   cs_move64_to(b, cs_reg64(b, COMPUTE_SRT), srt);
+   cs_move64_to(b, cs_reg64(b, COMPUTE_FAU), fau);
+   cs_move64_to(b, cs_reg64(b, COMPUTE_SPD), cs->spd[MALI_SPD_MAIN]);
+   cs_move64_to(b, cs_reg64(b, COMPUTE_TSD), tsd);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, GLOBAL_ATTRIBUTE_OFFSET), 0);
+   struct mali_compute_size_workgroup_packed wg;
+   pan_pack(&wg, COMPUTE_SIZE_WORKGROUP, cfg) {
+      cfg.workgroup_size_x = cs->cs.local_size[0];
+      cfg.workgroup_size_y = cs->cs.local_size[1];
+      cfg.workgroup_size_z = cs->cs.local_size[2];
+      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
+   }
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, WG_SIZE), wg.opaque[0]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_X), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Y), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), groups[0]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), groups[1]);
+   cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), groups[2]);
+   cs_run_compute(b, inc, axis, cs_shader_res_sel(0, 0, 0, 0));
+   cs_wait_slots(b, cmd->dev->csf->sb.all_iters_mask);
+
+   BITSET_ZERO(cmd->gfx.draw.regs_valid);
+   cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_ALL;
+   cmd->dispatches++;
+}
+
 void
 MALI_PER_ARCH(cmd_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                          const struct mali_desc_state *desc, const void *push,

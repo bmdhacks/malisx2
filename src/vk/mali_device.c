@@ -286,6 +286,8 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
       mali_event_pool_finish(dev);
       mali_bo_pool_finish(&dev->desc_pool);
       mali_bo_pool_finish(&dev->exec_pool);
+      if (dev->poly_heap.size)
+         mali_kbase_free(dev->kbase, &dev->poly_heap);
    }
    mali_kbase_destroy(dev->kbase);
    vk_device_finish(&dev->vk);

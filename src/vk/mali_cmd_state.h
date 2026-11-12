@@ -425,7 +425,7 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
    /* Viewport transform (the vertex shader applies it): scale (w/2, h/2,
     * zmax - zmin), offset (x + w/2, y + h/2, zmin). */
-   const VkViewport *vp = &dyn->vp.viewports[0];
+   const VkViewport *vp = &dyn->vp.viewports[d->vp_pass];
    sv->viewport[0].scale = 0.5f * vp->width;
    sv->viewport[1].scale = 0.5f * vp->height;
    sv->viewport[2].scale = vp->maxDepth - vp->minDepth;
@@ -436,6 +436,12 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
    sv->vs.noperspective_varyings = p->bind.noperspective;
+   sv->vs.viewport_pass = d->vp_pass;
+   sv->vs.provoking_last =
+      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+   sv->poly.vertex_params = d->poly_vertex_params;
+   sv->poly.geometry_params = d->poly_geometry_params;
+   sv->poly.tess_params = d->poly_tess_params;
 #if PAN_ARCH >= 9
    /* On v7 these words are v7_desc.sets, which the v7 draw fills: BLEND
     * reads the Blend descriptors from the blend FAU slots (mali_shader.h). */
@@ -672,10 +678,9 @@ mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
  * (mali_gfx_pack_vs_drv). 0 on failure. *drv (when not NULL): table 0's
  * address, where attribute i's descriptor is the i-th. */
 static inline uint64_t
-mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+mali_gfx_shader_vs_srt(struct mali_cmd_buffer *cmd, const struct mali_shader *vs, uint64_t *drv)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
-   const struct mali_shader *vs = d->pipeline->vs;
    const struct vk_vertex_input_state *vi = d->vi;
    uint32_t vb_offset, vb_count;
    const uint32_t count = mali_gfx_vs_drv_count(vs, vi, &vb_offset, &vb_count);
@@ -686,6 +691,14 @@ mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
    if (drv)
       *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+/* The same for a shader that takes a vertex shader's table (a geometry
+ * shader's compute shaders, mali_cmd_draw.c). */
+static inline uint64_t
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+{
+   return mali_gfx_shader_vs_srt(cmd, cmd->gfx.draw.pipeline->vs, drv);
 }
 
 static inline uint64_t
@@ -1013,8 +1026,9 @@ mali_gfx_scissor_rect(const struct mali_cmd_buffer *cmd, int *minx_out, int *min
                       int *maxx_out, int *maxy_out)
 {
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   const VkViewport *vp = &dyn->vp.viewports[0];
-   const VkRect2D *sc = &dyn->vp.scissors[0];
+   const uint32_t pass = cmd->gfx.draw.vp_pass;
+   const VkViewport *vp = &dyn->vp.viewports[pass];
+   const VkRect2D *sc = &dyn->vp.scissors[pass];
 
    int minx = (int)vp->x;
    int maxx = (int)(vp->x + vp->width);
@@ -1078,7 +1092,7 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
 static inline void
 mali_gfx_viewport(const struct mali_cmd_buffer *cmd, uint64_t words[2])
 {
-   const VkViewport *vp = &cmd->vk.dynamic_graphics_state.vp.viewports[0];
+   const VkViewport *vp = &cmd->vk.dynamic_graphics_state.vp.viewports[cmd->gfx.draw.vp_pass];
    int minx = (int)vp->x;
    int maxx = (int)(vp->x + vp->width);
    int miny = (int)MIN2(vp->y, vp->y + vp->height);
@@ -1268,6 +1282,15 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .vs = p->vs,
             .fs = p->fs,
             .view_mask = p->state.rp.view_mask,
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+            .has_gs = p->gs != NULL,
+            .gs_prim = p->gs ? p->gs->info.mode : 0,
+            .has_tess = p->tess != NULL,
+            .tess_prim = !p->tess              ? 0
+                         : p->tess->points     ? MESA_PRIM_POINTS
+                         : p->tess->mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                                                   : MESA_PRIM_TRIANGLES,
+#endif
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

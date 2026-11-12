@@ -325,15 +325,26 @@ struct mali_gfx_draw_state {
    const struct vk_vertex_input_state *vi;
    const uint16_t *vi_strides;
 
+   /* The last geometry-shader draw's libpoly parameter blocks, which its
+    * rasterization shader reads (mali_cmd_draw.c draw_gs). */
+   uint64_t poly_vertex_params, poly_geometry_params, poly_tess_params;
+   /* The tessellator's heap was emptied in this command buffer. */
+   bool poly_heap_reset;
+
+   /* The viewport this pass of a draw goes to: 0, or for a pipeline whose
+    * vertex shader writes gl_ViewportIndex, each viewport in turn
+    * (mali_cmd_draw.c). */
+   uint32_t vp_pass;
+
    /* The mali_gfx_bind table keys of the tables in SRT_0 and SRT_2. */
    uint32_t vs_srt_key, fs_srt_key;
    /* Descriptor sets bound since each stage's table was built. */
    uint32_t vs_sets_dirty, fs_sets_dirty;
 
-   /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on
-    * v12), per 32-bit register, where regs_valid says it is known: a draw
-    * writes only the registers whose value changes. Only mali_cmd_draw.c
-    * writes these registers; anything else that does clears regs_valid. */
+   /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on v12),
+    * per 32-bit register, where regs_valid says it is known: a draw writes
+    * only the registers whose value changes. Only mali_cmd_draw.c writes
+    * these registers; anything else that does clears regs_valid. */
    BITSET_DECLARE(regs_valid, 66);
    uint32_t regs[66];
 

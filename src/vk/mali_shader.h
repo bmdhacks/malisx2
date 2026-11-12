@@ -108,6 +108,13 @@ struct mali_graphics_sysvals {
        * Draw descriptor's offset_start. It fills padding, so the other
        * words keep their offsets. */
       int32_t raw_vertex_offset;
+      /* The viewport the draw is drawn into on this pass, for a pipeline
+       * whose vertex shader writes gl_ViewportIndex (mali_shader.c,
+       * "Viewport index"). */
+      uint32_t viewport_pass;
+      /* The last vertex provokes (VK_EXT_provoking_vertex), for a geometry
+       * shader's rasterization shader. */
+      uint32_t provoking_last;
    } vs;
    union {
       struct {
@@ -123,6 +130,13 @@ struct mali_graphics_sysvals {
       } v7_desc;
    };
    struct mali_input_attachment_info iam[MALI_INPUT_ATTACHMENT_MAP_SIZE];
+   /* Geometry shaders (mali_gs.c): the draw's libpoly parameter blocks
+    * (struct poly_vertex_params, poly_geometry_params, poly_tess_params). */
+   struct {
+      mali_aligned_u64 vertex_params;
+      mali_aligned_u64 geometry_params;
+      mali_aligned_u64 tess_params;
+   } poly;
 } __attribute__((aligned(8)));
 
 static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==
@@ -408,6 +422,14 @@ struct mali_shader {
          uint32_t local_size[3];
       } cs;
       struct {
+         /* gl_ClipDistance elements; the gl_CullDistance ones follow them
+          * in the CLIP_DIST slots (vk_nir merges the two arrays). */
+         uint32_t clip_distances;
+         /* It writes gl_ViewportIndex: the draw runs once per viewport
+          * (mali_cmd_draw.c). */
+         uint32_t viewport_index;
+      } vs;
+      struct {
          /* Bit i: input attachment i (index + 1 for InputAttachmentIndex
           * i; bit 0 for one without) is read. */
          uint32_t input_attachment_read;
@@ -482,6 +504,50 @@ MALI_PER_ARCH_DECL(const struct nir_shader_compiler_options *, shader_nir_option
 MALI_PER_ARCH_DECL(struct spirv_to_nir_options, shader_spirv_options,
                    (const struct vk_pipeline_robustness_state *rs));
 
+#if MALI_WITH_POLY
+#include "poly/nir/poly_nir.h"
+
+/*
+ * A geometry shader, as libpoly runs it (mali_shader.c, "Geometry
+ * shaders"): the vertex shader as a compute shader writing its outputs to
+ * memory, the geometry shader as one writing the index buffer of what it
+ * emits (and a count shader before it when the counts are not static),
+ * and the rasterization vertex shader the draw runs, which runs the
+ * geometry shader again for each vertex it emits. The last three share
+ * one resource table, the geometry shader's.
+ */
+struct mali_gs_shaders {
+   struct mali_shader *sw_vs;
+   struct mali_shader *main;
+   struct mali_shader *count;   /* NULL: the counts are static */
+   struct mali_shader *rast;
+   struct poly_gs_info info;
+   uint64_t vs_outputs;         /* VARYING_BIT_* the vertex shader stores */
+};
+
+/*
+ * Tessellation, as libpoly runs it (mali_shader.c, "Tessellation"): the
+ * vertex shader as for a geometry shader, the control shader as a compute
+ * shader writing its patch's outputs to memory, and the evaluation shader
+ * as the vertex shader of the draw of the tessellator's output.
+ */
+struct mali_tess_shaders {
+   struct mali_shader *sw_vs;
+   struct mali_shader *tcs;
+   struct mali_shader *tes;
+   uint64_t vs_outputs;
+   /* The control shader's outputs (poly_tess_params). */
+   uint64_t tcs_per_vertex_outputs;
+   uint32_t tcs_output_patch_size;
+   uint32_t tcs_patch_outputs;
+   uint32_t tcs_output_stride;    /* bytes per patch */
+   /* The evaluation shader's layout (enum tess_primitive_mode,
+    * gl_tess_spacing). */
+   uint8_t mode, spacing;
+   bool ccw, points;
+};
+#endif
+
 struct mali_shader_compile_info {
    /* Consumed (freed) by mali_shader_compile whatever the result. */
    nir_shader *nir;
@@ -489,8 +555,11 @@ struct mali_shader_compile_info {
    const struct vk_pipeline_layout *layout;
    /* Graphics state (NULL for compute). */
    const struct vk_graphics_pipeline_state *state;
-   /* Fragment: the vertex shader's varying layout, if known. */
+   /* Fragment: the vertex shader's varying layout, if known, and how many
+    * of its CLIP_DIST components are clip distances (the rest are cull
+    * distances, mali_shader.c "Clip distances"). */
    const struct pan_varying_layout *vs_varying_layout;
+   uint32_t vs_clip_distances;
    /* An internal fragment shader (mali_cmd_meta_gfx.c) whose draw forces
     * early depth/stencil and pixel kill unless it writes depth or
     * stencil: it gets no ATEST in that case, as panvk's frame shaders. */
@@ -521,6 +590,23 @@ MALI_PER_ARCH_DECL(void, shader_preprocess, (struct mali_device *dev, nir_shader
 MALI_PER_ARCH_DECL(VkResult, shader_compile,
                    (struct mali_device *dev, const struct mali_shader_compile_info *info,
                     const blake3_hash key, struct mali_shader **out));
+
+#if MALI_WITH_POLY
+/* Command-stream frontend only. Consumes both NIRs. */
+MALI_PER_CSF_ARCH_DECL(VkResult, shader_compile_gs,
+                       (struct mali_device *dev, const struct mali_shader_compile_info *vs,
+                        const struct mali_shader_compile_info *gs, const blake3_hash key,
+                        struct mali_gs_shaders *out));
+MALI_PER_CSF_ARCH_DECL(void, gs_shaders_unref,
+                       (struct mali_device *dev, struct mali_gs_shaders *gs));
+MALI_PER_CSF_ARCH_DECL(VkResult, shader_compile_tess,
+                       (struct mali_device *dev, const struct mali_shader_compile_info *vs,
+                        const struct mali_shader_compile_info *tcs,
+                        const struct mali_shader_compile_info *tes, const blake3_hash key,
+                        struct mali_tess_shaders *out));
+MALI_PER_CSF_ARCH_DECL(void, tess_shaders_unref,
+                       (struct mali_device *dev, struct mali_tess_shaders *t));
+#endif
 
 /* Driver-side NIR lowering entry points (mali_nir_*.c). */
 void mali_nir_lower_descriptors(nir_shader *nir,

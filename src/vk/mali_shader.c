@@ -58,6 +58,9 @@
 #include "compiler/spirv/nir_spirv.h"
 #include "panfrost/compiler/bifrost/bifrost_compile.h"
 #include "panfrost/compiler/pan_nir.h"
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+#include "poly/cl/libpoly.h"
+#endif
 #include "util/blob.h"
 #include "util/log.h"
 #include "util/u_call_once.h"
@@ -230,6 +233,36 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_printf_buffer_address:
       val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+      val = load_sysval(b, graphics, 64, poly.vertex_params);
+      break;
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      val = load_sysval(b, graphics, 64, poly.geometry_params);
+      break;
+   case nir_intrinsic_load_tess_param_buffer_poly:
+      val = load_sysval(b, graphics, 64, poly.tess_params);
+      break;
+   case nir_intrinsic_load_provoking_last:
+      val = load_sysval(b, graphics, bit_size, vs.provoking_last);
+      break;
+   case nir_intrinsic_load_stat_query_address_poly:
+      /* No pipeline statistics: their counters go where loads read zeros. */
+      val = nir_imm_int64(b, PAN_SHADER_OOB_ADDRESS);
+      break;
+   case nir_intrinsic_load_input_topology_poly: {
+      nir_def *p = load_sysval(b, graphics, 64, poly.geometry_params);
+      val = nir_load_global(b, 1, 32,
+                            nir_iadd_imm(b, p, offsetof(struct poly_geometry_params,
+                                                        input_topology)),
+                            .align_mul = 4);
+      break;
+   }
+   case nir_intrinsic_ro_to_rw_poly:
+      /* One address space for both. */
+      val = intr->src[0].ssa;
+      break;
+#endif
 #if PAN_ARCH < 9
    case nir_intrinsic_load_blend_descriptor_pan: {
       /* Bifrost reads the Blend descriptors from its blend FAU slots
@@ -1296,7 +1329,10 @@ lower_nir_io(nir_shader *nir)
             io_type_size, nir_lower_io_use_interpolated_input_intrinsics);
    /* Constant offsets for the constant-indexed derefs left above. */
    NIR_PASS(_, nir, nir_opt_constant_folding);
-   pan_nir_lower_mediump_io(nir);
+   /* Vertex and fragment I/O only; a geometry shader's goes to memory
+    * (mali_shader.c, "Geometry shaders"). */
+   if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_FRAGMENT)
+      pan_nir_lower_mediump_io(nir);
 }
 
 static bool
@@ -1684,6 +1720,16 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
  * A pipeline without a fragment shader gets one that does nothing else
  * (mali_pipeline.c clip_fs_compile).
  *
+ * Cull distances follow the clip distances in the same components. The
+ * vertex shader stores 1.0 for a cull distance that is not negative and
+ * 0.0 for one that is (lower_cull_distance_vs). A primitive is culled when
+ * that value is 0 at all its vertices, which, the value being interpolated
+ * linearly across the primitive (or perspective-correctly, which keeps
+ * both zero and non-zero), is where it is 0 at the fragment and so are its
+ * screen-space derivatives (Asahi's agx_nir_lower_cull_distance, which
+ * reads the interpolation coefficients instead). Such a fragment is
+ * discarded like a clipped one.
+ *
  * The result is that of clipping the primitive, except that:
  *  - the distance is interpolated at the pixel centre, so under
  *    multisampling the clipped edge is not antialiased;
@@ -1772,10 +1818,50 @@ clip_distance_input(nir_shader *nir, unsigned count)
    return var;
 }
 
-/* The discard for every clip distance the vertex shader writes
- * (vs_layout), before the fragment shader's input locations are assigned. */
+/* The cull distances' indicators: a vertex shader store to the CLIP_DIST
+ * slots past the clip distances keeps only whether the distance is not
+ * negative. */
+static bool
+lower_cull_distance_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned clip = *(const unsigned *)data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location != VARYING_SLOT_CLIP_DIST0 && sem.location != VARYING_SLOT_CLIP_DIST1)
+      return false;
+   const unsigned first = (sem.location - VARYING_SLOT_CLIP_DIST0 +
+                           nir_src_as_uint(intr->src[1])) * 4 + nir_intrinsic_component(intr);
+   nir_def *v = intr->src[0].ssa;
+   if (first + v->num_components <= clip)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned c = 0; c < v->num_components; c++) {
+      nir_def *d = nir_channel(b, v, c);
+      comps[c] = first + c < clip ? d : nir_b2f32(b, nir_fge_imm(b, d, 0.0));
+   }
+   nir_src_rewrite(&intr->src[0], nir_vec(b, comps, v->num_components));
+   return true;
+}
+
 static void
-lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layout)
+lower_cull_distance_vs(nir_shader *nir)
+{
+   if (!nir->info.cull_distance_array_size)
+      return;
+   unsigned clip = nir->info.clip_distance_array_size;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_cull_distance_store,
+            nir_metadata_control_flow, &clip);
+}
+
+/* The discard for every clip and cull distance the vertex shader writes
+ * (vs_layout; the first clip_count components are clip distances), before
+ * the fragment shader's input locations are assigned. */
+static void
+lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layout,
+                       unsigned clip_count)
 {
    if (!vs_layout)
       return;
@@ -1799,7 +1885,13 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    for (unsigned i = 0; i < 2; i++) {
       for (unsigned c = 0; slots[i] && c < slots[i]->ncomps; c++) {
          nir_def *d = nir_load_array_var_imm(&b, in, 4 * i + c);
-         clip = nir_ior(&b, clip, nir_flt_imm(&b, d, 0.0));
+         if (4 * i + c < clip_count) {
+            clip = nir_ior(&b, clip, nir_flt_imm(&b, d, 0.0));
+         } else {
+            nir_def *flat = nir_iand(&b, nir_feq_imm(&b, nir_ddx_fine(&b, d), 0.0),
+                                     nir_feq_imm(&b, nir_ddy_fine(&b, d), 0.0));
+            clip = nir_ior(&b, clip, nir_iand(&b, nir_feq_imm(&b, d, 0.0), flat));
+         }
       }
    }
    nir_discard_if(&b, clip);
@@ -1809,6 +1901,114 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
    nir_progress(true, impl, nir_metadata_control_flow);
 }
 #endif /* PAN_ARCH != 9 */
+
+/* ---------------------------------------------------------------------- */
+/* Viewport index                                                          */
+
+#if PAN_ARCH >= 10
+/*
+ * Mali has one viewport and one scissor box. A pipeline whose vertex
+ * shader writes gl_ViewportIndex is drawn once per viewport, with that
+ * viewport's transform, depth range and scissor (mali_cmd_draw.c); on the
+ * pass for viewport i, the vertex shader moves every vertex whose index is
+ * not i to one point off the screen, so its primitives have no area and
+ * draw nothing. A primitive is drawn into the viewport its vertices name;
+ * Vulkan takes the provoking vertex's, which is the same unless a
+ * primitive's vertices disagree. The index itself is not a varying: a
+ * fragment shader that reads it gets the pass's (lower_viewport_index_fs).
+ */
+/* Drops var: its stores, then the derefs left without a use. */
+static void
+remove_variable(nir_shader *nir, nir_variable *var)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_deref &&
+                nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0])) == var)
+               nir_instr_remove(instr);
+         }
+      }
+      nir_remove_dead_derefs_impl(impl);
+   }
+   exec_node_remove(&var->node);
+}
+
+static bool
+lower_viewport_index_vs(nir_shader *nir)
+{
+   if (!nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_VIEWPORT))
+      return false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+
+   /* Every output written once, at the end, from a temporary: the values
+    * those last stores write are then the outputs'. The pass makes new
+    * output variables, so they are looked up after it. */
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, impl, nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   nir_variable *vp = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                                      VARYING_SLOT_VIEWPORT);
+   nir_variable *pos = nir_find_variable_with_location(nir, nir_var_shader_out,
+                                                       VARYING_SLOT_POS);
+
+   nir_intrinsic_instr *vp_store = NULL, *pos_store = NULL;
+   nir_foreach_instr_safe(instr, nir_impl_last_block(impl)) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_store_deref)
+         continue;
+      nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+      if (var == vp)
+         vp_store = intr;
+      else if (var == pos && nir_intrinsic_write_mask(intr) == 0xf)
+         pos_store = intr;
+   }
+   if (vp_store && pos_store) {
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_def *index = nir_u2u32(&b, vp_store->src[1].ssa);
+      nir_def *pass = load_sysval(&b, graphics, 32, vs.viewport_pass);
+      nir_def *away = nir_imm_vec4(&b, -4.0f, -4.0f, 0.0f, 1.0f);
+      nir_store_var(&b, pos,
+                    nir_bcsel(&b, nir_ieq(&b, index, pass), pos_store->src[1].ssa, away), 0xf);
+      nir_instr_remove(&pos_store->instr);
+   }
+   remove_variable(nir, vp);
+   nir->info.outputs_written &= ~VARYING_BIT_VIEWPORT;
+   nir_progress(true, impl, nir_metadata_control_flow);
+   return true;
+}
+
+static bool
+lower_viewport_index_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (!var || var != data)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, load_sysval(b, graphics, 32, vs.viewport_pass));
+   return true;
+}
+
+static void
+lower_viewport_index_fs(nir_shader *nir)
+{
+   nir_variable *vp = nir_find_variable_with_location(nir, nir_var_shader_in,
+                                                      VARYING_SLOT_VIEWPORT);
+   if (!vp)
+      return;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_viewport_index_load,
+            nir_metadata_control_flow, vp);
+   remove_variable(nir, vp);
+   nir->info.inputs_read &= ~VARYING_BIT_VIEWPORT;
+}
+#endif /* PAN_ARCH >= 10 */
 
 /* ---------------------------------------------------------------------- */
 /* Backend compile                                                         */
@@ -2382,6 +2582,10 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          NIR_PASS(_, nir, nir_split_var_copies);
       }
 
+#if PAN_ARCH >= 10
+      s->vs.viewport_index = lower_viewport_index_vs(nir);
+#endif
+
       /* driver_location = attribute location, holes included, so the
        * vertex input state's numbering applies directly. */
       nir_foreach_shader_in_variable(var, nir) {
@@ -2392,6 +2596,10 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       nir_assign_io_var_locations(nir, nir_var_shader_out);
       lower_nir_io(nir);
       NIR_PASS(_, nir, nir_opt_constant_folding);
+#if PAN_ARCH != 9
+      s->vs.clip_distances = nir->info.clip_distance_array_size;
+      lower_cull_distance_vs(nir);
+#endif
 
       pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
       pan_build_varying_layout_compact(&varying_layout, nir, inputs.arch);
@@ -2411,7 +2619,10 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
                nir_metadata_control_flow, NULL);
 #endif
 #if PAN_ARCH != 9
-      lower_clip_distance_fs(nir, info->vs_varying_layout);
+      lower_clip_distance_fs(nir, info->vs_varying_layout, info->vs_clip_distances);
+#endif
+#if PAN_ARCH >= 10
+      lower_viewport_index_fs(nir);
 #endif
       /* Input slots first: their count sizes the front of the driver
        * table (mali_shader.h). */
@@ -2524,6 +2735,424 @@ fail:
    return result;
 }
 
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+/* ---------------------------------------------------------------------- */
+/* Geometry shaders                                                        */
+
+/*
+ * libpoly's software geometry shaders (Mesa src/poly, as Asahi's hk uses
+ * them; mali_shader.h struct mali_gs_shaders). The draw (mali_gs.c) runs,
+ * on the vertex/tiler stream:
+ *
+ *  1. the vertex shader as a compute shader over (vertices, instances),
+ *     storing its outputs to the vertex output buffer. Its inputs are the
+ *     attributes as a vertex shader reads them: LD_ATTR takes the vertex
+ *     and instance index as operands, and the resource table is the one a
+ *     vertex shader of the pipeline would have;
+ *  2. the geometry shader as a compute shader over (input primitives,
+ *     instances), writing the index buffer of the strips it emits
+ *     (POLY_GS_SHAPE_DYNAMIC_INDEXED; the static shapes need none);
+ *  3. a draw of that index buffer with the rasterization vertex shader,
+ *     which runs the geometry shader again for the vertex its index names
+ *     and writes that vertex's outputs as a vertex shader's.
+ *
+ * No transform feedback and no geometry statistics queries, so libpoly's
+ * count prefix sum and pre-GS program are never needed; the count shader is
+ * kept for a geometry shader whose counts are not static, which the
+ * rasterization shader reads.
+ */
+
+/* Wraps the shader's body in "if (global invocation id.x < limit)": the
+ * grid of a compute job is whole workgroups. */
+static void
+guard_invocations(nir_shader *nir, nir_def *(*limit)(nir_builder *b))
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *x = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_push_if(&b, nir_ult(&b, x, limit(&b)));
+   nir_cf_reinsert(&body, b.cursor);
+   nir_pop_if(&b, NULL);
+   /* limit() may inline a libpoly function, which numbers the defs of the
+    * impl it sees: not the body, which was out of it then. */
+   nir_index_ssa_defs(impl);
+   nir_progress(true, impl, nir_metadata_none);
+}
+
+static nir_def *
+vs_vertices_per_instance(nir_builder *b)
+{
+   return poly_input_vertices(b, nir_load_vertex_param_buffer_poly(b));
+}
+
+static nir_def *
+gs_primitives_per_instance(nir_builder *b)
+{
+   nir_def *p = nir_load_geometry_param_buffer_poly(b);
+   return nir_load_global(b, 1, 32,
+                          nir_iadd_imm(b, p, offsetof(struct poly_geometry_params, grid)),
+                          .align_mul = 4);
+}
+
+/* The software vertex shader's vertex and instance: global invocation x
+ * and y; the vertex index (for gl_VertexIndex and the attribute fetch) is
+ * the index buffer's entry for it plus the base vertex (libpoly's
+ * poly_nir_load_vertex_id). */
+static bool
+lower_sw_vs_ids(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *id = nir_load_global_invocation_id(b, 32);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_raw_vertex_id:
+   case nir_intrinsic_load_vertex_id:
+      nir_def_replace(&intr->def, poly_nir_load_vertex_id(b, nir_channel(b, id, 0)));
+      return true;
+   case nir_intrinsic_load_vertex_id_zero_base:
+      nir_def_replace(&intr->def, nir_channel(b, id, 0));
+      return true;
+   case nir_intrinsic_load_instance_id:
+      nir_def_replace(&intr->def, nir_channel(b, id, 1));
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* A shader libpoly made, or one turned into a compute shader, made ready
+ * for compile_nir. */
+static void
+as_compute(struct mali_device *dev, nir_shader *nir)
+{
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->info.workgroup_size[0] = 64;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.outputs_written = 0;
+   nir->info.inputs_read = 0;
+   nir->options = MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE);
+   nir->xfb_info = NULL;
+}
+
+/* The rasterization shader's outputs numbered by slot, as
+ * nir_assign_io_var_locations numbers a vertex shader's: libpoly's stores
+ * keep the geometry shader's bases, which need not be distinct per slot. */
+static bool
+renumber_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const uint64_t written = *(const uint64_t *)data;
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   nir_intrinsic_set_base(intr, util_bitcount64(written & BITFIELD64_MASK(loc)));
+   return true;
+}
+
+static VkResult
+gs_variant(struct mali_device *dev, const struct mali_shader_compile_info *info,
+           const blake3_hash key, unsigned index, mesa_shader_stage stage, nir_shader *nir,
+           const struct mali_shader_desc_info *desc, struct mali_shader **out)
+{
+   const struct mali_physical_device *pdev = mali_device_physical(dev);
+   blake3_hash k;
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, key, sizeof(blake3_hash));
+   _mesa_blake3_update(&h, &index, sizeof(index));
+   _mesa_blake3_final(&h, k);
+
+   struct mali_shader *s = shader_alloc(dev, stage, k, sizeof(blake3_hash));
+   if (!s) {
+      ralloc_free(nir);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   s->desc = *desc;
+
+   nir_variable_mode robust_modes = 0;
+   if (info->rs->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      robust_modes |= nir_var_mem_ubo;
+   if (info->rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      robust_modes |= nir_var_mem_ssbo;
+   struct pan_compile_inputs inputs = {
+      .arch = pdev->arch,
+      .model = pdev->model,
+      .robust_modes = robust_modes,
+      .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
+   };
+
+   /* What libpoly leaves in variables: into SSA values, with indirectly
+    * indexed arrays as branches. */
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp | nir_var_shader_temp, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+
+   NIR_PASS(_, nir, poly_nir_lower_sysvals);
+   /* libpoly's system values before the backend's passes, whose analyses
+    * do not know them (compile_nir lowers the rest). */
+   struct lower_sysvals_ctx ctx = {.state = info->state};
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_sysvals, nir_metadata_control_flow, &ctx);
+   struct pan_varying_layout varying_layout;
+   if (stage == MESA_SHADER_VERTEX) {
+      s->vs.clip_distances = nir->info.clip_distance_array_size;
+      lower_cull_distance_vs(nir);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      uint64_t written = nir->info.outputs_written;
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, renumber_output, nir_metadata_all, &written);
+      pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
+      pan_build_varying_layout_compact(&varying_layout, nir, inputs.arch);
+      inputs.varying_layout = &varying_layout;
+   }
+   /* No info gather on the compute shaders: the software vertex shader's
+    * load_attr_pan has no offset source, which nir_shader_gather_info
+    * expects of an input load. */
+
+   VkResult result = compile_nir(dev, nir, &inputs, info->state, s);
+   ralloc_free(nir);
+   if (result == VK_SUCCESS)
+      result = shader_upload(dev, s);
+   if (result != VK_SUCCESS) {
+      shader_destroy(dev, s);
+      return result;
+   }
+   *out = s;
+   return VK_SUCCESS;
+}
+
+VkResult
+MALI_PER_ARCH(shader_compile_gs)(struct mali_device *dev,
+                                 const struct mali_shader_compile_info *vs_info,
+                                 const struct mali_shader_compile_info *gs_info,
+                                 const blake3_hash key, struct mali_gs_shaders *out)
+{
+   nir_shader *vs = vs_info->nir, *gs = gs_info->nir;
+   nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+   VkResult result;
+   memset(out, 0, sizeof(*out));
+
+   /* The vertex shader, as a vertex shader would be lowered, then to
+    * compute: its outputs stored to memory, its ids from the grid. */
+   struct mali_shader_desc_info vs_desc = {.driver_table_prefix = MALI_MAX_VS_ATTRIBS};
+   struct mali_shader tmp = {0};
+   tmp.desc = vs_desc;
+   result = lower_nir(dev, vs, vs_info, &tmp, false);
+   if (result != VK_SUCCESS)
+      goto fail;
+   vs_desc = tmp.desc;
+   nir_foreach_shader_in_variable(var, vs)
+      var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
+   nir_assign_io_var_locations(vs, nir_var_shader_out);
+   lower_nir_io(vs);
+   NIR_PASS(_, vs, nir_opt_constant_folding);
+   nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
+   out->vs_outputs = vs->info.outputs_written;
+   NIR_PASS(_, vs, pan_nir_lower_vs_inputs);
+   NIR_PASS(_, vs, poly_nir_lower_vs_before_gs);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
+   guard_invocations(vs, vs_vertices_per_instance);
+   as_compute(dev, vs);
+
+   /* The geometry shader, lowered as a vertex shader would be (descriptors
+    * at the vertex shader's table prefix, so the rasterization shader takes
+    * a vertex shader's table), then by libpoly. */
+   struct mali_shader_desc_info gs_desc = {.driver_table_prefix = MALI_MAX_VS_ATTRIBS};
+   tmp = (struct mali_shader){0};
+   tmp.desc = gs_desc;
+   result = lower_nir(dev, gs, gs_info, &tmp, false);
+   if (result != VK_SUCCESS)
+      goto fail;
+   gs_desc = tmp.desc;
+   nir_assign_io_var_locations(gs, nir_var_shader_in);
+   nir_assign_io_var_locations(gs, nir_var_shader_out);
+   lower_nir_io(gs);
+   NIR_PASS(_, gs, nir_opt_constant_folding);
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   if (!poly_nir_lower_gs(gs, &count, &rast, &pre_gs, &out->info)) {
+      result = vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV, "geometry shader lowering failed");
+      goto fail;
+   }
+   ralloc_free(pre_gs);
+   pre_gs = NULL;
+   guard_invocations(gs, gs_primitives_per_instance);
+   as_compute(dev, gs);
+   if (count) {
+      guard_invocations(count, gs_primitives_per_instance);
+      as_compute(dev, count);
+   }
+   rast->options = MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_VERTEX);
+
+   result = gs_variant(dev, vs_info, key, 0, MESA_SHADER_COMPUTE, vs, &vs_desc, &out->sw_vs);
+   vs = NULL;
+   if (result == VK_SUCCESS)
+      result = gs_variant(dev, gs_info, key, 1, MESA_SHADER_COMPUTE, gs, &gs_desc, &out->main);
+   gs = NULL;
+   if (result == VK_SUCCESS && count)
+      result = gs_variant(dev, gs_info, key, 2, MESA_SHADER_COMPUTE, count, &gs_desc, &out->count);
+   count = NULL;
+   if (result == VK_SUCCESS)
+      result = gs_variant(dev, gs_info, key, 3, MESA_SHADER_VERTEX, rast, &gs_desc, &out->rast);
+   rast = NULL;
+   if (result != VK_SUCCESS)
+      goto fail;
+   return VK_SUCCESS;
+
+fail:
+   ralloc_free(vs);
+   ralloc_free(gs);
+   ralloc_free(count);
+   ralloc_free(rast);
+   ralloc_free(pre_gs);
+   MALI_PER_ARCH(gs_shaders_unref)(dev, out);
+   return result;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Tessellation                                                            */
+
+/*
+ * libpoly's software tessellation (mali_shader.h struct mali_tess_shaders;
+ * the draw is mali_cmd_draw.c draw_tess): the vertex shader as for a
+ * geometry shader; the control shader as a compute shader with a workgroup
+ * per patch and an invocation per output vertex, storing its outputs and
+ * tessellation levels to memory; the tessellator (vk/cl/mali_poly.cl) in
+ * between; and the evaluation shader as the vertex shader of an indexed draw
+ * of the tessellator's output, reading the control shader's outputs and its
+ * domain point from memory by the vertex index.
+ */
+
+/* The vertex shader as a compute shader feeding a later stage
+ * (shader_compile_gs's first part). */
+static VkResult
+sw_vs_lower(struct mali_device *dev, const struct mali_shader_compile_info *info,
+            struct mali_shader_desc_info *desc, uint64_t *outputs)
+{
+   nir_shader *vs = info->nir;
+   struct mali_shader tmp = {0};
+   tmp.desc.driver_table_prefix = MALI_MAX_VS_ATTRIBS;
+   VkResult result = lower_nir(dev, vs, info, &tmp, false);
+   if (result != VK_SUCCESS)
+      return result;
+   *desc = tmp.desc;
+   nir_foreach_shader_in_variable(var, vs)
+      var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
+   nir_assign_io_var_locations(vs, nir_var_shader_out);
+   lower_nir_io(vs);
+   NIR_PASS(_, vs, nir_opt_constant_folding);
+   nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
+   *outputs = vs->info.outputs_written;
+   NIR_PASS(_, vs, pan_nir_lower_vs_inputs);
+   NIR_PASS(_, vs, poly_nir_lower_vs_before_gs);
+   NIR_PASS(_, vs, nir_shader_intrinsics_pass, lower_sw_vs_ids, nir_metadata_control_flow, NULL);
+   guard_invocations(vs, vs_vertices_per_instance);
+   as_compute(dev, vs);
+   return VK_SUCCESS;
+}
+
+/* A control or evaluation shader lowered as a vertex shader would be
+ * (descriptors at the vertex shader's table prefix: each takes a vertex
+ * shader's table), its I/O to intrinsics. */
+static VkResult
+tess_stage_lower(struct mali_device *dev, const struct mali_shader_compile_info *info,
+                 struct mali_shader_desc_info *desc)
+{
+   nir_shader *nir = info->nir;
+   struct mali_shader tmp = {0};
+   tmp.desc.driver_table_prefix = MALI_MAX_VS_ATTRIBS;
+   VkResult result = lower_nir(dev, nir, info, &tmp, false);
+   if (result != VK_SUCCESS)
+      return result;
+   *desc = tmp.desc;
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
+   lower_nir_io(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return VK_SUCCESS;
+}
+
+VkResult
+MALI_PER_ARCH(shader_compile_tess)(struct mali_device *dev,
+                                   const struct mali_shader_compile_info *vs_info,
+                                   const struct mali_shader_compile_info *tcs_info,
+                                   const struct mali_shader_compile_info *tes_info,
+                                   const blake3_hash key, struct mali_tess_shaders *out)
+{
+   nir_shader *vs = vs_info->nir, *tcs = tcs_info->nir, *tes = tes_info->nir;
+   struct mali_shader_desc_info vs_desc, tcs_desc, tes_desc;
+   VkResult result;
+   memset(out, 0, sizeof(*out));
+
+   result = sw_vs_lower(dev, vs_info, &vs_desc, &out->vs_outputs);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   result = tess_stage_lower(dev, tcs_info, &tcs_desc);
+   if (result != VK_SUCCESS)
+      goto fail;
+   out->tcs_output_patch_size = tcs->info.tess.tcs_vertices_out;
+   out->tcs_per_vertex_outputs = poly_tcs_per_vertex_outputs(tcs);
+   out->tcs_patch_outputs = util_last_bit(tcs->info.patch_outputs_written);
+   out->tcs_output_stride = poly_tcs_output_stride(tcs);
+   NIR_PASS(_, tcs, poly_nir_lower_tcs, true);
+   as_compute(dev, tcs);
+   tcs->info.workgroup_size[0] = MAX2(out->tcs_output_patch_size, 1);
+
+   result = tess_stage_lower(dev, tes_info, &tes_desc);
+   if (result != VK_SUCCESS)
+      goto fail;
+   out->mode = tes->info.tess._primitive_mode;
+   out->spacing = tes->info.tess.spacing;
+   out->ccw = tes->info.tess.ccw;
+   out->points = tes->info.tess.point_mode;
+   NIR_PASS(_, tes, poly_nir_lower_tes, true);
+   tes->options = MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_VERTEX);
+
+   result = gs_variant(dev, vs_info, key, 0, MESA_SHADER_COMPUTE, vs, &vs_desc, &out->sw_vs);
+   vs = NULL;
+   if (result == VK_SUCCESS)
+      result = gs_variant(dev, tcs_info, key, 4, MESA_SHADER_COMPUTE, tcs, &tcs_desc, &out->tcs);
+   tcs = NULL;
+   if (result == VK_SUCCESS)
+      result = gs_variant(dev, tes_info, key, 5, MESA_SHADER_VERTEX, tes, &tes_desc, &out->tes);
+   tes = NULL;
+   if (result != VK_SUCCESS)
+      goto fail;
+   return VK_SUCCESS;
+
+fail:
+   ralloc_free(vs);
+   ralloc_free(tcs);
+   ralloc_free(tes);
+   MALI_PER_ARCH(tess_shaders_unref)(dev, out);
+   return result;
+}
+
+void
+MALI_PER_ARCH(tess_shaders_unref)(struct mali_device *dev, struct mali_tess_shaders *t)
+{
+   MALI_PER_ARCH(shader_unref)(dev, t->sw_vs);
+   MALI_PER_ARCH(shader_unref)(dev, t->tcs);
+   MALI_PER_ARCH(shader_unref)(dev, t->tes);
+   t->sw_vs = t->tcs = t->tes = NULL;
+}
+
+void
+MALI_PER_ARCH(gs_shaders_unref)(struct mali_device *dev, struct mali_gs_shaders *gs)
+{
+   MALI_PER_ARCH(shader_unref)(dev, gs->sw_vs);
+   MALI_PER_ARCH(shader_unref)(dev, gs->main);
+   MALI_PER_ARCH(shader_unref)(dev, gs->count);
+   MALI_PER_ARCH(shader_unref)(dev, gs->rast);
+   gs->sw_vs = gs->main = gs->count = gs->rast = NULL;
+}
+#endif /* MALI_WITH_POLY && PAN_ARCH >= 10 */
+
 /* ---------------------------------------------------------------------- */
 /* Pipeline cache                                                          */
 
@@ -2544,6 +3173,10 @@ shader_serialize(struct vk_pipeline_cache_object *object, struct blob *blob)
    blob_write_bytes(blob, &s->desc, sizeof(s->desc));
    if (s->stage == MESA_SHADER_COMPUTE)
       blob_write_bytes(blob, s->cs.local_size, sizeof(s->cs.local_size));
+   else if (s->stage == MESA_SHADER_VERTEX) {
+      blob_write_uint32(blob, s->vs.clip_distances);
+      blob_write_uint32(blob, s->vs.viewport_index);
+   }
    else if (s->stage == MESA_SHADER_FRAGMENT) {
       blob_write_uint32(blob, s->fs.input_attachment_read);
       blob_write_uint32(blob, s->fs.no_atest);
@@ -2616,6 +3249,10 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    blob_copy_bytes(blob, &s->desc, sizeof(s->desc));
    if (stage == MESA_SHADER_COMPUTE)
       blob_copy_bytes(blob, s->cs.local_size, sizeof(s->cs.local_size));
+   else if (stage == MESA_SHADER_VERTEX) {
+      s->vs.clip_distances = blob_read_uint32(blob);
+      s->vs.viewport_index = blob_read_uint32(blob);
+   }
    else if (stage == MESA_SHADER_FRAGMENT) {
       s->fs.input_attachment_read = blob_read_uint32(blob);
       s->fs.no_atest = blob_read_uint32(blob);

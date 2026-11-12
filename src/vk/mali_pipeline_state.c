@@ -843,7 +843,11 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                            attachment_read(fs, dyn->ial.stencil_att) ||
                            (dyn->rasterization_order_access &
                             (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
-            bool roa_color = dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+            /* Rasterization-order access orders a shader's reads of the
+             * colour attachments; one that reads none has nothing to order
+             * and may be killed as usual (as on v7, pack_rsd). */
+            const bool roa_color =
+               (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) && out->rt_read;
 
             cfg.allow_forward_pixel_to_kill =
                fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&

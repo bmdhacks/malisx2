@@ -25,7 +25,7 @@
  * operations that genuinely differ per frontend (whether a submit's work
  * has been reached, noticing a fault before the next event, and sync-file
  * import/export, how a host wait sleeps) are declared below as
- * MALI_PER_ARCH() hooks. This header has the CSF (v10, v11) bodies, defined in
+ * MALI_PER_ARCH() hooks. This header has the CSF (v10, v11, v12) bodies, defined in
  * mali_queue.c, mali_sync_file.c and inline below; the v9 (JM) bodies are
  * in mali_jm.h, mali_jm_queue.c and mali_jm_sync_file.c.
  */
@@ -169,7 +169,7 @@ mali_queue_done_va(const struct mali_csf_queue *q, unsigned sq)
 
 /*
  * The CSF back half's device and queue setup and its submit, one copy per
- * command-stream arch (mali_v10_*, mali_v11_*; mali_arch.h). Per-arch code
+ * command-stream arch (mali_v10_*, mali_v11_*, mali_v12_*; mali_arch.h). Per-arch code
  * names them without the prefix; code built once picks one with
  * mali_csf_arch_dispatch.
  */

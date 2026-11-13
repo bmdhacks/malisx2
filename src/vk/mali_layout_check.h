@@ -6,12 +6,13 @@
 /*
  * Link-time layout checks between builds of the same structure.
  *
- * The command-stream back half is compiled twice (PAN_ARCH 10 and 11), and
- * code built once without a PAN_ARCH hands it the same objects. A struct
- * that came out different in two of those builds would be read at the
- * wrong offsets, silently. To catch that when the driver is linked, one
- * build defines a symbol whose name carries the value (a size or an
- * offset) and the other refers to the symbol named after its own value:
+ * The command-stream back half is compiled three times (PAN_ARCH 10, 11
+ * and 12), and code built once without a PAN_ARCH hands it the same
+ * objects. A struct that came out different in two of those builds would
+ * be read at the wrong offsets, silently. To catch that when the driver is
+ * linked, one build defines a symbol whose name carries the value (a size
+ * or an offset) and the others refer to the symbol named after their own
+ * value:
  *
  *    MALI_LAYOUT_DEFINE(cmd_buffer_size, sizeof(struct mali_cmd_buffer));
  *    MALI_LAYOUT_EXPECT(cmd_buffer_size, sizeof(struct mali_cmd_buffer));

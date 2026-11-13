@@ -84,7 +84,7 @@ mali_wsi_arch_no_afbc_usage(unsigned arch, const char *property_value)
 {
    bool fallback;
    const uint64_t bits = mali_wsi_no_afbc_usage(property_value, &fallback);
-   return fallback && arch == 11 ? 0x0200000000000000ull : bits;
+   return fallback && (arch == 11 || arch == 12) ? 0x0200000000000000ull : bits;
 }
 
 #ifndef VK_USE_PLATFORM_ANDROID_KHR
@@ -663,7 +663,7 @@ mali_wsi_release(struct mali_queue *queue, uint32_t count, const VkSemaphore *se
 /* Release (per architecture: see the file comment)                        */
 
 /* How many uint64_t slots a mali_sync's req[] holds here: the done value
- * per CSF subqueue on v10 and v11, the submission number and tracker atom on v7
+ * per CSF subqueue on v10, v11 and v12, the submission number and tracker atom on v7
  * and v9 (mali_jm.h's MALI_SYNC_REQ_COUNT). Local to this function: the
  * rest of the file never looks inside a mali_sync. */
 #if PAN_ARCH < 10

@@ -2227,12 +2227,17 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
    }
 
    /* Vertex: position for points, position for everything else (the
-    * point-size write patched out), then the varying shader. */
+    * point-size write patched out), then the varying shader. v12 compiles
+    * position and varyings into one program (IDVS2, panvk's all_points and
+    * all_triangles), so both slots are that program and there is no
+    * varying shader. */
    const uint64_t pos_offsets[2] = { 0, s->info.vs.no_psiz_offset };
    for (unsigned i = 0; i < 2; i++) {
       pan_pack(&spds[i], SHADER_PROGRAM, cfg) {
          cfg.stage = MALI_SHADER_STAGE_VERTEX;
+#if PAN_ARCH < 12
          cfg.vertex_warp_limit = MALI_WARP_LIMIT_HALF;
+#endif
          cfg.register_allocation = register_allocation(s->info.work_reg_count);
          cfg.binary = code + pos_offsets[i];
          cfg.preload.r48_r63 = s->info.preload >> 48;
@@ -2241,6 +2246,7 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
       s->spd[MALI_SPD_POS_POINTS + i] = s->spd_mem.gpu_va + i * MALI_SPD_SIZE;
    }
 
+#if PAN_ARCH < 12
    if (s->info.vs.secondary_enable) {
       pan_pack(&spds[2], SHADER_PROGRAM, cfg) {
          cfg.stage = MALI_SHADER_STAGE_VERTEX;
@@ -2253,6 +2259,7 @@ shader_upload(struct mali_device *dev, struct mali_shader *s)
       }
       s->spd[MALI_SPD_VARYING] = s->spd_mem.gpu_va + 2 * MALI_SPD_SIZE;
    }
+#endif
 
    return VK_SUCCESS;
 #endif /* PAN_ARCH >= 9 */

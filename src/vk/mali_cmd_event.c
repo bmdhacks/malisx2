@@ -4,7 +4,7 @@
  */
 
 /*
- * VkEvent commands on the command-stream frontend (v10, v11): vkCmdSetEvent2,
+ * VkEvent commands on the command-stream frontend (v10, v11, v12): vkCmdSetEvent2,
  * vkCmdResetEvent2, vkCmdWaitEvents2. The Vulkan 1.0 vkCmdSetEvent,
  * vkCmdResetEvent and vkCmdWaitEvents are Mesa's, which call these; an
  * application that enables synchronization2 names the "2" forms itself. The

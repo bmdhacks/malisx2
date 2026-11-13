@@ -41,7 +41,7 @@
 #include "mali_queue.h"
 
 #if PAN_ARCH < 10
-#error "mali_cmd_draw.c is written for the command-stream archs (v10, v11)"
+#error "mali_cmd_draw.c is written for the command-stream archs (v10, v11, v12)"
 #endif
 
 #include "mali_cmd_draw.h"
@@ -219,7 +219,7 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
                           MALI_GFX_DIRTY_PASS;
    /* The scissor, tiler flags and tiler context registers changed behind
     * the draws' record of them. */
-   cmd->gfx.draw.regs_valid = 0;
+   BITSET_ZERO(cmd->gfx.draw.regs_valid);
 }
 
 /* A primitive barrier over the whole framebuffer: later fragments of the

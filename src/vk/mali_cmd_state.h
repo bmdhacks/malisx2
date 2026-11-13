@@ -71,6 +71,9 @@
 #include "mali_image.h"
 #include "mali_pipeline.h"
 #include "mali_vk.h"
+#if PAN_ARCH >= 10
+#include "mali_queue.h"
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* Compute                                                                 */
@@ -153,9 +156,14 @@ mali_compute_task_axis(const struct mali_thread_props *tp, const struct mali_sha
    const unsigned wgs_per_core = (unsigned)MIN2(DIV_ROUND_UP(total, tp->core_count), UINT32_MAX);
    unsigned wgs_per_task = CLAMP(threads_per_task / threads_per_wg, 1, wgs_per_core);
 
+   /* Not split along an axis of one workgroup: on the vertex/tiler
+    * stream a job split along X with a grid of 1 x N runs its N rows one
+    * after the other (the software vertex shader of an instanced geometry
+    * or tessellation draw took 125 us for 64 instances, 20 us split along
+    * Y). */
    *inc = wgs_per_task;
    for (unsigned i = 0; i < 2; i++) {
-      if (*inc <= groups[i])
+      if (*inc <= groups[i] && groups[i] > 1)
          break;
       (*axis)++;
       *inc /= groups[i];
@@ -332,10 +340,15 @@ mali_cmd_tls_size_field(const struct mali_cmd_buffer *cmd)
  * count is not known yet: its WLS gets as many instances as the cores can
  * hold at once (as panvk's pan_calc_wls_instances), which is also the most
  * any dispatch gets, so the buffer is sized by the hardware's thread
- * limits and the shader, not by a workgroup count. */
+ * limits and the shader, not by a workgroup count.
+ *
+ * Each dispatch has its own WLS range, as dispatches may run at the same
+ * time. On CSF a full slab is used again from the start once the stream has
+ * waited for its jobs; vt is a dispatch on the vertex/tiler stream, which
+ * waits for each job (cmd_vt_dispatch). */
 static inline uint64_t
-mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
-                 const struct mali_thread_props *tp, const uint32_t groups[3])
+mali_compute_tsd_in(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                    const struct mali_thread_props *tp, const uint32_t groups[3], bool vt)
 {
    struct mali_device *dev = cmd->dev;
    uint64_t tls_ptr = 0, wls_ptr = 0;
@@ -360,24 +373,56 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                           util_next_power_of_two(groups[2]);
       wls_instances = MIN2(dispatch, max_per_core);
       wls_size = util_next_power_of_two(MAX2(cs->info.wls_size, 128));
-      uint64_t total = (uint64_t)wls_size * wls_instances * tp->core_id_range;
+      uint64_t total = ALIGN_POT((uint64_t)wls_size * wls_instances * tp->core_id_range, 4096);
 
       /* 4 KiB aligned and inside one 4 GiB window (the descriptor's
-       * requirement): its own allocation, kept in one 4 GiB page. */
-      struct mali_cmd_slab *s = calloc(1, sizeof(*s));
-      const struct mali_kbase_alloc_info ai = {
-         .size = total,
-         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS |
-                                                KB_MEM_GPU_VA_SAME_4GB_PAGE),
-         .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
-      };
-      if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
-         free(s);
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return 0;
+       * requirement): carved from a slab kept in one 4 GiB page, each
+       * dispatch its own range as they may run at the same time. */
+#if PAN_ARCH >= 10
+      struct mali_wls_state *w = vt ? &cmd->wls_vt : &cmd->wls;
+      if (w->used + total > w->size && total <= w->size) {
+         cs_wait_slots(mali_cmd_cs(cmd, vt ? MALI_SUBQUEUE_VERTEX_TILER : MALI_SUBQUEUE_COMPUTE),
+                       dev->csf->sb.all_iters_mask);
+         w->used = 0;
       }
-      list_addtail(&s->link, &cmd->slabs);
-      wls_ptr = s->bo.gpu_va;
+#else
+      struct mali_wls_state *w = &cmd->wls;
+      (void)vt;
+#endif
+      if (w->used + total > w->size) {
+         const bool std = total <= MALI_WLS_SLAB_SIZE;
+         struct mali_cmd_slab *s = NULL;
+         if (std) {
+            simple_mtx_lock(&dev->slab_lock);
+            if (!list_is_empty(&dev->free_wls_slabs)) {
+               s = list_first_entry(&dev->free_wls_slabs, struct mali_cmd_slab, link);
+               list_del(&s->link);
+               dev->free_wls_slab_count--;
+            }
+            simple_mtx_unlock(&dev->slab_lock);
+         }
+         if (!s) {
+            s = calloc(1, sizeof(*s));
+            const struct mali_kbase_alloc_info ai = {
+               .size = std ? MALI_WLS_SLAB_SIZE : total,
+               .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_TLS |
+                                                      KB_MEM_GPU_VA_SAME_4GB_PAGE),
+               .mem_class = MALI_KBASE_MEM_CLASS_INTERNAL_TLS,
+            };
+            if (!s || mali_kbase_alloc(dev->kbase, &ai, &s->bo) != MALI_KBASE_SUCCESS) {
+               free(s);
+               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+               return 0;
+            }
+            s->wls = std;
+         }
+         list_addtail(&s->link, &cmd->slabs);
+         w->gpu = s->bo.gpu_va;
+         w->size = s->bo.size;
+         w->used = 0;
+      }
+      wls_ptr = w->gpu + w->used;
+      w->used += total;
    }
 
    struct mali_ptr p = mali_cmd_alloc(cmd, pan_size(LOCAL_STORAGE), 64);
@@ -408,6 +453,13 @@ mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    return p.gpu;
 }
 
+static inline uint64_t
+mali_compute_tsd(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                 const struct mali_thread_props *tp, const uint32_t groups[3])
+{
+   return mali_compute_tsd_in(cmd, cs, tp, groups, false);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Graphics: FAU (the block itself is mali_cmd_gfx_fau, in mali_cmd_state.c) */
 
@@ -425,7 +477,7 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
    /* Viewport transform (the vertex shader applies it): scale (w/2, h/2,
     * zmax - zmin), offset (x + w/2, y + h/2, zmin). */
-   const VkViewport *vp = &dyn->vp.viewports[0];
+   const VkViewport *vp = &dyn->vp.viewports[d->vp_pass];
    sv->viewport[0].scale = 0.5f * vp->width;
    sv->viewport[1].scale = 0.5f * vp->height;
    sv->viewport[2].scale = vp->maxDepth - vp->minDepth;
@@ -436,6 +488,12 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
    sv->vs.noperspective_varyings = p->bind.noperspective;
+   sv->vs.viewport_pass = d->vp_pass;
+   sv->vs.provoking_last =
+      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+   sv->poly.vertex_params = d->poly_vertex_params;
+   sv->poly.geometry_params = d->poly_geometry_params;
+   sv->poly.tess_params = d->poly_tess_params;
 #if PAN_ARCH >= 9
    /* On v7 these words are v7_desc.sets, which the v7 draw fills: BLEND
     * reads the Blend descriptors from the blend FAU slots (mali_shader.h). */
@@ -672,10 +730,9 @@ mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
  * (mali_gfx_pack_vs_drv). 0 on failure. *drv (when not NULL): table 0's
  * address, where attribute i's descriptor is the i-th. */
 static inline uint64_t
-mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+mali_gfx_shader_vs_srt(struct mali_cmd_buffer *cmd, const struct mali_shader *vs, uint64_t *drv)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
-   const struct mali_shader *vs = d->pipeline->vs;
    const struct vk_vertex_input_state *vi = d->vi;
    uint32_t vb_offset, vb_count;
    const uint32_t count = mali_gfx_vs_drv_count(vs, vi, &vb_offset, &vb_count);
@@ -686,6 +743,14 @@ mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
    if (drv)
       *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+/* The same for a shader that takes a vertex shader's table (a geometry
+ * shader's compute shaders, mali_cmd_draw.c). */
+static inline uint64_t
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+{
+   return mali_gfx_shader_vs_srt(cmd, cmd->gfx.draw.pipeline->vs, drv);
 }
 
 static inline uint64_t
@@ -722,7 +787,9 @@ mali_gfx_pack_varying_descs(const struct mali_shader *vs, const struct mali_shad
          cfg.table = 61;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
          cfg.offset = 1024 + offset;
-         cfg.buffer_index = 0;
+         /* v12 puts the hardware's varying buffer at index 1 (panvk
+          * emit_varying_descs). */
+         cfg.buffer_index = PAN_ARCH >= 12 ? 1 : 0;
          cfg.attribute_stride = vl->generic_size_B;
          cfg.packet_stride = vl->generic_size_B + 16;
       }
@@ -1011,8 +1078,9 @@ mali_gfx_scissor_rect(const struct mali_cmd_buffer *cmd, int *minx_out, int *min
                       int *maxx_out, int *maxy_out)
 {
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   const VkViewport *vp = &dyn->vp.viewports[0];
-   const VkRect2D *sc = &dyn->vp.scissors[0];
+   const uint32_t pass = cmd->gfx.draw.vp_pass;
+   const VkViewport *vp = &dyn->vp.viewports[pass];
+   const VkRect2D *sc = &dyn->vp.scissors[pass];
 
    int minx = (int)vp->x;
    int maxx = (int)(vp->x + vp->width);
@@ -1064,6 +1132,37 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
    return mali_gfx_pack_scissor(minx, miny, maxx, maxy);
 }
 
+#endif
+
+#if PAN_ARCH >= 12
+/*
+ * The packed Viewport (128 bits) of viewport 0, for the VIEWPORT_HIGH and
+ * VIEWPORT_LOW staging registers (panvk v12 prepare_vp): the rectangle as
+ * inclusive bounds, and the depth range the v11 LOW/HIGH_DEPTH_CLAMP
+ * registers held.
+ */
+static inline void
+mali_gfx_viewport(const struct mali_cmd_buffer *cmd, uint64_t words[2])
+{
+   const VkViewport *vp = &cmd->vk.dynamic_graphics_state.vp.viewports[cmd->gfx.draw.vp_pass];
+   int minx = (int)vp->x;
+   int maxx = (int)(vp->x + vp->width);
+   int miny = (int)MIN2(vp->y, vp->y + vp->height);
+   int maxy = (int)MAX2(vp->y, vp->y + vp->height);
+   maxx = maxx > minx ? maxx - 1 : maxx;
+   maxy = maxy > miny ? maxy - 1 : maxy;
+
+   struct mali_viewport_packed v;
+   pan_pack(&v, VIEWPORT, cfg) {
+      cfg.min_x = CLAMP(minx, 0, UINT16_MAX);
+      cfg.min_y = CLAMP(miny, 0, UINT16_MAX);
+      cfg.max_x = CLAMP(maxx, 0, UINT16_MAX);
+      cfg.max_y = CLAMP(maxy, 0, UINT16_MAX);
+      cfg.min_depth = MIN2(vp->minDepth, vp->maxDepth);
+      cfg.max_depth = MAX2(vp->minDepth, vp->maxDepth);
+   }
+   memcpy(words, &v, 2 * sizeof(uint64_t));
+}
 #endif
 
 static inline enum mali_index_type
@@ -1235,6 +1334,15 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .vs = p->vs,
             .fs = p->fs,
             .view_mask = p->state.rp.view_mask,
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+            .has_gs = p->gs != NULL,
+            .gs_prim = p->gs ? p->gs->info.mode : 0,
+            .has_tess = p->tess != NULL,
+            .tess_prim = !p->tess              ? 0
+                         : p->tess->points     ? MESA_PRIM_POINTS
+                         : p->tess->mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                                                   : MESA_PRIM_TRIANGLES,
+#endif
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

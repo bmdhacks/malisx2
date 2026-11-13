@@ -25,6 +25,8 @@
 #define MALI_PER_ARCH(name) mali_v10_##name
 #elif PAN_ARCH == 11
 #define MALI_PER_ARCH(name) mali_v11_##name
+#elif PAN_ARCH == 12
+#define MALI_PER_ARCH(name) mali_v12_##name
 #else
 #error "no per-arch naming for this PAN_ARCH"
 #endif
@@ -87,10 +89,10 @@
 #endif
 
 /*
- * The command-stream (CSF) back half is built at PAN_ARCH 10 and 11 into
- * one driver too, so its own functions (mali_cmd_buffer.h, mali_queue.h,
- * the CSF section of mali_measure.h) get the arch's prefix as well:
- * mali_v10_* and mali_v11_*. Code built once calls them through
+ * The command-stream (CSF) back half is built at PAN_ARCH 10, 11 and 12
+ * into one driver too, so its own functions (mali_cmd_buffer.h,
+ * mali_queue.h, the CSF section of mali_measure.h) get the arch's prefix as
+ * well: mali_v10_*, mali_v11_* and mali_v12_*. Code built once calls them through
  * mali_csf_arch_dispatch.
  */
 #if defined(PAN_ARCH) && PAN_ARCH >= 10 && !defined(MALI_CSF_NAMES)
@@ -130,7 +132,8 @@
  * Declares every arch's variant of a per-arch function:
  *    MALI_PER_ARCH_DECL(void, pack_dummy_sampler, (void *out));
  * declares mali_v7_pack_dummy_sampler, mali_v9_pack_dummy_sampler,
- * mali_v10_pack_dummy_sampler and mali_v11_pack_dummy_sampler.
+ * mali_v10_pack_dummy_sampler, mali_v11_pack_dummy_sampler and
+ * mali_v12_pack_dummy_sampler.
  * Per-arch code calls its own with MALI_PER_ARCH(name)(...), code compiled
  * once picks one with mali_arch_dispatch.
  */
@@ -138,13 +141,15 @@
    ret mali_v7_##name params;                                                  \
    ret mali_v9_##name params;                                                  \
    ret mali_v10_##name params;                                                 \
-   ret mali_v11_##name params
+   ret mali_v11_##name params;                                                 \
+   ret mali_v12_##name params
 
 /* The same for a function of the command-stream back half, which is built
- * at PAN_ARCH 10 and 11 only. */
+ * at PAN_ARCH 10, 11 and 12 only. */
 #define MALI_PER_CSF_ARCH_DECL(ret, name, params)                              \
    ret mali_v10_##name params;                                                 \
-   ret mali_v11_##name params
+   ret mali_v11_##name params;                                                 \
+   ret mali_v12_##name params
 
 /* The same for a function of the job-manager back half, which is built at
  * PAN_ARCH 7 and 9 only. */
@@ -163,12 +168,15 @@
    ((arch) == 7 ? mali_v7_##name(__VA_ARGS__)                                  \
     : (arch) == 9 ? mali_v9_##name(__VA_ARGS__)                                \
     : (arch) == 10 ? mali_v10_##name(__VA_ARGS__)                              \
+    : (arch) == 12 ? mali_v12_##name(__VA_ARGS__)                              \
     : mali_v11_##name(__VA_ARGS__))
 
-/* The same for the command-stream back half's own functions (arch 10 or
- * 11). */
+/* The same for the command-stream back half's own functions (arch 10, 11
+ * or 12). */
 #define mali_csf_arch_dispatch(arch, name, ...)                                \
-   ((arch) == 10 ? mali_v10_##name(__VA_ARGS__) : mali_v11_##name(__VA_ARGS__))
+   ((arch) == 10   ? mali_v10_##name(__VA_ARGS__)                              \
+    : (arch) == 12 ? mali_v12_##name(__VA_ARGS__)                              \
+                   : mali_v11_##name(__VA_ARGS__))
 
 /* The same for the job-manager back half's own functions (arch 7 or 9). */
 #define mali_jm_arch_dispatch(arch, name, ...)                                 \
@@ -178,6 +186,6 @@
 #define mali_arch_is_jm(arch) ((arch) == 7 || (arch) == 9)
 
 /* Whether a device of this arch runs on the command-stream back half. */
-#define mali_arch_is_csf(arch) ((arch) == 10 || (arch) == 11)
+#define mali_arch_is_csf(arch) ((arch) == 10 || (arch) == 11 || (arch) == 12)
 
 #endif

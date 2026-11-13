@@ -86,17 +86,18 @@ EXCLUDE_FILES = {
 # The job-manager back half (mali_jm*) is built at 7 and 9, except its
 # draws: mali_jm_cmd_draw.c at 9 and mali_jm_cmd_draw_v7.c at 7. The
 # v7-only sources are named *_v7.c and *_v7.h. Shaders take their
-# descriptor lowering from mali_nir_lower_descriptors.c on 9, 10 and 11
-# and from mali_nir_lower_descriptors_v7.c on 7 (mali_shader.c). Each
+# descriptor lowering from mali_nir_lower_descriptors.c on 9, 10, 11
+# and 12 and from mali_nir_lower_descriptors_v7.c on 7 (mali_shader.c). Each
 # arch's genxml only reaches its own build.
 ARCH_ONLY = [
     (lambda rel: rel.startswith('src/vk/mali_jm'), {7, 9}),
     (lambda rel: rel == 'src/vk/mali_jm_cmd_draw.c', {9}),
-    (lambda rel: rel == 'src/vk/mali_nir_lower_descriptors.c', {9, 10, 11}),
-    (lambda rel: rel == 'src/vk/mali_event.h', {10, 11}),
+    (lambda rel: rel == 'src/vk/mali_nir_lower_descriptors.c', {9, 10, 11, 12}),
+    (lambda rel: rel == 'src/vk/mali_event.h', {10, 11, 12}),
     (lambda rel: rel == 'mesa/src/panfrost/genxml/v9.xml', {9}),
     (lambda rel: rel == 'mesa/src/panfrost/genxml/v10.xml', {10}),
     (lambda rel: rel == 'mesa/src/panfrost/genxml/v11.xml', {11}),
+    (lambda rel: rel == 'mesa/src/panfrost/genxml/v12.xml', {12}),
     (lambda rel: (rel == 'mesa/src/panfrost/genxml/v7.xml' or
                   rel.endswith(('_v7.c', '_v7.h'))), {7}),
 ]

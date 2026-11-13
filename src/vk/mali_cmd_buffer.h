@@ -164,6 +164,10 @@ struct mali_cmd_buffer {
       uint64_t gpu;
    } tls;
 
+   /* WLS of the compute stream's dispatches and of the vertex/tiler
+    * stream's (cmd_vt_dispatch). */
+   struct mali_wls_state wls, wls_vt;
+
    /* RUN_COMPUTEs, RUN_IDVSs and render passes recorded (tests,
     * statistics). */
    uint32_t dispatches;
@@ -251,6 +255,8 @@ mali_cmd_defer_iter(const struct mali_cmd_buffer *cmd, enum mali_subqueue sq, un
  * in bytes. False when the stream is empty. */
 bool mali_cmd_buffer_span(struct mali_cmd_buffer *cmd, unsigned sq,
                           uint64_t *addr, uint32_t *size);
+MALI_PER_CSF_ARCH_DECL(bool, cmd_buffer_span, (struct mali_cmd_buffer *cmd, unsigned sq,
+                          uint64_t *addr, uint32_t *size));
 
 /* Bit i: subqueue i has recorded work. */
 uint32_t mali_cmd_buffer_subqueue_mask(struct mali_cmd_buffer *cmd);
@@ -295,6 +301,17 @@ void mali_cmd_emit_barrier(struct mali_cmd_buffer *cmd, const struct mali_cs_dep
 /* Emits the fragment stream's put-off barrier wait and flush, if any.
  * Called before a fragment job and at the end of the command buffer. */
 void mali_cmd_frag_flush_pending(struct mali_cmd_buffer *cmd);
+
+/* An internal compute job on the vertex/tiler stream, waited for before
+ * the stream goes on (mali_cmd_dispatch.c). */
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch_shader,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                        const void *push, uint32_t push_size, const uint32_t groups[3]));
+MALI_PER_CSF_ARCH_DECL(void, cmd_draw_indexed_indirect_one,
+                       (struct mali_cmd_buffer *cmd, uint64_t params));
+MALI_PER_CSF_ARCH_DECL(void, cmd_vt_dispatch,
+                       (struct mali_cmd_buffer *cmd, const struct mali_shader *cs, uint64_t srt,
+                        uint64_t fau, const uint32_t groups[3]));
 
 /* Compute dispatch (mali_cmd_dispatch.c) and the internal copy shaders
  * (mali_cmd_copy.c): mali_cmd_gfx.h, shared with the job-manager back

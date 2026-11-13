@@ -41,7 +41,7 @@
 #include "mali_queue.h"
 
 #if PAN_ARCH < 10
-#error "mali_cmd_draw.c is written for the command-stream archs (v10, v11)"
+#error "mali_cmd_draw.c is written for the command-stream archs (v10, v11, v12)"
 #endif
 
 #include "mali_cmd_draw.h"
@@ -53,7 +53,7 @@ bool mali_idvs_bit55 = true;
 #endif
 
 static void
-draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+draw_pass(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    struct mali_render_state *r = &cmd->gfx.render;
@@ -114,19 +114,592 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       for (uint32_t i = 0; i < r->td_count; i++) {
          if (i)
             cs_add_imm64(b, ctx, ctx, pan_size(TILER_CONTEXT));
-         emit_run_idvs(b, ovr.opaque[0]);
+         emit_run_idvs(b, ovr.opaque[0], -1);
       }
       cs_move64_to(b, ctx, r->tiler);
    } else {
       b->req_resource_mask |= CS_IDVS_RES;
       assert(e.n < ARRAY_SIZE(e.ins));
-      e.ins[e.n++] = run_idvs_ins(ovr.opaque[0]);
+      e.ins[e.n++] = run_idvs_ins(ovr.opaque[0], -1);
       batch_flush(b, &e);
    }
    r->draws++;
    cmd->draws++;
    if (unlikely(mh))
       mali_measure_end(cmd, mh);
+}
+
+static void
+draw_viewports(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   const uint32_t passes = viewport_passes(cmd);
+   if (likely(passes == 1)) {
+      draw_pass(cmd, di);
+      return;
+   }
+   for (uint32_t i = 0; i < passes; i++) {
+      viewport_pass_begin(cmd, i);
+      draw_pass(cmd, di);
+   }
+   viewport_pass_begin(cmd, 0);
+}
+
+/*
+ * Polygon mode line: the triangles' edges as a line list (the pipeline's
+ * tiler flags draw lines, mali_pipeline_state.c polygon_prim). A compute
+ * job on the vertex/tiler stream writes six indices per triangle, from the
+ * bound index buffer or the vertex positions, and the draw is an indexed
+ * one of those. The topology is a triangle list, strip or fan; a strip's
+ * restart is honoured per triangle only.
+ */
+static enum mesa_prim
+polygon_lines_topology(const struct mali_cmd_buffer *cmd)
+{
+   /* The polygon mode is never dynamic here (no extended dynamic state 3);
+    * the topology may be. */
+   const struct mali_graphics_pipeline *p = cmd->gfx.draw.pipeline;
+   if (!p || p->state.rs.polygon_mode != VK_POLYGON_MODE_LINE)
+      return MESA_PRIM_COUNT;
+   const VkPrimitiveTopology topology =
+      BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)
+         ? cmd->vk.dynamic_graphics_state.ia.primitive_topology
+         : p->state.ia.primitive_topology;
+   const enum mesa_prim prim = vk_topology_to_mesa(topology);
+   return prim == MESA_PRIM_TRIANGLES || prim == MESA_PRIM_TRIANGLE_STRIP ||
+                prim == MESA_PRIM_TRIANGLE_FAN
+             ? prim
+             : MESA_PRIM_COUNT;
+}
+
+static void
+draw_polygon_lines(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
+                   enum mesa_prim topology)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const uint32_t tris = topology == MESA_PRIM_TRIANGLES ? di->count / 3
+                         : di->count >= 3                 ? di->count - 2
+                                                          : 0;
+   if (!tris || !di->instance_count)
+      return;
+   const struct mali_shader *s = MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_POLYGON_LINES);
+   struct mali_ptr dst = mali_cmd_alloc(cmd, (uint64_t)tris * 24, 64);
+   if (!s || !dst.cpu)
+      return;
+
+   const uint32_t isz = di->indexed ? d->ib.index_size : 4;
+   const uint32_t restart = di->indexed && dyn->ia.primitive_restart_enable
+                               ? (uint32_t)BITFIELD64_MASK(isz * 8)
+                               : 0;
+   const struct mali_meta_lines_push push = {
+      .src = di->indexed ? d->ib.addr : 0,
+      .dst = dst.gpu,
+      .count = tris,
+      .first = di->indexed ? di->first_index : (uint32_t)di->vertex_offset,
+      .index_size = isz,
+      .mode = topology,
+      .restart = restart,
+   };
+   const uint32_t groups[3] = {DIV_ROUND_UP(tris, 64), 1, 1};
+   MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, s, &push, sizeof(push), groups);
+
+   struct mali_draw_info ld = *di;
+   ld.count = tris * 6;
+   ld.indexed = true;
+   ld.first_index = 0;
+   ld.vertex_offset = di->indexed ? di->vertex_offset : 0;
+   const __typeof__(d->ib) ib = d->ib;
+   d->ib.addr = dst.gpu;
+   d->ib.size = tris * 24;
+   d->ib.index_size = 4;
+   d->dirty |= MALI_GFX_DIRTY_INDEX;
+   draw_viewports(cmd, &ld);
+   d->ib = ib;
+   d->dirty |= MALI_GFX_DIRTY_INDEX;
+}
+
+#if MALI_WITH_POLY
+#include "poly/tessellator.h"
+#include "mali_tess_pattern.h"
+#include "mali_pipeline.h"
+
+/* The draw's topology: the pipeline's, or the command buffer's when it is
+ * dynamic. */
+static enum mesa_prim
+draw_topology(const struct mali_cmd_buffer *cmd)
+{
+   const struct mali_graphics_pipeline *p = cmd->gfx.draw.pipeline;
+   const VkPrimitiveTopology t = BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY)
+                                    ? cmd->vk.dynamic_graphics_state.ia.primitive_topology
+                                    : p->state.ia.primitive_topology;
+   return vk_topology_to_mesa(t);
+}
+
+static uint64_t
+upload(struct mali_cmd_buffer *cmd, const void *data, size_t size)
+{
+   struct mali_ptr p = mali_cmd_alloc(cmd, size, 64);
+   if (!p.cpu)
+      return 0;
+   memcpy(p.cpu, data, size);
+   return p.gpu;
+}
+
+/*
+ * A draw with a geometry shader (mali_shader.c, "Geometry shaders"): the
+ * vertex shader and the geometry shader run as compute jobs on this
+ * stream, then the draw of the geometry shader's primitives. Direct draws.
+ */
+static void
+draw_gs(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_gs_shaders *g = d->pipeline->gs;
+   const struct poly_gs_info *info = &g->info;
+   const enum mesa_prim prim = draw_topology(cmd);
+   const uint32_t verts = di->count, inst = di->instance_count;
+   const uint32_t prims = u_decomposed_prims_for_vertices(prim, verts);
+   if (!prims || !inst)
+      return;
+
+   /* The vertex shader's outputs: a vec4 per output written, per vertex
+    * and instance (poly_vertex_output_address). */
+   const uint32_t outputs = util_bitcount64(g->vs_outputs);
+   struct mali_ptr vout = mali_cmd_alloc(cmd, MAX2((uint64_t)verts * inst * outputs * 16, 16), 64);
+   if (!vout.cpu)
+      return;
+
+   const uint32_t wg[3] = {64, 1, 1};
+   struct poly_vertex_params vp;
+   poly_vertex_params_init(&vp, g->vs_outputs, wg);
+   poly_vertex_params_set_draw(&vp, verts, inst);
+   vp.output_buffer = vout.gpu;
+   if (di->indexed) {
+      const uint32_t isz = d->ib.index_size;
+      vp.index_buffer = d->ib.addr + (uint64_t)di->first_index * isz;
+      vp.index_size_B = isz;
+      vp.index_buffer_range_el = poly_index_buffer_range_el(d->ib.size / isz, di->first_index);
+   }
+
+   struct poly_geometry_params gp;
+   poly_geometry_params_init(&gp, prim, wg);
+   poly_geometry_params_set_draw(&gp, prim, info->shape, info->max_indices, verts, inst);
+   gp.count_buffer_stride = info->count_words * 4;
+   if (gp.count_buffer_stride) {
+      struct mali_ptr c = mali_cmd_alloc(cmd, 16, 16);
+      if (!c.cpu)
+         return;
+      memset(c.cpu, 0, 16);
+      gp.count_buffer = c.gpu;
+   }
+   for (unsigned i = 0; i < POLY_MAX_SO_BUFFERS; i++)
+      gp.xfb_offs_ptrs[i] = gp.xfb_base_original[i] = PAN_SHADER_OOB_ADDRESS;
+   for (unsigned i = 0; i < POLY_MAX_VERTEX_STREAMS; i++)
+      gp.xfb_prims_generated_counter[i] = gp.prims_generated_counter[i] =
+         gp.xfb_overflow[i] = PAN_SHADER_OOB_ADDRESS;
+   gp.xfb_any_overflow = PAN_SHADER_OOB_ADDRESS;
+
+   if (g->fused_slots) {
+      /* One draw (mali_shader.c fused_gs_rast): a list of fused_slots
+       * vertices per input primitive, for each instance. */
+      d->poly_vertex_params = upload(cmd, &vp, sizeof(vp));
+      d->poly_geometry_params = upload(cmd, &gp, sizeof(gp));
+      if (!d->poly_vertex_params || !d->poly_geometry_params)
+         return;
+      d->first_vertex = di->vertex_offset;
+      d->base_instance = di->first_instance;
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT;
+      const struct mali_draw_info ld = {
+         .count = prims * g->fused_slots,
+         .instance_count = inst,
+      };
+      draw_viewports(cmd, &ld);
+      return;
+   }
+
+   uint64_t ib = 0;
+   uint32_t ib_size = 0, isz = 0;
+   if (info->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      struct mali_ptr i = mali_cmd_alloc(cmd, (uint64_t)gp.draw.index_count * 4, 64);
+      if (!i.cpu)
+         return;
+      gp.output_index_buffer = i.gpu;
+      ib = i.gpu;
+      ib_size = gp.draw.index_count * 4;
+      isz = 4;
+   } else if (info->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
+      ib = upload(cmd, info->topology, info->max_indices);
+      ib_size = info->max_indices;
+      isz = 1;
+   }
+
+   d->poly_vertex_params = upload(cmd, &vp, sizeof(vp));
+   d->poly_geometry_params = upload(cmd, &gp, sizeof(gp));
+   if (!d->poly_vertex_params || !d->poly_geometry_params || (isz && !ib))
+      return;
+
+   /* The vertex shader over (vertices, instances), then the geometry
+    * shader over (primitives, instances), with this draw's base vertex and
+    * instance (the rasterization draw's are 0). */
+   d->first_vertex = di->vertex_offset;
+   d->base_instance = di->first_instance;
+   struct mali_graphics_sysvals sv;
+   mali_gfx_fill_sysvals(cmd, &sv);
+   const uint64_t vs_fau = MALI_PER_ARCH(cmd_gfx_fau)(cmd, g->sw_vs, &sv, cmd->push_constants,
+                                                       sizeof(cmd->push_constants));
+   const uint64_t vs_srt = mali_gfx_shader_vs_srt(cmd, g->sw_vs, NULL);
+   const uint64_t gs_fau = MALI_PER_ARCH(cmd_gfx_fau)(cmd, g->main, &sv, cmd->push_constants,
+                                                       sizeof(cmd->push_constants));
+   const uint64_t gs_srt = mali_gfx_shader_vs_srt(cmd, g->main, NULL);
+   if (!vs_srt || !gs_srt || (g->sw_vs->fau.total_count && !vs_fau) ||
+       (g->main->fau.total_count && !gs_fau)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   const uint32_t vs_groups[3] = {DIV_ROUND_UP(verts, 64), inst, 1};
+   MALI_PER_ARCH(cmd_vt_dispatch)(cmd, g->sw_vs, vs_srt, vs_fau, vs_groups);
+   const uint32_t gs_groups[3] = {DIV_ROUND_UP(prims, 64), inst, 1};
+   MALI_PER_ARCH(cmd_vt_dispatch)(cmd, g->main, gs_srt, gs_fau, gs_groups);
+
+   /* The draw of what it emitted, by the rasterization shader. */
+   struct mali_draw_info ld = {
+      .count = poly_gs_rast_vertices(info->shape, info->max_indices, prims, inst),
+      .instance_count = poly_gs_rast_instances(info->shape, info->max_indices, prims, inst),
+      .indexed = isz != 0,
+   };
+   const __typeof__(d->ib) saved_ib = d->ib;
+   if (isz) {
+      d->ib.addr = ib;
+      d->ib.size = ib_size;
+      d->ib.index_size = isz;
+      d->dirty |= MALI_GFX_DIRTY_INDEX;
+   }
+   d->dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT;
+   draw_viewports(cmd, &ld);
+   if (isz) {
+      d->ib = saved_ib;
+      d->dirty |= MALI_GFX_DIRTY_INDEX;
+   }
+}
+
+/* Bytes of the tessellator's heap, after its struct poly_heap. Asahi's
+ * is 128 MiB. */
+#define POLY_HEAP_SIZE (64u * 1024 * 1024)
+#define POLY_HEAP_HEADER 64
+
+/* The tessellator's heap (struct poly_heap's GPU address), emptied before
+ * this command buffer's first use of it: everything that reads or writes it
+ * runs on this stream, so once the stream has drained, what an earlier
+ * command buffer allocated is no longer read. */
+/* The device's stitch records buffer (vk/cl/mali_tessellator.h
+ * tess_records: a count per patch, then 132 records of 96 bytes per patch),
+ * one draw's at a time: the vertex/tiler stream runs the draws in order. */
+#define TESS_RECORDS_SIZE    (8u << 20)
+#define TESS_PATCH_RECORDS_B (132u * 24 * 4)
+
+static uint64_t
+tess_records(struct mali_cmd_buffer *cmd)
+{
+   struct mali_device *dev = cmd->dev;
+   simple_mtx_lock(&dev->meta_lock);
+   if (!dev->tess_records.size) {
+      const struct mali_kbase_alloc_info ai = {
+         .size = TESS_RECORDS_SIZE,
+         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
+         .mem_class = MALI_KBASE_MEM_CLASS_DEVICE_CPU_UNCACHED,
+      };
+      if (mali_kbase_alloc(dev->kbase, &ai, &dev->tess_records) != MALI_KBASE_SUCCESS)
+         dev->tess_records = (struct mali_kbase_bo){0};
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+   return dev->tess_records.size ? dev->tess_records.gpu_va : 0;
+}
+
+static uint64_t
+poly_heap(struct mali_cmd_buffer *cmd)
+{
+   struct mali_device *dev = cmd->dev;
+   simple_mtx_lock(&dev->meta_lock);
+   if (!dev->poly_heap.size) {
+      const struct mali_kbase_alloc_info ai = {
+         .size = POLY_HEAP_HEADER + POLY_HEAP_SIZE,
+         .flags = mali_kbase_mem_same_va_policy(MALI_KBASE_FLAGS_DEVICE_UNCACHED),
+         .mem_class = MALI_KBASE_MEM_CLASS_DEVICE_CPU_UNCACHED,
+      };
+      if (mali_kbase_alloc(dev->kbase, &ai, &dev->poly_heap) == MALI_KBASE_SUCCESS) {
+         struct poly_heap *h = dev->poly_heap.cpu;
+         *h = (struct poly_heap){
+            .base = dev->poly_heap.gpu_va + POLY_HEAP_HEADER,
+            .size = POLY_HEAP_SIZE,
+         };
+      } else {
+         dev->poly_heap = (struct mali_kbase_bo){0};
+      }
+   }
+   simple_mtx_unlock(&dev->meta_lock);
+   if (!dev->poly_heap.size)
+      return 0;
+
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   if (!d->poly_heap_reset) {
+      struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_VERTEX_TILER);
+      cs_wait_slots(b, cmd->dev->csf->sb.all_iters_mask);
+      const struct cs_index addr = mali_cs_scratch_reg64(b, 0);
+      const struct cs_index zero = mali_cs_scratch_reg32(b, 2);
+      cs_move64_to(b, addr, dev->poly_heap.gpu_va + offsetof(struct poly_heap, bottom));
+      cs_move32_to(b, zero, 0);
+      cs_store32(b, zero, addr, 0);
+      cs_flush_stores(b);
+      d->poly_heap_reset = true;
+   }
+   return dev->poly_heap.gpu_va;
+}
+
+/*
+ * A draw with tessellation (mali_shader.c, "Tessellation"): on this stream
+ * the vertex shader, the control shader, the tessellator's count, offset
+ * and index passes, then the indexed draw of its output, whose command the
+ * tessellator wrote. Direct draws.
+ */
+static void
+draw_tess(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct mali_tess_shaders *t = p->tess;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const uint32_t patch_size =
+      BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS)
+         ? dyn->ts.patch_control_points
+         : p->state.ts.patch_control_points;
+   const uint32_t verts = di->count, inst = di->instance_count;
+   const uint32_t in_patches = patch_size ? verts / patch_size : 0;
+   const uint32_t patches = in_patches * inst;
+   if (!patches)
+      return;
+
+   /* Constant levels: every patch's tessellation is the pipeline's pattern
+    * (mali_tess_pattern.h), drawn without the tessellator's jobs, unless its
+    * index buffer would be large. */
+   const struct mali_tess_pattern *pat = p->tess_pattern;
+   const uint64_t pat_indices = pat ? (uint64_t)patches * pat->index_count : 0;
+   const bool fast = pat && pat->index_count && pat_indices <= (1u << 22) &&
+                     patches <= UINT32_MAX / POLY_TES_PATCH_ID_STRIDE;
+   const uint64_t heap = fast ? 0 : poly_heap(cmd);
+   const uint32_t stride = t->tcs_output_stride;
+   const uint64_t tcs_out = (uint64_t)patches * stride;
+   const uint64_t size = tcs_out + 2ull * patches * 4 + 32;
+   struct mali_ptr blob = mali_cmd_alloc(cmd, size, 64);
+   const uint32_t outputs = util_bitcount64(t->vs_outputs);
+   struct mali_ptr vout = mali_cmd_alloc(cmd, MAX2((uint64_t)verts * inst * outputs * 16, 16), 64);
+   if ((!fast && !heap) || !blob.cpu || !vout.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   memset(blob.cpu, 0, size);
+
+   const VkTessellationDomainOrigin origin =
+      BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_TS_DOMAIN_ORIGIN) ? dyn->ts.domain_origin
+                                                                : p->state.ts.domain_origin;
+   struct poly_tess_params tp = {
+      .heap = heap,
+      .patch_coord_buffer = heap + POLY_HEAP_HEADER,
+      .tcs_buffer = blob.gpu,
+      .coord_allocs = blob.gpu + tcs_out,
+      .counts = blob.gpu + tcs_out + patches * 4,
+      .out_draws = blob.gpu + tcs_out + 2 * patches * 4,
+      .statistic = 0,
+      .tcs_per_vertex_outputs = t->tcs_per_vertex_outputs,
+      .input_patch_size = patch_size,
+      .output_patch_size = t->tcs_output_patch_size,
+      .tcs_patch_constants = t->tcs_patch_outputs,
+      .patches_per_instance = in_patches,
+      .tcs_stride_el = stride / 4,
+      .nr_patches = patches,
+      .partitioning = t->spacing == TESS_SPACING_EQUAL ? POLY_TESS_PARTITIONING_INTEGER
+                      : t->spacing == TESS_SPACING_FRACTIONAL_ODD
+                         ? POLY_TESS_PARTITIONING_FRACTIONAL_ODD
+                         : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN,
+      .points_mode = t->points,
+      .isolines = t->mode == TESS_PRIMITIVE_ISOLINES,
+   };
+   if (!t->points && t->mode != TESS_PRIMITIVE_ISOLINES)
+      tp.ccw = t->ccw ^ (origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT);
+
+   /* Triangles and quads: the counting pass records each stitch, then the
+    * points and the stitches are placed by passes of their own
+    * (vk/cl/mali_tess.cl); the records' address is in the statistic field,
+    * which nothing else uses. */
+   const unsigned tdomain = t->mode == TESS_PRIMITIVE_ISOLINES ? 0
+                            : t->mode == TESS_PRIMITIVE_QUADS  ? 2
+                                                               : 1;
+   const uint64_t records =
+      !fast && tdomain && !getenv("MALISX2_NO_TESS_RECORDS") &&
+            (uint64_t)patches * (TESS_PATCH_RECORDS_B + 4) + 16 <= TESS_RECORDS_SIZE
+         ? tess_records(cmd)
+         : 0;
+   tp.statistic = records;
+
+   struct mali_ptr pat_ib = {0};
+   if (fast) {
+      /* All patches' points at 0 (coord_allocs is the zeroed blob). */
+      struct mali_ptr pts = mali_cmd_alloc(cmd, MAX2(pat->point_count, 1) * 8ull, 64);
+      pat_ib = mali_cmd_alloc(cmd, MAX2(pat_indices, 1) * 4, 64);
+      if (!pts.cpu || !pat_ib.cpu) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      memcpy(pts.cpu, pat->points, pat->point_count * 8ull);
+      tp.patch_coord_buffer = pts.gpu;
+      uint32_t *ib = pat_ib.cpu;
+      for (uint32_t i = 0; i < patches; i++, ib += pat->index_count) {
+         const uint32_t bias = i * POLY_TES_PATCH_ID_STRIDE;
+         for (uint32_t j = 0; j < pat->index_count; j++)
+            ib[j] = pat->indices[j] + bias;
+      }
+   }
+
+   const uint32_t wg[3] = {64, 1, 1};
+   struct poly_vertex_params vp;
+   poly_vertex_params_init(&vp, t->vs_outputs, wg);
+   poly_vertex_params_set_draw(&vp, verts, inst);
+   vp.output_buffer = vout.gpu;
+   if (di->indexed) {
+      const uint32_t isz = d->ib.index_size;
+      vp.index_buffer = d->ib.addr + (uint64_t)di->first_index * isz;
+      vp.index_size_B = isz;
+      vp.index_buffer_range_el = poly_index_buffer_range_el(d->ib.size / isz, di->first_index);
+   }
+   d->poly_vertex_params = upload(cmd, &vp, sizeof(vp));
+   d->poly_tess_params = upload(cmd, &tp, sizeof(tp));
+   if (!d->poly_vertex_params || !d->poly_tess_params)
+      return;
+
+   d->first_vertex = di->vertex_offset;
+   d->base_instance = di->first_instance;
+   struct mali_graphics_sysvals sv;
+   mali_gfx_fill_sysvals(cmd, &sv);
+   /* No vertex shader job when the control shader runs it (mali_shader.c
+    * fuse_vs_tcs). */
+   const uint64_t vs_fau =
+      t->sw_vs ? MALI_PER_ARCH(cmd_gfx_fau)(cmd, t->sw_vs, &sv, cmd->push_constants,
+                                            sizeof(cmd->push_constants))
+               : 0;
+   const uint64_t vs_srt = t->sw_vs ? mali_gfx_shader_vs_srt(cmd, t->sw_vs, NULL) : 0;
+   const uint64_t tcs_fau = MALI_PER_ARCH(cmd_gfx_fau)(cmd, t->tcs, &sv, cmd->push_constants,
+                                                        sizeof(cmd->push_constants));
+   const uint64_t tcs_srt = mali_gfx_shader_vs_srt(cmd, t->tcs, NULL);
+   if ((t->sw_vs && !vs_srt) || !tcs_srt || (t->sw_vs && t->sw_vs->fau.total_count && !vs_fau) ||
+       (t->tcs->fau.total_count && !tcs_fau)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   const uint32_t vs_groups[3] = {DIV_ROUND_UP(verts, 64), inst, 1};
+   if (t->sw_vs)
+      MALI_PER_ARCH(cmd_vt_dispatch)(cmd, t->sw_vs, vs_srt, vs_fau, vs_groups);
+   const uint32_t tcs_groups[3] = {in_patches, inst, 1};
+   MALI_PER_ARCH(cmd_vt_dispatch)(cmd, t->tcs, tcs_srt, tcs_fau, tcs_groups);
+
+   if (fast) {
+      const __typeof__(d->ib) saved = d->ib;
+      d->ib.addr = pat_ib.gpu;
+      d->ib.size = pat_indices * 4;
+      d->ib.index_size = 4;
+      d->first_vertex = 0;
+      d->base_instance = 0;
+      d->dirty |= MALI_GFX_DIRTY_INDEX | MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT;
+      const struct mali_draw_info ld = {
+         .count = pat_indices,
+         .instance_count = 1,
+         .indexed = true,
+      };
+      draw_viewports(cmd, &ld);
+      d->ib = saved;
+      d->dirty |= MALI_GFX_DIRTY_INDEX;
+      return;
+   }
+
+   const unsigned domain = t->mode == TESS_PRIMITIVE_ISOLINES ? 0
+                           : t->mode == TESS_PRIMITIVE_QUADS  ? 2
+                                                              : 1;
+   const struct mali_meta_tess_push push = {.params = d->poly_tess_params};
+   const uint32_t groups[3] = {DIV_ROUND_UP(patches, 64), 1, 1};
+   const uint32_t one[3] = {1, 1, 1};
+   const struct mali_shader *count =
+      MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_COUNT_ISOLINES + domain);
+   const struct mali_shader *finish = MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_FINISH);
+   const struct mali_shader *write =
+      MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_WRITE_ISOLINES + domain);
+   if (!count || !finish || !write)
+      return;
+   const uint32_t write_groups[3] = {
+      DIV_ROUND_UP(patches, 16) * 16 * MALI_TESS_WRITE_THREADS / 64, 1, 1};
+   const struct mali_shader *record =
+      records ? MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_RECORD_TRIANGLES + domain - 1)
+              : NULL;
+   const struct mali_shader *points =
+      records ? MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_POINTS_TRIANGLES + domain - 1)
+              : NULL;
+   const struct mali_shader *stitch =
+      records ? MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_STITCH) : NULL;
+   /* At most 64 patches: counting and offsets in one workgroup, points
+    * and stitches in one pass. */
+   const struct mali_shader *record_finish =
+      records && patches <= 64 && !getenv("MALISX2_NO_TESS_MERGE")
+         ? MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_RECORD_FINISH_TRIANGLES + domain - 1)
+         : NULL;
+   const struct mali_shader *emit =
+      record_finish ? MALI_PER_ARCH(cmd_meta_shader)(cmd, MALI_META_TESS_EMIT_TRIANGLES + domain - 1)
+                    : NULL;
+   if (record_finish && emit) {
+      const uint32_t emit_groups[3] = {DIV_ROUND_UP(64 + 132, 64), patches, 1};
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, record_finish, &push, sizeof(push), one);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, emit, &push, sizeof(push), emit_groups);
+   } else if (records && record && points && stitch) {
+      const uint32_t stitch_groups[3] = {DIV_ROUND_UP(132, 64), patches, 1};
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, record, &push, sizeof(push), groups);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, finish, &push, sizeof(push), one);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, points, &push, sizeof(push), write_groups);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, stitch, &push, sizeof(push), stitch_groups);
+   } else {
+      if (records)
+         return;
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, count, &push, sizeof(push), groups);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, finish, &push, sizeof(push), one);
+      MALI_PER_ARCH(cmd_vt_dispatch_shader)(cmd, write, &push, sizeof(push), write_groups);
+   }
+
+   /* The draw of the tessellator's indices, into the heap. */
+   const __typeof__(d->ib) saved_ib = d->ib;
+   d->ib.addr = heap + POLY_HEAP_HEADER;
+   d->ib.size = POLY_HEAP_SIZE;
+   d->ib.index_size = 4;
+   d->dirty |= MALI_GFX_DIRTY_INDEX | MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT;
+   MALI_PER_ARCH(cmd_draw_indexed_indirect_one)(cmd, tp.out_draws);
+   d->ib = saved_ib;
+   d->dirty |= MALI_GFX_DIRTY_INDEX;
+}
+#endif /* MALI_WITH_POLY */
+
+static void
+draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+#if MALI_WITH_POLY
+   if (unlikely(cmd->gfx.draw.pipeline && cmd->gfx.draw.pipeline->gs)) {
+      draw_gs(cmd, di);
+      return;
+   }
+   if (unlikely(cmd->gfx.draw.pipeline && cmd->gfx.draw.pipeline->tess)) {
+      draw_tess(cmd, di);
+      return;
+   }
+#endif
+   const enum mesa_prim lines = polygon_lines_topology(cmd);
+   if (unlikely(lines != MESA_PRIM_COUNT)) {
+      draw_polygon_lines(cmd, di, lines);
+      return;
+   }
+   draw_viewports(cmd, di);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -219,7 +792,7 @@ MALI_PER_ARCH(cmd_run_fullscreen)(struct mali_cmd_buffer *cmd, uint64_t dcd, con
                           MALI_GFX_DIRTY_PASS;
    /* The scissor, tiler flags and tiler context registers changed behind
     * the draws' record of them. */
-   cmd->gfx.draw.regs_valid = 0;
+   BITSET_ZERO(cmd->gfx.draw.regs_valid);
 }
 
 /* A primitive barrier over the whole framebuffer: later fragments of the

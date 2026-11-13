@@ -66,6 +66,9 @@ enum mali_sb {
 #define MALI_CS_REG_SUBQUEUE_CTX 90
 #define MALI_CS_KERNEL_REGS 4
 #define MALI_CS_RING_REG0 92   /* 92..95: ring-level temporaries */
+/* The registers the layout above uses: all of v10's and v11's, the low 96
+ * of v12's 128. */
+#define MALI_CS_REG_COUNT 96
 
 /* A 64-bit GPU sync object (panvk_cs_sync64). error is set by sync
  * operations with error propagation when the stream has faulted. */

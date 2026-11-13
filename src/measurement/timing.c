@@ -5,7 +5,7 @@
 
 /*
  * GPU timing of passes, dispatches and draws on the command-stream back
- * half, built once per command-stream arch (v10, v11).
+ * half, built once per command-stream arch (v10, v11, v12).
  *
  * Recording: a region is two STORE_STATE{Timestamp} instructions on one
  * subqueue's stream, each deferred on every iterator scoreboard entry

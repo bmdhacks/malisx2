@@ -41,12 +41,12 @@
 /* Layout                                                                  */
 
 /*
- * This back half is built at v10 and v11 into one driver, and the
- * structures below must come out the same in both (no field may depend on
- * PAN_ARCH): the v11 build defines the command buffer's layout and the v10
- * build checks its own against it, and both check what they share with the
- * code built once against that build's view (mali_device.c). A difference
- * fails the link (mali_layout_check.h).
+ * This back half is built at v10, v11 and v12 into one driver, and the
+ * structures below must come out the same in all of them (no field may
+ * depend on PAN_ARCH): the v11 build defines the command buffer's layout
+ * and the v10 and v12 builds check their own against it, and all check
+ * what they share with the code built once against that build's view
+ * (mali_device.c). A difference fails the link (mali_layout_check.h).
  */
 static void __attribute__((used))
 layout_check(void)
@@ -133,6 +133,28 @@ slab_new(struct mali_device *dev, uint64_t size, bool recycle)
 static void
 slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
 {
+   if (s->wls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_wls_slab_count < MALI_FREE_WLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_wls_slabs);
+         dev->free_wls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
+   if (s->tls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_tls_slab_count < MALI_FREE_TLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_tls_slabs);
+         dev->free_tls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
    if (s->recycle) {
       simple_mtx_lock(&dev->slab_lock);
       if (dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
@@ -197,6 +219,8 @@ cmd_release_memory(struct mali_cmd_buffer *cmd)
    cmd->cur_offset = 0;
    cmd->tls.size = 0;
    cmd->tls.gpu = 0;
+   cmd->wls = (struct mali_wls_state){0};
+   cmd->wls_vt = (struct mali_wls_state){0};
 }
 
 /* ---------------------------------------------------------------------- */
@@ -222,6 +246,11 @@ init_streams(struct mali_cmd_buffer *cmd)
       const struct cs_builder_conf conf = {
          .nr_registers = csf->nr_registers,
          .nr_kernel_registers = MALI_CS_KERNEL_REGS,
+#if PAN_ARCH >= 12
+         /* RUN_COMPUTE's endpoint limit: the tasks a core takes at once,
+          * THREAD_FEATURES bits 31:24 (panvk, panthor_kmod). */
+         .compute_ep_limit = cmd->dev->kbase->props.thread_features >> 24,
+#endif
          .alloc_buffer = cs_alloc_chunk,
          .cookie = cmd,
          .ls_sb_slot = MALI_SB_LS,

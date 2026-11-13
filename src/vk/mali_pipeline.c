@@ -68,6 +68,8 @@
 
 #include "mali_compiler.h"
 #include "mali_measure.h"
+#include "mali_tess_pattern.h"
+#include "poly/tessellator.h"
 
 /* ---------------------------------------------------------------------- */
 /* Destruction and bind                                                    */
@@ -81,6 +83,20 @@ graphics_pipeline_destroy(struct vk_device *vk_dev, struct vk_pipeline *vk_pipel
 
    MALI_PER_ARCH(shader_unref)(dev, p->vs);
    MALI_PER_ARCH(shader_unref)(dev, p->fs);
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+   if (p->gs) {
+      MALI_PER_ARCH(gs_shaders_unref)(dev, p->gs);
+      vk_free(&dev->vk.alloc, p->gs);
+   }
+   if (p->tess) {
+      MALI_PER_ARCH(tess_shaders_unref)(dev, p->tess);
+      vk_free(&dev->vk.alloc, p->tess);
+   }
+   if (p->tess_pattern) {
+      mali_tess_pattern_finish(p->tess_pattern);
+      vk_free(&dev->vk.alloc, p->tess_pattern);
+   }
+#endif
    if (p->zsd_mem.size)
       mali_bo_pool_free(&dev->desc_pool, &p->zsd_mem);
    if (p->base.layout)
@@ -424,7 +440,7 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
               VkPipelineCreateFlags2KHR flags, struct stage *st,
               const struct vk_pipeline_layout *layout,
               const struct vk_graphics_pipeline_state *state,
-              const struct pan_varying_layout *vs_varying_layout)
+              const struct mali_shader *vs)
 {
    int64_t start = os_time_get_nano();
 
@@ -439,7 +455,8 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
       .rs = &st->rs,
       .layout = layout,
       .state = state,
-      .vs_varying_layout = vs_varying_layout,
+      .vs_varying_layout = vs ? &vs->info.varyings.formats : NULL,
+      .vs_clip_distances = vs ? vs->vs.clip_distances : 0,
    };
    st->nir = NULL; /* consumed */
 
@@ -468,6 +485,110 @@ stage_finish(struct mali_device *dev, struct stage *st)
    MALI_PER_ARCH(shader_unref)(dev, st->shader);
    st->shader = NULL;
 }
+
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+/*
+ * The shaders of a geometry or tessellation pipeline in the pipeline cache:
+ * each as a shader object under the key the compile gave it (the set's key
+ * and its index, mali_shader.c gs_variant), and the set's other fields as a
+ * raw object under the set's key and POLY_SET_META_INDEX.
+ */
+#define POLY_SET_META_INDEX 100
+
+static void
+poly_sub_key(const blake3_hash key, unsigned index, blake3_hash out)
+{
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, key, sizeof(blake3_hash));
+   _mesa_blake3_update(&h, &index, sizeof(index));
+   _mesa_blake3_final(&h, out);
+}
+
+/* set: the struct, of set_size bytes, whose shader pointers are slots[i]
+ * (index[i] the compile's index of each). */
+static bool
+poly_set_lookup(struct mali_device *dev, struct vk_pipeline_cache *cache, const blake3_hash key,
+                void *set, size_t set_size, struct mali_shader **const *slots,
+                const unsigned *index, unsigned n)
+{
+   if (!cache)
+      return false;
+   blake3_hash k;
+   poly_sub_key(key, POLY_SET_META_INDEX, k);
+   struct vk_pipeline_cache_object *obj =
+      vk_pipeline_cache_lookup_object(cache, k, sizeof(k), &vk_raw_data_cache_object_ops, NULL);
+   if (!obj)
+      return false;
+   const struct vk_raw_data_cache_object *raw =
+      container_of(obj, struct vk_raw_data_cache_object, base);
+   uint32_t present = 0;
+   const bool ok = raw->data_size == sizeof(present) + set_size;
+   if (ok) {
+      memcpy(&present, raw->data, sizeof(present));
+      memcpy(set, (const uint8_t *)raw->data + sizeof(present), set_size);
+   }
+   vk_pipeline_cache_object_unref(&dev->vk, obj);
+   if (!ok)
+      return false;
+
+   for (unsigned i = 0; i < n; i++)
+      *slots[i] = NULL;
+   for (unsigned i = 0; i < n; i++) {
+      if (!(present & BITFIELD_BIT(i)))
+         continue;
+      poly_sub_key(key, index[i], k);
+      obj = vk_pipeline_cache_lookup_object(cache, k, sizeof(k), &MALI_PER_ARCH(shader_cache_ops),
+                                            NULL);
+      if (!obj) {
+         for (unsigned j = 0; j < i; j++)
+            MALI_PER_ARCH(shader_unref)(dev, *slots[j]);
+         for (unsigned j = 0; j < n; j++)
+            *slots[j] = NULL;
+         return false;
+      }
+      *slots[i] = container_of(obj, struct mali_shader, base);
+   }
+   p_atomic_inc(&dev->pipeline_stats.shader_cache_hits);
+   return true;
+}
+
+static void
+poly_set_add(struct mali_device *dev, struct vk_pipeline_cache *cache, const blake3_hash key,
+             void *set, size_t set_size, struct mali_shader **const *slots, unsigned n)
+{
+   if (!cache)
+      return;
+   uint32_t present = 0;
+   struct mali_shader *saved[8];
+   assert(n <= ARRAY_SIZE(saved));
+   for (unsigned i = 0; i < n; i++) {
+      saved[i] = *slots[i];
+      if (!*slots[i])
+         continue;
+      present |= BITFIELD_BIT(i);
+      struct vk_pipeline_cache_object *obj = vk_pipeline_cache_add_object(cache, &(*slots[i])->base);
+      saved[i] = *slots[i] = container_of(obj, struct mali_shader, base);
+      *slots[i] = NULL;
+   }
+   /* The fields without the shader pointers. */
+   uint8_t data[sizeof(present) + 256];
+   assert(set_size <= sizeof(data) - sizeof(present));
+   memcpy(data, &present, sizeof(present));
+   memcpy(data + sizeof(present), set, set_size);
+   for (unsigned i = 0; i < n; i++)
+      *slots[i] = saved[i];
+
+   blake3_hash k;
+   poly_sub_key(key, POLY_SET_META_INDEX, k);
+   struct vk_raw_data_cache_object *raw =
+      vk_raw_data_cache_object_create(&dev->vk, k, sizeof(k), data, sizeof(present) + set_size);
+   if (raw) {
+      struct vk_pipeline_cache_object *obj = vk_pipeline_cache_add_object(cache, &raw->base);
+      vk_pipeline_cache_object_unref(&dev->vk, obj);
+   }
+}
+#endif
 
 /* VkPipelineCreationFeedbackCreateInfo, if the application chained one. */
 static void
@@ -755,6 +876,7 @@ clip_fs_key(const struct mali_device *dev, const struct vk_graphics_pipeline_sta
    _mesa_blake3_init(&h);
    _mesa_blake3_update(&h, CLIP_FS_TAG, sizeof(CLIP_FS_TAG) - 1);
    _mesa_blake3_update(&h, &vl, sizeof(vl));
+   _mesa_blake3_update(&h, &vs->vs.clip_distances, sizeof(vs->vs.clip_distances));
    hash_fs_state(&h, dev, state);
    _mesa_blake3_final(&h, key);
 }
@@ -782,6 +904,7 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
       .rs = &rs,
       .state = state,
       .vs_varying_layout = &vs->info.varyings.formats,
+      .vs_clip_distances = vs->vs.clip_distances,
    };
 
    struct mali_shader *shader;
@@ -801,6 +924,18 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
 }
 #endif /* PAN_ARCH != 9 */
 
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+/* The tessellator's output primitives (mali_shader.h struct
+ * mali_tess_shaders). */
+static enum mesa_prim
+tess_prim(const struct mali_tess_shaders *t)
+{
+   if (t->points)
+      return MESA_PRIM_POINTS;
+   return t->mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES;
+}
+#endif
+
 static VkResult
 create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
                          const VkGraphicsPipelineCreateInfo *ci,
@@ -810,8 +945,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    const VkPipelineCreateFlags2KHR flags = vk_graphics_pipeline_create_flags(ci);
    VK_FROM_HANDLE(vk_pipeline_layout, layout, ci->layout);
    struct vk_pipeline_cache *cache = pick_cache(dev, cache_handle);
-   struct stage stages[2];
-   struct stage *vs = NULL, *fs = NULL;
+   struct stage stages[5];
+   struct stage *vs = NULL, *fs = NULL, *gs = NULL, *tcs = NULL, *tes = NULL;
+   struct mali_gs_shaders *gs_shaders = NULL;
+   struct mali_tess_shaders *tess_shaders = NULL;
 #if PAN_ARCH != 9
    /* The fragment shader that only clips (clip_fs_compile), if needed. */
    struct stage clip = {0};
@@ -838,6 +975,20 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          fs = &stages[stage_count++];
          stage_init(dev, flags, ci->pNext, si, fs);
          break;
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+      case VK_SHADER_STAGE_GEOMETRY_BIT:
+         gs = &stages[stage_count++];
+         stage_init(dev, flags, ci->pNext, si, gs);
+         break;
+      case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+         tcs = &stages[stage_count++];
+         stage_init(dev, flags, ci->pNext, si, tcs);
+         break;
+      case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
+         tes = &stages[stage_count++];
+         stage_init(dev, flags, ci->pNext, si, tes);
+         break;
+#endif
       default:
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "shader stage 0x%x is not supported", si->stage);
@@ -846,6 +997,12 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    if (!vs)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "graphics pipeline without a vertex shader");
+   if (!tcs != !tes)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "tessellation needs both a control and an evaluation shader");
+   if (tes && gs)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "tessellation with a geometry shader is not supported");
 
    struct vk_graphics_pipeline_all_state all;
    struct vk_graphics_pipeline_state state = {0};
@@ -885,10 +1042,118 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       _mesa_blake3_update(&h, fs->stage_hash, sizeof(fs->stage_hash));
       hash_layout(&h, layout);
       _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
+      if (gs)
+         _mesa_blake3_update(&h, gs->stage_hash, sizeof(gs->stage_hash));
+      if (tes) {
+         _mesa_blake3_update(&h, tcs->stage_hash, sizeof(tcs->stage_hash));
+         _mesa_blake3_update(&h, tes->stage_hash, sizeof(tes->stage_hash));
+      }
       hash_fs_state(&h, dev, &state);
       _mesa_blake3_final(&h, fs->key);
    }
 
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+   /* A geometry shader: its shaders are compiled with the vertex
+    * shader's, not looked up in the cache (mali_shader.c, "Geometry
+    * shaders"); the draw's vertex shader is the rasterization shader. */
+   if (gs) {
+      gs_shaders = vk_zalloc(&dev->vk.alloc, sizeof(*gs_shaders), 8,
+                             VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!gs_shaders) {
+         result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto out;
+      }
+      const int64_t gs_start = os_time_get_nano();
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, "gs", 2);
+      _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
+      _mesa_blake3_update(&h, gs->stage_hash, sizeof(gs->stage_hash));
+      hash_layout(&h, layout);
+      _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+      _mesa_blake3_final(&h, gs->key);
+      struct mali_shader **const gs_slots[] = {&gs_shaders->sw_vs, &gs_shaders->main,
+                                               &gs_shaders->count, &gs_shaders->rast};
+      static const unsigned gs_index[] = {0, 1, 2, 3};
+      if (poly_set_lookup(dev, cache, gs->key, gs_shaders, sizeof(*gs_shaders), gs_slots,
+                          gs_index, ARRAY_SIZE(gs_slots))) {
+         vs->cache_hit = gs->cache_hit = true;
+         goto gs_done;
+      }
+      result = stage_to_nir(dev, flags, vs);
+      if (result == VK_SUCCESS)
+         result = stage_to_nir(dev, flags, gs);
+      if (result != VK_SUCCESS)
+         goto out;
+      const struct mali_shader_compile_info vs_info = {
+         .nir = vs->nir, .rs = &vs->rs, .layout = layout, .state = &state,
+      };
+      const struct mali_shader_compile_info gs_info = {
+         .nir = gs->nir, .rs = &gs->rs, .layout = layout, .state = &state,
+      };
+      vs->nir = gs->nir = NULL;
+      result = MALI_PER_ARCH(shader_compile_gs)(dev, &vs_info, &gs_info, gs->key, gs_shaders);
+      if (result != VK_SUCCESS)
+         goto out;
+      poly_set_add(dev, cache, gs->key, gs_shaders, sizeof(*gs_shaders), gs_slots,
+                   ARRAY_SIZE(gs_slots));
+   gs_done:
+      vs->shader = mali_shader_ref(gs_shaders->rast);
+      gs->duration_ns = os_time_get_nano() - gs_start;
+   } else if (tes) {
+      tess_shaders = vk_zalloc(&dev->vk.alloc, sizeof(*tess_shaders), 8,
+                               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!tess_shaders) {
+         result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto out;
+      }
+      const int64_t tess_start = os_time_get_nano();
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, "ts", 2);
+      _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
+      _mesa_blake3_update(&h, tcs->stage_hash, sizeof(tcs->stage_hash));
+      _mesa_blake3_update(&h, tes->stage_hash, sizeof(tes->stage_hash));
+      hash_layout(&h, layout);
+      _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+      _mesa_blake3_final(&h, tes->key);
+      struct mali_shader **const ts_slots[] = {&tess_shaders->sw_vs, &tess_shaders->tcs,
+                                               &tess_shaders->tes};
+      static const unsigned ts_index[] = {0, 4, 5};
+      if (poly_set_lookup(dev, cache, tes->key, tess_shaders, sizeof(*tess_shaders), ts_slots,
+                          ts_index, ARRAY_SIZE(ts_slots))) {
+         vs->cache_hit = tcs->cache_hit = tes->cache_hit = true;
+         goto tess_done;
+      }
+      result = stage_to_nir(dev, flags, vs);
+      if (result == VK_SUCCESS)
+         result = stage_to_nir(dev, flags, tcs);
+      if (result == VK_SUCCESS)
+         result = stage_to_nir(dev, flags, tes);
+      if (result != VK_SUCCESS)
+         goto out;
+      const struct mali_shader_compile_info vs_info = {
+         .nir = vs->nir, .rs = &vs->rs, .layout = layout, .state = &state,
+      };
+      const struct mali_shader_compile_info tcs_info = {
+         .nir = tcs->nir, .rs = &tcs->rs, .layout = layout, .state = &state,
+      };
+      const struct mali_shader_compile_info tes_info = {
+         .nir = tes->nir, .rs = &tes->rs, .layout = layout, .state = &state,
+      };
+      vs->nir = tcs->nir = tes->nir = NULL;
+      result = MALI_PER_ARCH(shader_compile_tess)(dev, &vs_info, &tcs_info, &tes_info, tes->key,
+                                                  tess_shaders);
+      if (result != VK_SUCCESS)
+         goto out;
+      poly_set_add(dev, cache, tes->key, tess_shaders, sizeof(*tess_shaders), ts_slots,
+                   ARRAY_SIZE(ts_slots));
+   tess_done:
+      vs->shader = mali_shader_ref(tess_shaders->tes);
+      MALI_PER_ARCH(meta_tess_warm)(dev, tess_shaders->mode == TESS_PRIMITIVE_ISOLINES ? 0
+                                         : tess_shaders->mode == TESS_PRIMITIVE_QUADS ? 2
+                                                                                      : 1);
+      tes->duration_ns = os_time_get_nano() - tess_start;
+   } else
+#endif
    stage_lookup(dev, cache, vs);
    if (fs)
       stage_lookup(dev, cache, fs);
@@ -905,8 +1170,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          goto out;
    }
    if (fs && !fs->shader) {
-      result = stage_compile(dev, cache, flags, fs, layout, &state,
-                             &vs->shader->info.varyings.formats);
+      result = stage_compile(dev, cache, flags, fs, layout, &state, vs->shader);
       if (result != VK_SUCCESS)
          goto out;
    }
@@ -940,6 +1204,29 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       p->base.layout = vk_pipeline_layout_ref(layout);
    p->vs = vs->shader;
    vs->shader = NULL;
+   p->gs = gs_shaders;
+   gs_shaders = NULL;
+   p->tess = tess_shaders;
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+   if (tess_shaders && tess_shaders->const_levels) {
+      const struct mali_tess_shaders *t = tess_shaders;
+      struct mali_tess_pattern *pat = vk_zalloc(&dev->vk.alloc, sizeof(*pat), 8,
+                                                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      const unsigned domain = t->mode == TESS_PRIMITIVE_ISOLINES ? 0
+                              : t->mode == TESS_PRIMITIVE_QUADS  ? 2
+                                                                 : 1;
+      const unsigned part = t->spacing == TESS_SPACING_EQUAL ? POLY_TESS_PARTITIONING_INTEGER
+                            : t->spacing == TESS_SPACING_FRACTIONAL_ODD
+                               ? POLY_TESS_PARTITIONING_FRACTIONAL_ODD
+                               : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN;
+      if (pat && mali_tess_pattern_build(pat, domain, part, t->points, t->levels)) {
+         p->tess_pattern = pat;
+      } else if (pat) {
+         vk_free(&dev->vk.alloc, pat);
+      }
+   }
+#endif
+   tess_shaders = NULL;
    if (fs) {
       p->fs = fs->shader;
       fs->shader = NULL;
@@ -967,6 +1254,12 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       .vs = p->vs,
       .fs = p->fs,
       .view_mask = view_mask,
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+      .has_gs = p->gs != NULL,
+      .gs_prim = p->gs ? p->gs->info.mode : 0,
+      .has_tess = p->tess != NULL,
+      .tess_prim = p->tess ? tess_prim(p->tess) : 0,
+#endif
    };
    MALI_PER_ARCH(gfx_pack_state)(&pack, &p->baked);
    MALI_PER_ARCH(blend_shaders_prepare)(dev, p);
@@ -981,6 +1274,16 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    result = VK_SUCCESS;
 
 out:
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+   if (gs_shaders) {
+      MALI_PER_ARCH(gs_shaders_unref)(dev, gs_shaders);
+      vk_free(&dev->vk.alloc, gs_shaders);
+   }
+   if (tess_shaders) {
+      MALI_PER_ARCH(tess_shaders_unref)(dev, tess_shaders);
+      vk_free(&dev->vk.alloc, tess_shaders);
+   }
+#endif
    write_feedback(ci->pNext, stages, stage_count, cache_handle != VK_NULL_HANDLE,
                   os_time_get_nano() - start);
    for (uint32_t i = 0; i < stage_count; i++)

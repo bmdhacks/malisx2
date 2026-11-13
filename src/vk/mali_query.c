@@ -206,6 +206,29 @@ put_result(void *out, unsigned index, bool wide, uint64_t v)
       ((uint32_t *)out)[index] = (uint32_t)MIN2(v, (uint64_t)UINT32_MAX);
 }
 
+/*
+ * vkResetQueryPool (VK_EXT_host_query_reset): the host zeroes the queries'
+ * counters and availability words, as vkCmdResetQueryPool's fills do. The
+ * queries are not in use by any pending command (Vulkan), and the memory
+ * is mapped uncached; on the command-stream frontend every submit starts
+ * by cleaning and invalidating the GPU caches (mali_queue.c), so the next
+ * command that uses the queries sees the zeros.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(ResetQueryPool)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,
+                              uint32_t queryCount)
+{
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+   for (uint32_t i = 0; i < queryCount; i++) {
+      const uint32_t q = firstQuery + i;
+      volatile uint64_t *v = (volatile uint64_t *)(pool->val_cpu + (uint64_t)q * pool->val_stride);
+      for (uint32_t k = 0; k < pool->val_count; k++)
+         v[k] = 0;
+      *mali_query_avail_cpu(pool, q) = 0;
+   }
+   __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 MALI_PER_ARCH(GetQueryPoolResults)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,
                                    uint32_t queryCount, size_t dataSize, void *pData,

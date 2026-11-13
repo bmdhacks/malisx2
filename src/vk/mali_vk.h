@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "util/list.h"
+#include "c11/threads.h"
 #include "util/simple_mtx.h"
 
 #include "vk_device.h"
@@ -171,7 +172,54 @@ enum mali_meta_shader {
    MALI_META_INDIRECT_DISPATCH, /* v7 and v9 vkCmdDispatchIndirect: patches the Compute job */
    MALI_META_INDIRECT_DRAW,     /* v7 and v9 indirect draws: patches a draw's jobs */
    MALI_META_INDEX_MINMAX,      /* v7 indirect indexed draws: the indices' range */
+   MALI_META_POLYGON_LINES,     /* CSF polygon mode line: the triangles' edges */
+   /* CSF tessellation (vk/cl/mali_poly.cl): per patch, count the indices of
+    * an isoline, triangle or quad domain, or write them; and between the
+    * two, the offsets and the index buffer. */
+   MALI_META_TESS_COUNT_ISOLINES,
+   MALI_META_TESS_COUNT_TRIANGLES,
+   MALI_META_TESS_COUNT_QUADS,
+   MALI_META_TESS_WRITE_ISOLINES,
+   MALI_META_TESS_WRITE_TRIANGLES,
+   MALI_META_TESS_WRITE_QUADS,
+   MALI_META_TESS_FINISH,
+   MALI_META_TESS_RECORD_TRIANGLES,
+   MALI_META_TESS_RECORD_QUADS,
+   MALI_META_TESS_POINTS_TRIANGLES,
+   MALI_META_TESS_POINTS_QUADS,
+   MALI_META_TESS_STITCH,
+   MALI_META_TESS_RECORD_FINISH_TRIANGLES,
+   MALI_META_TESS_RECORD_FINISH_QUADS,
+   MALI_META_TESS_EMIT_TRIANGLES,
+   MALI_META_TESS_EMIT_QUADS,
    MALI_META_COUNT,
+};
+
+/* Push constants of the MALI_META_TESS_* shaders: the draw's struct
+ * poly_tess_params. */
+struct mali_meta_tess_push {
+   uint64_t params;
+};
+
+/* Invocations per patch of the MALI_META_TESS_WRITE_* shaders
+ * (MALI_TESS_THREADS in vk/cl/mali_tess.cl). */
+#define MALI_TESS_WRITE_THREADS 16
+
+/* Push constants of MALI_META_POLYGON_LINES (mali_cmd_draw.c): triangle t
+ * of a list, strip or fan (mode: MESA_PRIM_TRIANGLES, _STRIP, _FAN) at
+ * index position first + its vertices' positions, read from the index
+ * buffer at src (index_size bytes each) or, with src 0, the positions
+ * themselves; written to dst as the six 32-bit indices of its three edges.
+ * A triangle with the restart index (restart, if not 0) writes restarts. */
+struct mali_meta_lines_push {
+   uint64_t src;
+   uint64_t dst;
+   uint32_t count;     /* triangles */
+   uint32_t first;
+   uint32_t index_size;
+   uint32_t mode;
+   uint32_t restart;
+   uint32_t pad;
 };
 
 /* Push constants of MALI_META_INDIRECT_DISPATCH (mali_jm_cmd_dispatch.c):
@@ -322,10 +370,33 @@ struct mali_device {
    simple_mtx_t slab_lock;
    struct list_head free_slabs;
    unsigned free_slab_count;
+   /* Free MALI_WLS_SLAB_SIZE slabs for dispatches' shared memory. */
+   struct list_head free_wls_slabs;
+   unsigned free_wls_slab_count;
+   /* Free TLS buffers, any size. */
+   struct list_head free_tls_slabs;
+   unsigned free_tls_slab_count;
 
    /* Internal shaders, compiled on first use. */
    simple_mtx_t meta_lock;
    struct mali_shader *meta[MALI_META_COUNT];
+   /* meta[] and the meta shaders a thread is compiling (bit per
+    * mali_meta_shader) are under meta_mtx; others wait on meta_cond. */
+   uint64_t meta_busy;
+   mtx_t meta_mtx;
+   cnd_t meta_cond;
+   /* The tessellator's heap (mali_cmd_draw.c draw_tess): a struct
+    * poly_heap, then the memory it hands out. Allocated on first use, under
+    * meta_lock. */
+   struct mali_kbase_bo poly_heap;
+   /* The tessellator's stitch records (mali_cmd_draw.c draw_tess), one
+    * draw's at a time: the vertex/tiler stream runs the draws in order. */
+   struct mali_kbase_bo tess_records;
+   /* Compiles the tessellator's shaders after device creation, when the
+    * application enabled tessellationShader. */
+   thrd_t tess_warm;
+   bool tess_warm_started;
+   volatile bool tess_warm_cancel;
    /* Internal fragment shaders (mali_cmd_meta_gfx.c), by key. */
    void *meta_gfx;
    /* Blend shaders (mali_blend.c), by key. Under meta_lock. */
@@ -405,7 +476,7 @@ void mali_event_pool_finish(struct mali_device *dev);
  * The job-manager back half (v7 and v9), as code built once (mali_device.c,
  * mali_physical_device.c) reaches it: device and queue setup
  * (mali_jm_queue.c), command buffers (mali_jm_cmd_buffer.c) and the sync
- * type (mali_sync.c built at v7 and v9). The command-stream (v10, v11)
+ * type (mali_sync.c built at v7 and v9). The command-stream (v10, v11, v12)
  * counterparts are in mali_queue.h and below.
  */
 struct vk_command_buffer_ops;
@@ -420,10 +491,14 @@ MALI_PER_JM_ARCH_DECL(VkResult, queue_submit,
                       (struct vk_queue *vkq, struct vk_queue_submit *submit));
 extern const struct vk_command_buffer_ops mali_v7_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v9_cmd_buffer_ops;
+/* lineWidthRange's maximum where wideLines is offered (panvk's). */
+#define MALI_MAX_LINE_WIDTH 7.9921875f
+
 extern const struct vk_sync_type mali_v7_sync_type;
 extern const struct vk_sync_type mali_v9_sync_type;
 extern const struct vk_sync_type mali_v10_sync_type;
 extern const struct vk_sync_type mali_v11_sync_type;
+extern const struct vk_sync_type mali_v12_sync_type;
 
 /* Each arch's sync types, binary first and then the timeline semaphore type
  * wrapped around it (mali_sync.c); the physical device picks by arch. */
@@ -431,6 +506,7 @@ const struct vk_sync_type *const *mali_v7_sync_types(void);
 const struct vk_sync_type *const *mali_v9_sync_types(void);
 const struct vk_sync_type *const *mali_v10_sync_types(void);
 const struct vk_sync_type *const *mali_v11_sync_types(void);
+const struct vk_sync_type *const *mali_v12_sync_types(void);
 
 /* Log a failed sync-file import or export (mali_sync.c, every arch; the
  * per-arch headers declare each build's own). */
@@ -438,9 +514,10 @@ MALI_PER_ARCH_DECL(void, sync_file_log_error,
                    (struct mali_device *dev, const char *op, int fd, const char *why));
 
 /* The command-stream back half's command buffers (mali_cmd_buffer.c, built
- * at v10 and v11). */
+ * at v10, v11 and v12). */
 extern const struct vk_command_buffer_ops mali_v10_cmd_buffer_ops;
 extern const struct vk_command_buffer_ops mali_v11_cmd_buffer_ops;
+extern const struct vk_command_buffer_ops mali_v12_cmd_buffer_ops;
 
 /* Report device loss to the runtime and the log (once), then mark it and
  * wake every waiter. Takes dev->lock; call without it. Every back half

@@ -142,8 +142,8 @@ emit_invalidate_ro(struct cs_builder *b, uint32_t wait_sb_mask)
  * and max_draws.
  */
 static void
-draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
-              uint64_t count_va, uint32_t max_draws)
+draw_indirect_pass(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
+                   uint64_t count_va, uint32_t max_draws)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    struct mali_render_state *r = &cmd->gfx.render;
@@ -221,9 +221,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    const uint64_t fau0 = p.gpu | ((uint64_t)vs->fau.total_count << 56);
    const uint64_t srt0 = (p.gpu + rt_off) | rt_count;
    if (sv_off >= 0)
-      batch_move64(&e, IDVS(FAU_0), fau0);
+      batch_move64(&e, IDVS_VS_FAU, fau0);
    if (attribs)
-      batch_move64(&e, IDVS(SRT_0), srt0);
+      batch_move64(&e, IDVS_VS_SRT, srt0);
    if (!indexed)
       batch_move32(&e, IDVS(INDEX_OFFSET), 0);
 
@@ -261,6 +261,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    const struct cs_index left = mali_cs_scratch_reg32(b, 6);   /* entries left in the ring */
    const struct cs_index acc = mali_cs_scratch_reg32(b, 7);
    const struct cs_index bit = mali_cs_scratch_reg32(b, 8);
+   /* gl_DrawID: the command's index in the loop (scratch 9 is
+    * emit_invalidate_ro's). */
+   const struct cs_index draw_id = mali_cs_scratch_reg32(b, 10);
    const struct cs_index first_instance = cs_reg32(b, IDVS(INSTANCE_OFFSET));
    const bool laps = entry && ring < max_draws;
 
@@ -279,6 +282,7 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    }
    if (laps)
       cs_move32_to(b, left, ring);
+   cs_move32_to(b, draw_id, 0);
 
    cs_while(b, MALI_CS_CONDITION_GREATER, count) {
       if (laps) {
@@ -288,9 +292,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
             emit_invalidate_ro(b, cmd->dev->csf->sb.all_iters_mask);
             cs_move64_to(b, base, p.gpu);
             if (sv_off >= 0)
-               cs_move64_to(b, cs_reg64(b, IDVS(FAU_0)), fau0);
+               cs_move64_to(b, cs_reg64(b, IDVS_VS_FAU), fau0);
             if (attribs)
-               cs_move64_to(b, cs_reg64(b, IDVS(SRT_0)), srt0);
+               cs_move64_to(b, cs_reg64(b, IDVS_VS_SRT), srt0);
             cs_move32_to(b, left, ring);
          }
       }
@@ -329,22 +333,23 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
             for (uint32_t i = 0; i < r->td_count; i++) {
                if (i)
                   cs_add_imm64(b, ctx, ctx, pan_size(TILER_CONTEXT));
-               emit_run_idvs(b, ovr.opaque[0]);
+               emit_run_idvs(b, ovr.opaque[0], draw_id.reg);
             }
             cs_move64_to(b, ctx, r->tiler);
          } else {
-            emit_run_idvs(b, ovr.opaque[0]);
+            emit_run_idvs(b, ovr.opaque[0], draw_id.reg);
          }
       }
 
       cs_add_imm32(b, count, count, -1);
+      cs_add_imm32(b, draw_id, draw_id, 1);
       cs_add_imm64(b, addr, addr, stride);
       if (entry) {
          cs_add_imm64(b, base, base, entry);
          if (sv_off >= 0)
-            cs_add_imm64(b, cs_reg64(b, IDVS(FAU_0)), cs_reg64(b, IDVS(FAU_0)), entry);
+            cs_add_imm64(b, cs_reg64(b, IDVS_VS_FAU), cs_reg64(b, IDVS_VS_FAU), entry);
          if (attribs)
-            cs_add_imm64(b, cs_reg64(b, IDVS(SRT_0)), cs_reg64(b, IDVS(SRT_0)), entry);
+            cs_add_imm64(b, cs_reg64(b, IDVS_VS_SRT), cs_reg64(b, IDVS_VS_SRT), entry);
       }
       if (laps)
          cs_add_imm32(b, left, left, -1);
@@ -353,8 +358,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    /* The registers the loop changed behind the draws' record, and the
     * blocks the next draw has to build again: the ones here hold the last
     * command's values. */
-   d->regs_valid &= ~(BITFIELD64_RANGE(IDVS(INDEX_COUNT), 5) |
-                      BITFIELD64_RANGE(IDVS(FAU_0), 2) | BITFIELD64_RANGE(IDVS(SRT_0), 2));
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS(INDEX_COUNT), 5);
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS_VS_FAU, 2);
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS_VS_SRT, 2);
    if (sv_off >= 0)
       d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    if (attribs)
@@ -364,6 +370,26 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    cmd->draws++;
    if (unlikely(mh))
       mali_measure_end(cmd, mh);
+}
+
+static void
+draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32_t stride,
+              uint64_t count_va, uint32_t max_draws)
+{
+   const uint32_t passes = viewport_passes(cmd);
+   for (uint32_t i = 0; i < passes; i++) {
+      viewport_pass_begin(cmd, i);
+      draw_indirect_pass(cmd, indexed, params, stride, count_va, max_draws);
+   }
+   viewport_pass_begin(cmd, 0);
+}
+
+/* One indexed draw whose VkDrawIndexedIndirectCommand the GPU writes
+ * (tessellation, mali_cmd_draw.c), without the viewport passes. */
+void
+MALI_PER_ARCH(cmd_draw_indexed_indirect_one)(struct mali_cmd_buffer *cmd, uint64_t params)
+{
+   draw_indirect_pass(cmd, true, params, sizeof(VkDrawIndexedIndirectCommand), 0, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -59,6 +59,19 @@ struct mali_cmd_slab {
    /* Kept on the device's free list for reuse: a standard slab, or on v7
     * a 1 MiB slab (else a dedicated BO). */
    bool recycle;
+   /* A MALI_WLS_SLAB_SIZE slab, kept on the device's free_wls_slabs. */
+   bool wls;
+   /* A TLS buffer, kept on the device's free_tls_slabs. */
+   bool tls;
+};
+
+#define MALI_WLS_SLAB_SIZE (4ull << 20)
+#define MALI_FREE_WLS_SLABS_MAX 16
+#define MALI_FREE_TLS_SLABS_MAX 4
+
+/* The slab a command buffer carves its dispatches' WLS buffers from. */
+struct mali_wls_state {
+   uint64_t gpu, size, used;
 };
 
 struct mali_ptr {
@@ -325,17 +338,28 @@ struct mali_gfx_draw_state {
    const struct vk_vertex_input_state *vi;
    const uint16_t *vi_strides;
 
+   /* The last geometry-shader draw's libpoly parameter blocks, which its
+    * rasterization shader reads (mali_cmd_draw.c draw_gs). */
+   uint64_t poly_vertex_params, poly_geometry_params, poly_tess_params;
+   /* The tessellator's heap was emptied in this command buffer. */
+   bool poly_heap_reset;
+
+   /* The viewport this pass of a draw goes to: 0, or for a pipeline whose
+    * vertex shader writes gl_ViewportIndex, each viewport in turn
+    * (mali_cmd_draw.c). */
+   uint32_t vp_pass;
+
    /* The mali_gfx_bind table keys of the tables in SRT_0 and SRT_2. */
    uint32_t vs_srt_key, fs_srt_key;
    /* Descriptor sets bound since each stage's table was built. */
    uint32_t vs_sets_dirty, fs_sets_dirty;
 
-   /* What the IDVS staging registers 0..63 hold, per 32-bit register,
-    * where regs_valid says it is known: a draw writes only the registers
-    * whose value changes. Only mali_cmd_draw.c writes these registers;
-    * anything else that does clears regs_valid. */
-   uint64_t regs_valid;
-   uint32_t regs[64];
+   /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on v12),
+    * per 32-bit register, where regs_valid says it is known: a draw writes
+    * only the registers whose value changes. Only mali_cmd_draw.c writes
+    * these registers; anything else that does clears regs_valid. */
+   BITSET_DECLARE(regs_valid, 66);
+   uint32_t regs[66];
 
    /* The pipeline's words repacked with this command buffer's dynamic
     * state, for pipelines whose baked words depend on it. */
@@ -369,6 +393,10 @@ MALI_PER_ARCH_DECL(void, cmd_dispatch_meta,
  * first use; NULL with the command buffer's error set on failure. */
 MALI_PER_ARCH_DECL(const struct mali_shader *, cmd_meta_shader,
                    (struct mali_cmd_buffer *cmd, unsigned m));
+
+/* Compiles the tessellator's shaders for a domain (0 isolines, 1
+ * triangles, 2 quads) ahead of the first draw. */
+MALI_PER_ARCH_DECL(void, meta_tess_warm, (struct mali_device *dev, unsigned domain));
 
 /* The internal copy/fill shaders, blend shaders and internal fragment
  * shaders of a device, freed at device destruction (mali_cmd_copy.c). */

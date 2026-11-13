@@ -72,7 +72,7 @@ idep_mali_kbase = declare_dependency(
 # Mesa's generator; the stubs themselves come from waist.txt.
 # Device-level commands (vkCmd*, vkQueue*, vkCreate{Sampler,ImageView,
 # BufferView,*Pipelines}, vkUpdateDescriptorSets, ...) get a dispatch table
-# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v10/mali_v11, so every
+# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v10/mali_v11/mali_v12, so every
 # arch's MALI_PER_ARCH-named functions can sit in the same .so without
 # colliding; mali_CreateDevice picks the table that matches the device
 # (mali_device.c).
@@ -88,6 +88,7 @@ mali_entrypoints = custom_target(
     '--prefix', 'mali', '--prefix', 'mali_waist',
     '--device-prefix', 'mali_v7', '--device-prefix', 'mali_v9',
     '--device-prefix', 'mali_v10', '--device-prefix', 'mali_v11',
+    '--device-prefix', 'mali_v12',
     '--beta', with_vulkan_beta.to_string(),
   ],
   depend_files : vk_entrypoints_gen_depend_files,
@@ -115,20 +116,22 @@ mali_version_h = vcs_tag(
 # binaries (vk/gen_shader_cache_id.py), not from the commit, so a driver
 # update that leaves the compiler alone keeps applications' pipeline caches.
 # One hash per architecture: a change only the v9 build sees leaves the
-# v10 and v11 ones alone.
+# v10, v11 and v12 ones alone.
 # The script runs on every build and rewrites the header only on a change.
 mali_shader_cache_id_h = custom_target(
   'mali_shader_cache_id.h',
   output : 'mali_shader_cache_id.h',
   command : [prog_python, files('vk/gen_shader_cache_id.py'),
              '--root', meson.project_source_root(),
-             '--arch', '11', '--arch', '10', '--arch', '9', '--arch', '7',
+             '--arch', '11', '--arch', '10', '--arch', '12', '--arch', '9', '--arch', '7',
              '--out-h', '@OUTPUT@'],
   build_always_stale : true,
 )
 
 _vk_c_args = [
   pre_args, malisx2_c_args,
+  # Geometry and tessellation shaders (mesa-glue/src/poly).
+  '-DMALI_WITH_POLY=@0@'.format(with_poly.to_int()),
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
 ]
 
@@ -139,7 +142,7 @@ _vk_c_args = [
 # (mali_cmd_copy.c, on each back half's dispatch) and the image copies,
 # clears and blits (mali_cmd_image.c, on each back half's dispatch and
 # render pass). Each copy names its
-# functions mali_v7_*, mali_v9_*, mali_v10_* or mali_v11_* (MALI_PER_ARCH,
+# functions mali_v7_*, mali_v9_*, mali_v10_*, mali_v11_* or mali_v12_* (MALI_PER_ARCH,
 # vk/mali_arch.h).
 _vk_per_arch_files = files(
   'vk/mali_blend.c', 'vk/mali_cmd_copy.c', 'vk/mali_cmd_image.c', 'vk/mali_cmd_meta_gfx.c',
@@ -175,7 +178,7 @@ malisx2_vk = static_library(
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
         'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
   # VkEvent: the host side and the object, for every arch; the vkCmd*
-  # commands are mali_cmd_event.c (v10, v11) and mali_jm_event.c (v7, v9).
+  # commands are mali_cmd_event.c (v10, v11, v12) and mali_jm_event.c (v7, v9).
   files('vk/mali_event.c'),
   # Sync files (the command-stream back half's kcpu queue) and the window
   # systems: the gralloc and swapchain-image side of mali_wsi.c that does
@@ -185,6 +188,8 @@ malisx2_vk = static_library(
   # The measurement layer's configuration, output and CPU profile
   # (MALISX2_MEASURE); the recording side is per back half.
   files('measurement/config.c', 'measurement/cpuprof.c'),
+  # The tessellator on the CPU, for constant tessellation levels.
+  with_poly ? files('vk/mali_tess_cpu.c') : [],
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
@@ -195,12 +200,39 @@ malisx2_vk = static_library(
   gnu_symbol_visibility : 'hidden',
 )
 
+# The tessellator's kernels (vk/cl/mali_tess.cl) as SPIR-V, which the
+# driver compiles when it first tessellates (mali_cmd_copy.c).
+if with_poly
+  _mali_tess_cl = files('vk/cl/mali_tess.cl')
+  _mali_tess_spv = custom_target(
+    'mali_tess.spv',
+    input : _mali_tess_cl,
+    output : 'mali_tess.spv',
+    command : [
+      prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', _mali_tess_cl, '--',
+      '-I' + (mesa_src / '..' / 'include'), '-I' + (mesa_src / 'compiler' / 'libcl'),
+      '-I' + (mesa_src / 'poly' / 'cl'), '-I' + mesa_src,
+      '-cl-std=cl2.0', '-D__OPENCL_VERSION__=200',
+      '-DHAVE___BUILTIN_FFS', '-DHAVE___BUILTIN_CLZ', '-DNDEBUG',
+    ],
+    depfile : 'mali_tess.spv.d',
+  )
+  mali_tess_spv_h = custom_target(
+    'mali_tess_spv.h',
+    input : [files('vk/gen_spirv_h.py'), _mali_tess_spv],
+    output : 'mali_tess_spv.h',
+    command : [prog_python, '@INPUT0@', '--name', 'mali_tess_spv', '@INPUT1@', '@OUTPUT@'],
+  )
+else
+  mali_tess_spv_h = []
+endif
+
 # The command-stream (CSF) back half: command buffers, dispatches, events,
 # queries, render passes, draws, the queue, submit and sync, the per-arch
 # side of mali_wsi.c, and the recording side of the measurement layer.
-# Built at PAN_ARCH 10 (Mali-G610, G710) and 11 (Mali-G615) with the
-# per-arch files; each copy names its own functions mali_v10_* or
-# mali_v11_* (MALI_CSF_NAMES, vk/mali_arch.h).
+# Built at PAN_ARCH 10 (Mali-G610, G710), 11 (Mali-G615) and 12 (Mali-G720)
+# with the per-arch files; each copy names its own functions mali_v10_*,
+# mali_v11_* or mali_v12_* (MALI_CSF_NAMES, vk/mali_arch.h).
 _vk_csf_files = files(
   'vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
   'vk/mali_cmd_query.c', 'vk/mali_query.c',
@@ -210,22 +242,22 @@ _vk_csf_files = files(
 )
 
 malisx2_vk_csf = {}
-foreach arch : ['10', '11']
+foreach arch : ['10', '11', '12']
   malisx2_vk_csf += {arch : static_library(
     'mali_vk_v' + arch,
     _vk_csf_files, _vk_per_arch_files,
     mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
-    mali_version_h,
+    mali_version_h, mali_shader_cache_id_h, mali_tess_spv_h,
     include_directories : _vk_inc,
-    c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=' + arch,
-              '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version())],
+    c_args : [_vk_c_args, '-DPAN_ARCH=' + arch],
     dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch[arch],
-                    idep_pan_packers_by_arch[arch]],
+                    idep_pan_packers_by_arch[arch], idep_poly],
     gnu_symbol_visibility : 'hidden',
   )}
 endforeach
 malisx2_vk_v10 = malisx2_vk_csf['10']
 malisx2_vk_v11 = malisx2_vk_csf['11']
+malisx2_vk_v12 = malisx2_vk_csf['12']
 
 # The files both job-manager back halves build, at PAN_ARCH 7 and 9:
 # command buffers, dispatches, render passes, the tiler heap, queries, the
@@ -304,8 +336,10 @@ endforeach
 # For the driver .so and the tests: the front half, the runtime, kbase, the
 # compiler. The waist behaviour is added by the user of the dependency.
 idep_mali_vk = declare_dependency(
-  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v10, malisx2_vk_v9, malisx2_vk_v7],
-  link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['11'],
+  link_whole : [malisx2_vk, malisx2_vk_v12, malisx2_vk_v11, malisx2_vk_v10, malisx2_vk_v9,
+                malisx2_vk_v7],
+  link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['12'],
+               libpanfrost_pixel_format_by_arch['11'],
                libpanfrost_pixel_format_by_arch['10'],
                libpanfrost_pixel_format_by_arch['9'],
                libpanfrost_pixel_format_by_arch['7']],

@@ -20,7 +20,7 @@
 #ifndef MALI_CS_H
 #define MALI_CS_H
 
-/* Built per command-stream arch (10 and 11), never once. */
+/* Built per command-stream arch (10, 11 and 12), never once. */
 #ifndef PAN_ARCH
 #error "mali_cs.h needs PAN_ARCH"
 #endif
@@ -109,7 +109,9 @@ static inline uint32_t
 mali_subqueue_resources(enum mali_subqueue sq)
 {
    switch (sq) {
-   case MALI_SUBQUEUE_VERTEX_TILER: return CS_IDVS_RES | CS_TILER_RES;
+   /* Compute too: a draw may need a compute job first (polygon mode line,
+    * mali_cmd_dispatch.c cmd_vt_dispatch_shader). */
+   case MALI_SUBQUEUE_VERTEX_TILER: return CS_IDVS_RES | CS_TILER_RES | CS_COMPUTE_RES;
    case MALI_SUBQUEUE_FRAGMENT: return CS_FRAG_RES;
    default: return CS_COMPUTE_RES;
    }

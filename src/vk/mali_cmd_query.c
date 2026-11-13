@@ -4,7 +4,7 @@
  */
 
 /*
- * Query commands on the command-stream frontend (v10, v11): vkCmdResetQueryPool,
+ * Query commands on the command-stream frontend (v10, v11, v12): vkCmdResetQueryPool,
  * vkCmdWriteTimestamp2 (vkCmdWriteTimestamp calls it), and the occlusion
  * queries' vkCmdBeginQuery and vkCmdEndQuery. (The job manager's are in mali_jm_query.c; the
  * pool object and the host reads are in mali_query.c.)
@@ -34,7 +34,7 @@
 #include "mali_queue.h"
 
 #if PAN_ARCH < 10
-#error "mali_cmd_query.c is written for the command-stream archs (v10, v11)"
+#error "mali_cmd_query.c is written for the command-stream archs (v10, v11, v12)"
 #endif
 
 /* The memory dependency around a dispatch that touches query memory. A

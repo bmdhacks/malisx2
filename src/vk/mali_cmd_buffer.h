@@ -251,6 +251,8 @@ mali_cmd_defer_iter(const struct mali_cmd_buffer *cmd, enum mali_subqueue sq, un
  * in bytes. False when the stream is empty. */
 bool mali_cmd_buffer_span(struct mali_cmd_buffer *cmd, unsigned sq,
                           uint64_t *addr, uint32_t *size);
+MALI_PER_CSF_ARCH_DECL(bool, cmd_buffer_span, (struct mali_cmd_buffer *cmd, unsigned sq,
+                          uint64_t *addr, uint32_t *size));
 
 /* Bit i: subqueue i has recorded work. */
 uint32_t mali_cmd_buffer_subqueue_mask(struct mali_cmd_buffer *cmd);

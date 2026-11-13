@@ -221,9 +221,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    const uint64_t fau0 = p.gpu | ((uint64_t)vs->fau.total_count << 56);
    const uint64_t srt0 = (p.gpu + rt_off) | rt_count;
    if (sv_off >= 0)
-      batch_move64(&e, IDVS(FAU_0), fau0);
+      batch_move64(&e, IDVS_VS_FAU, fau0);
    if (attribs)
-      batch_move64(&e, IDVS(SRT_0), srt0);
+      batch_move64(&e, IDVS_VS_SRT, srt0);
    if (!indexed)
       batch_move32(&e, IDVS(INDEX_OFFSET), 0);
 
@@ -288,9 +288,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
             emit_invalidate_ro(b, cmd->dev->csf->sb.all_iters_mask);
             cs_move64_to(b, base, p.gpu);
             if (sv_off >= 0)
-               cs_move64_to(b, cs_reg64(b, IDVS(FAU_0)), fau0);
+               cs_move64_to(b, cs_reg64(b, IDVS_VS_FAU), fau0);
             if (attribs)
-               cs_move64_to(b, cs_reg64(b, IDVS(SRT_0)), srt0);
+               cs_move64_to(b, cs_reg64(b, IDVS_VS_SRT), srt0);
             cs_move32_to(b, left, ring);
          }
       }
@@ -342,9 +342,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
       if (entry) {
          cs_add_imm64(b, base, base, entry);
          if (sv_off >= 0)
-            cs_add_imm64(b, cs_reg64(b, IDVS(FAU_0)), cs_reg64(b, IDVS(FAU_0)), entry);
+            cs_add_imm64(b, cs_reg64(b, IDVS_VS_FAU), cs_reg64(b, IDVS_VS_FAU), entry);
          if (attribs)
-            cs_add_imm64(b, cs_reg64(b, IDVS(SRT_0)), cs_reg64(b, IDVS(SRT_0)), entry);
+            cs_add_imm64(b, cs_reg64(b, IDVS_VS_SRT), cs_reg64(b, IDVS_VS_SRT), entry);
       }
       if (laps)
          cs_add_imm32(b, left, left, -1);
@@ -353,8 +353,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
    /* The registers the loop changed behind the draws' record, and the
     * blocks the next draw has to build again: the ones here hold the last
     * command's values. */
-   d->regs_valid &= ~(BITFIELD64_RANGE(IDVS(INDEX_COUNT), 5) |
-                      BITFIELD64_RANGE(IDVS(FAU_0), 2) | BITFIELD64_RANGE(IDVS(SRT_0), 2));
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS(INDEX_COUNT), 5);
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS_VS_FAU, 2);
+   BITSET_CLEAR_COUNT(d->regs_valid, IDVS_VS_SRT, 2);
    if (sv_off >= 0)
       d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    if (attribs)

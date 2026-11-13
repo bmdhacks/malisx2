@@ -81,6 +81,10 @@
 #define MALI_V10_DRIVER_VERSION MALI_DRIVER_VERSION
 #define MALI_V10_DRIVER_INFO \
    "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V10_SHORT
+/* The G720 build (arch 12): the same scheme, ending in its own shader
+ * cache ID. */
+#define MALI_V12_DRIVER_INFO \
+   "v1.r44p1-malisx2." MALI_VERSION_STRING ".s" MALI_SHADER_CACHE_ID_V12_SHORT
 
 static inline const char *
 driver_info_for_arch(uint32_t arch)
@@ -88,6 +92,7 @@ driver_info_for_arch(uint32_t arch)
    return arch == 7    ? MALI_V7_DRIVER_INFO
           : arch == 9  ? MALI_V9_DRIVER_INFO
           : arch == 10 ? MALI_V10_DRIVER_INFO
+          : arch == 12 ? MALI_V12_DRIVER_INFO
                        : MALI_DRIVER_INFO;
 }
 
@@ -263,9 +268,30 @@ v11_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    snprintf(buf, size, "Mali-%s MC%u", model, p->core_count);
 }
 
-/* Every product of the arches built in (7, 9, 10, 11) has a name; any other
- * arch (Midgard, the arch 6 G71 and G72, arch 12 on) has no back half here
- * and gets none. */
+/*
+ * Arch 12: the parts Mesa's model table knows (pan_model.c), which keys
+ * them by the CORE_FEATURES variant as for arch 11. The G720 with fewer
+ * than 6 cores is sold as the G620, with 10 or more and ray tracing as the
+ * Immortalis-G720 (the table's G720-Immortalis).
+ */
+static bool
+v12_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
+{
+   const struct pan_model *model =
+      pan_get_model(p->gpu_id, p->core_features & 0xff, p->core_count, p->gpu_features);
+   if (!model)
+      return false;
+   /* The table's names carry the "Mali-" prefix already. */
+   const char *name = model->name;
+   if (!strcmp(name, "Mali-G720") && p->core_count < 6)
+      name = "Mali-G620";
+   snprintf(buf, size, "%s MC%u", name, p->core_count);
+   return true;
+}
+
+/* Every product of the arches built in (7, 9, 10, 11) and the arch 12 parts
+ * Mesa's model table knows have a name; any other arch (Midgard, the arch 6
+ * G71 and G72, arch 13 on) has no back half here and gets none. */
 bool
 mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
 {
@@ -282,6 +308,8 @@ mali_device_name(const struct mali_kbase_gpu_props *p, char *buf, size_t size)
    case 11:
       v11_device_name(p, buf, size);
       return true;
+   case 12:
+      return v12_device_name(p, buf, size);
    default:
       return false;
    }
@@ -552,19 +580,19 @@ static const struct vk_device_extension_table mali_device_extensions = {
 static bool
 storage8_for_arch(uint32_t arch)      /* VK_KHR_8bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 static bool
 storage16_for_arch(uint32_t arch)     /* VK_KHR_16bit_storage */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 static bool
 int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int8 */
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -579,7 +607,7 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
 static bool
 draw_indirect_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -595,7 +623,7 @@ draw_indirect_for_arch(uint32_t arch)
 static bool
 bda_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 /*
@@ -607,10 +635,10 @@ bda_for_arch(uint32_t arch)
 static bool
 ubo_std_layout_for_arch(uint32_t arch)
 {
-   return arch == 7 || arch == 9 || arch == 10 || arch == 11;
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
-/* maxDrawIndirectCount. v10, v11: the stream compares the count as a signed
+/* maxDrawIndirectCount. v10, v11, v12: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
 static uint32_t
@@ -692,7 +720,7 @@ device_extensions_for_arch(uint32_t arch)
  * blend shader reads it from there (load_blend_input_pan); on v7 Mesa's
  * Bifrost backend does both, as for panvk_v7.
  *
- * Reported on v7, v9, v10 and v11. ARMSX2 then hardware-blends some draws into
+ * Reported on v7, v9, v10, v11 and v12. ARMSX2 then hardware-blends some draws into
  * 16-bit PS2 frames without the PS2's colour truncation, a few levels too
  * bright, as on every other driver that reports it; it saves those draws
  * a framebuffer read. Without it ARMSX2 also takes its render-target-read
@@ -707,6 +735,7 @@ dual_src_blend_for_arch(uint32_t arch)
    case 9:
    case 10:
    case 11:
+   case 12:
       return true;
    default:
       return false;
@@ -833,7 +862,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v7, v10 and v11 (not v9): clip distances are varyings the fragment
+      /* v7, v10, v11 and v12 (not v9): clip distances are varyings the fragment
        * shader tests and discards on (mali_shader.c, "Clip distances").
        * The test is per pixel, at the pixel centre, so under
        * multisampling the clipped edge is not antialiased; and with a
@@ -841,7 +870,7 @@ get_features(struct vk_features *f, uint32_t arch)
        * discards or writes memory, depth or stencil, clipped fragments
        * still write depth and stencil. Cull distances are not
        * supported. */
-      .shaderClipDistance = arch == 7 || arch == 10 || arch == 11,
+      .shaderClipDistance = arch == 7 || mali_arch_is_csf(arch),
       .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = false,
@@ -1405,7 +1434,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
-   if (p->arch_major == 10 || p->arch_major == 11) {
+   if (mali_arch_is_csf(p->arch_major)) {
       props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
       props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
    }
@@ -1515,6 +1544,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    else if (p->arch_major == 10)
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V10,
                           sizeof(MALI_SHADER_CACHE_ID_V10), p->gpu_id);
+   else if (p->arch_major == 12)
+      pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID_V12,
+                          sizeof(MALI_SHADER_CACHE_ID_V12), p->gpu_id);
    else
       pipeline_cache_uuid(props->pipelineCacheUUID, MALI_SHADER_CACHE_ID,
                           sizeof(MALI_SHADER_CACHE_ID), p->gpu_id);
@@ -1686,8 +1718,8 @@ physical_device_create(struct mali_instance *instance, const char *path,
    const enum mali_kbase_frontend frontend = kb->frontend;
    mali_kbase_destroy(kb);
 
-   /* The arch has to match the frontend the kernel speaks: CSF with v10
-    * and v11, the job manager with v7 and v9. */
+   /* The arch has to match the frontend the kernel speaks: CSF with v10,
+    * v11 and v12, the job manager with v7 and v9. */
    const bool arch_ok =
       (mali_arch_is_csf(pdev->arch) && frontend == MALI_KBASE_FRONTEND_CSF) ||
       (mali_arch_is_jm(pdev->arch) && frontend == MALI_KBASE_FRONTEND_JM);
@@ -1695,7 +1727,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
    if (!arch_ok || !mali_device_name(&pdev->props, name, sizeof(name))) {
       mesa_logw("malisx2: skipping %s: GPU product 0x%04x (arch %u) is not "
                 "one this driver was built for (arch 7 or 9 on a job-manager "
-                "kernel, arch 10 or 11 on a command-stream kernel)", path,
+                "kernel, arch 10, 11 or 12 on a command-stream kernel)", path,
                 pdev->props.product_id, pdev->props.arch_major);
       vk_free(&instance->vk.alloc, pdev);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
@@ -1759,6 +1791,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
    pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
                                    : pdev->arch == 9  ? mali_v9_sync_types()
                                    : pdev->arch == 10 ? mali_v10_sync_types()
+                                   : pdev->arch == 12 ? mali_v12_sync_types()
                                                       : mali_v11_sync_types();
 
    /* Compiled shaders are what pipeline caches hold. */
@@ -1766,6 +1799,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
       pdev->arch == 7    ? mali_v7_pipeline_cache_import_ops
       : pdev->arch == 9  ? mali_v9_pipeline_cache_import_ops
       : pdev->arch == 10 ? mali_v10_pipeline_cache_import_ops
+      : pdev->arch == 12 ? mali_v12_pipeline_cache_import_ops
                          : mali_v11_pipeline_cache_import_ops;
 
 #ifndef __ANDROID__

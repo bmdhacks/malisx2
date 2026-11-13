@@ -164,7 +164,8 @@ write_capture(struct mali_device *dev, struct mali_measure_capture *cap, FILE *f
       };
       uint32_t mask = 0;
       for (unsigned i = 0; i < MALI_SUBQUEUE_COUNT; i++) {
-         if (mali_cmd_buffer_span(cmd, i, &cb.span[i].addr, &cb.span[i].size))
+         if (mali_csf_arch_dispatch(mali_device_physical(dev)->arch, cmd_buffer_span, cmd, i,
+                                    &cb.span[i].addr, &cb.span[i].size))
             mask |= 1u << i;
       }
       if (!put_record(fp, CAP_CMDBUF, c, mask, cmd->usage, &cb, sizeof(cb), bytes))

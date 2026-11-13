@@ -691,8 +691,8 @@ pack_zsd(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       if (in->fs) {
          /* The same bit is Shader Read Only Z/S on v10, which the
           * early-ZS choice above never asks for (panvk sets it only for
-          * a read-only tile-buffer read it can prove). */
-#if PAN_ARCH >= 11
+          * a read-only tile-buffer read it can prove); v12 has neither. */
+#if PAN_ARCH == 11
          cfg.separated_dependency_tracking = true;
 #endif
          cfg.depth_source = in->fs->info.fs.writes_depth ?
@@ -912,7 +912,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
           * WRC 3 got light vertical streaks a few pixels wide and Katamari
           * Damacy changed at 2x upscale and above, on the G57 and the G615.
           * Those draws are excluded the same way forward pixel kill
-          * excludes them. */
+          * excludes them. v12 has no such bit. */
+#if PAN_ARCH < 12
          cfg.allow_primitive_reorder =
             has_depth(in->rp) && dyn->ds.depth.test_enable && dyn->ds.depth.write_enable &&
             (dyn->ds.depth.compare_op == VK_COMPARE_OP_LESS ||
@@ -922,6 +923,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
             !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read &&
             !(out->rt_read & out->rt_written) &&
             !(dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT);
+#endif
          cfg.scissor_to_bounding_box = true;
 #if PAN_ARCH >= 11
          cfg.conservative_rast_mode =

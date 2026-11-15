@@ -209,12 +209,21 @@ mali_wsi_alloc_scanout(struct mali_physical_device *pdev, VkFormat format, unsig
 
    const int nfd = gbm_bo_get_fd(bo);
    *stride = gbm_bo_get_stride(bo);
-   *size = (uint64_t)gbm_bo_get_stride(bo) * gbm_bo_get_height(bo);
    gbm_bo_destroy(bo);
    if (nfd < 0) {
       mesa_loge("malisx2: gbm_bo_get_fd failed: %s", strerror(errno));
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
+   /* The dma-buf's own size. The kernel rounds a buffer up to whole pages, as
+    * the image's layout does, so stride * height falls short of the image
+    * unless its rows happen to fill the last page. */
+   const off_t end = lseek(nfd, 0, SEEK_END);
+   if (end < 0) {
+      mesa_loge("malisx2: size of the scanout dma-buf: %s", strerror(errno));
+      close(nfd);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   *size = end;
    *fd = nfd;
    return VK_SUCCESS;
 }

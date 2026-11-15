@@ -1744,6 +1744,9 @@ physical_device_create(struct mali_instance *instance, const char *path,
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
+   /* The Mali-G31 (arch 7, product major 3): an AFBC render target faults
+    * (0x58) on the H700's, so it gets linear and u-interleaved images only. */
+   pdev->afbc = !(pdev->arch == 7 && pdev->props.product_major == 3);
    pdev->timestamp_hz = timestamp_frequency();
    init_memory(pdev);
    /* driverInfo carries the shader cache ID, not the commit; say which build

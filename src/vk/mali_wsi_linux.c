@@ -130,6 +130,8 @@ mali_wsi_init(struct mali_physical_device *pdev)
 
    pdev->wsi = wsi;
    pdev->vk.wsi_device = wsi;
+   /* No DRM node: VK_KHR_display on the framebuffer device instead. */
+   mali_wsi_fbdev_init(pdev);
    return VK_SUCCESS;
 }
 
@@ -137,6 +139,7 @@ void
 mali_wsi_finish(struct mali_physical_device *pdev)
 {
    pdev->vk.wsi_device = NULL;
+   mali_wsi_fbdev_finish(pdev);
    if (pdev->wsi) {
       wsi_device_finish(pdev->wsi, &pdev->vk.instance->alloc);
       vk_free(&pdev->vk.instance->alloc, pdev->wsi);

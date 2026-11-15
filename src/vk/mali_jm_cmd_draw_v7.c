@@ -1660,9 +1660,11 @@ vs_reads_draw_sysvals(const struct mali_shader *vs)
    const unsigned fv = offsetof(struct mali_graphics_sysvals, vs.first_vertex);
    const unsigned bi = offsetof(struct mali_graphics_sysvals, vs.base_instance);
    const unsigned rvo = offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset);
+   const unsigned did = offsetof(struct mali_graphics_sysvals, draw_id);
    return BITSET_TEST(vs->fau.used_sysvals, fv / MALI_FAU_WORD_SIZE) ||
           BITSET_TEST(vs->fau.used_sysvals, bi / MALI_FAU_WORD_SIZE) ||
-          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE);
+          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE) ||
+          BITSET_TEST(vs->fau.used_sysvals, did / MALI_FAU_WORD_SIZE);
 }
 
 /* The address of a vertex shader system value in its FAU block at fau, 0
@@ -1685,7 +1687,8 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    const struct mali_shader *vs = p->vs;
 
    /* Placeholders the patch job replaces: one vertex, one instance. */
-   const struct mali_draw_info di = {.count = 1, .instance_count = 1, .indexed = call->indexed};
+   const struct mali_draw_info di = {
+      .count = 1, .instance_count = 1, .indexed = call->indexed, .draw_id = i};
    struct draw_data dd;
    memset(&dd, 0, sizeof(dd));
    dd.vertex_range = 1;

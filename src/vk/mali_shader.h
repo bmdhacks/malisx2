@@ -123,6 +123,10 @@ struct mali_graphics_sysvals {
       } v7_desc;
    };
    struct mali_input_attachment_info iam[MALI_INPUT_ATTACHMENT_MAP_SIZE];
+   /* v7: DrawIndex, the draw's index in a multi-draw indirect (0 for a
+    * direct draw). */
+   uint32_t draw_id;
+   uint32_t _pad_draw_id;
 } __attribute__((aligned(8)));
 
 static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==

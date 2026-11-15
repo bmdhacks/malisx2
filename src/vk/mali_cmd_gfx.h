@@ -316,6 +316,7 @@ struct mali_gfx_draw_state {
    /* The last values the FAU blocks were built with. */
    int32_t first_vertex;
    uint32_t base_instance;
+   uint32_t draw_id;                /* v7: DrawIndex */
    uint64_t blend_descs[8];         /* fs.blend_descs, from the last blend build */
    uint32_t blend_shader_mask;      /* targets blended by a shader, last blend build */
 

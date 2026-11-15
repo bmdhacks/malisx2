@@ -435,6 +435,7 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
+   sv->draw_id = d->draw_id;
    sv->vs.noperspective_varyings = p->bind.noperspective;
 #if PAN_ARCH >= 9
    /* On v7 these words are v7_desc.sets, which the v7 draw fills: BLEND
@@ -1120,6 +1121,7 @@ struct mali_draw_info {
    int32_t vertex_offset;      /* firstVertex or vertexOffset */
    uint32_t first_instance;
    bool indexed;
+   uint32_t draw_id;           /* DrawIndex: the multi-draw indirect index */
 };
 
 /* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
@@ -1288,6 +1290,9 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    }
    d->first_vertex = di->vertex_offset;
    d->base_instance = di->first_instance;
+   if (d->draw_id != di->draw_id)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   d->draw_id = di->draw_id;
 
    /* Descriptor sets bound since a stage's table was built. */
    if (d->vs_sets_dirty & bd->vs_sets)

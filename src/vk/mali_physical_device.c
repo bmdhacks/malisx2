@@ -704,6 +704,12 @@ device_extensions_for_arch(uint32_t arch)
 
    ext.KHR_buffer_device_address = bda_for_arch(arch);
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
+   /* v7: DrawIndex is a system value the draw sets (draw_id); 8-bit indices
+    * and list restart are the index scan's and the tiler's. */
+   ext.KHR_shader_draw_parameters = arch == 7;
+   ext.KHR_index_type_uint8 = arch == 7;
+   ext.EXT_index_type_uint8 = arch == 7;
+   ext.EXT_primitive_topology_list_restart = arch == 7;
 #ifndef __ANDROID__
    /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
    ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
@@ -985,6 +991,11 @@ get_features(struct vk_features *f, uint32_t arch)
    };
 
    get_descriptor_indexing_features(f, arch);
+   if (arch == 7) {
+      f->shaderDrawParameters = true;
+      f->indexTypeUint8 = true;
+      f->primitiveTopologyListRestart = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and

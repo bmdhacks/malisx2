@@ -106,6 +106,10 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
       return MALI_KBASE_ERROR_INVALID_ARGUMENT;
 
    const bool frame_nr = kb->jm_atom_layout == MALI_KBASE_JM_ATOM_FRAME_NR;
+   /* base_jd_atom_v2 is struct kb_jm_atom from jc on, cut at v2_size. */
+   const unsigned v2_size = kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2      ? 56
+                            : kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2_48 ? 48
+                                                                            : 0;
    for (unsigned off = 0; off < n; off += MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT) {
       unsigned batch = n - off;
       if (batch > MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT)
@@ -125,6 +129,14 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
             wide[i].atom = atoms[off + i];
          s.addr = (uint64_t)(uintptr_t)wide;
          s.stride = sizeof(struct kb_jm_atom_frame_nr);
+      }
+      /* At most 14 KiB, only on kernels before 11.22. */
+      uint8_t narrow[v2_size ? batch * v2_size : 1];
+      if (v2_size) {
+         for (unsigned i = 0; i < batch; i++)
+            memcpy(narrow + i * v2_size, (const uint8_t *)&atoms[off + i].jc, v2_size);
+         s.addr = (uint64_t)(uintptr_t)narrow;
+         s.stride = v2_size;
       }
       long ret = kb_ioctl(kb, KB_JM_IOCTL_JOB_SUBMIT, &s);
       if (ret < 0) {
@@ -155,6 +167,16 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
 enum mali_kbase_result
 kb_jm_probe_atom_layout(struct mali_kbase *kb)
 {
+   /* Before 11.22 the kernel takes base_jd_atom_v2 only and its size
+    * follows from the minor (uapi_jm.h). The frame_nr variant is only
+    * known on 11.22 and later, so nothing is probed. */
+   if (kb->uk_minor < KB_JM_UK_ATOM_V3_MINOR) {
+      kb->jm_atom_layout = kb->uk_minor >= KB_JM_UK_ATOM_RP_MINOR ? MALI_KBASE_JM_ATOM_V2
+                                                                  : MALI_KBASE_JM_ATOM_V2_48;
+      kb->jm_probe_errno = 0;
+      return MALI_KBASE_SUCCESS;
+   }
+
    struct kb_jm_atom_frame_nr probe;
    memset(&probe, 0, sizeof(probe));
    probe.atom.atom_number = PROBE_ATOM_NUMBER;
@@ -225,7 +247,12 @@ kb_jm_probe_atom_layout(struct mali_kbase *kb)
 const char *
 mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf, size_t size)
 {
-   if (kb->jm_atom_layout == MALI_KBASE_JM_ATOM_FRAME_NR) {
+   if (kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2 ||
+       kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2_48) {
+      snprintf(buf, size, "%u-byte base_jd_atom_v2 (UK %u.%u, before base_jd_atom): not probed",
+               kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2 ? 56u : 48u, kb->uk_major,
+               kb->uk_minor);
+   } else if (kb->jm_atom_layout == MALI_KBASE_JM_ATOM_FRAME_NR) {
       snprintf(buf, size,
                "72-byte atoms with frame_nr (MediaTek kbase): the kernel accepted "
                "stride 72, probe atom completed with 0x%x%s",

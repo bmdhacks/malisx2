@@ -287,11 +287,12 @@ struct mali_kbase {
     * 32-byte form, so imports skip the standard request. Set by the first
     * import that finds out; read and written with relaxed atomics. */
    bool jm_huawei_mem_import;
-   /* Command stream only: an allocation in a nonzero memory group failed
-    * with ENOMEM where group 0 did not (Google's Tensor kernels, whose
-    * memory group manager backs only some groups), so every allocation
-    * goes to group 0. Set by the first allocation that finds out; read and
-    * written with relaxed atomics. */
+   /* Command stream only. csf_mem_group_ok: an allocation in a nonzero
+    * memory group has succeeded. csf_mem_group_0_only: before any had, one
+    * failed with ENOMEM where group 0 did not (Google's Tensor kernels,
+    * whose memory group manager backs only some groups), so every
+    * allocation goes to group 0. Read and written with relaxed atomics. */
+   bool csf_mem_group_ok;
    bool csf_mem_group_0_only;
    /* SET_FLAGS succeeded: the kernel context exists. */
    bool context_created;

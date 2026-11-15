@@ -230,6 +230,20 @@ jm_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info, uint64
    return r;
 }
 
+/* One MEM_ALLOC_EX of the given flags. */
+static long
+alloc_ex(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info, uint64_t va_pages,
+         uint64_t commit_pages, uint64_t flags, union kb_ioctl_mem_alloc_ex *a)
+{
+   memset(a, 0, sizeof(*a));
+   a->in.va_pages = va_pages;
+   a->in.commit_pages = commit_pages;
+   a->in.extension = (flags & KB_MEM_GROW_ON_GPF) ? info->extension_pages : 0;
+   a->in.flags = flags;
+   a->in.fixed_address = info->fixed_address;
+   return kb_ioctl(kb, KB_IOCTL_MEM_ALLOC_EX, a);
+}
+
 enum mali_kbase_result
 mali_kbase_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info,
                  struct mali_kbase_bo *bo)
@@ -275,32 +289,27 @@ mali_kbase_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info
       return jm_alloc(kb, info, va_pages, commit_pages, flags, bo);
 
    union kb_ioctl_mem_alloc_ex a;
-   memset(&a, 0, sizeof(a));
-   a.in.va_pages = va_pages;
-   a.in.commit_pages = commit_pages;
-   a.in.extension = (flags & KB_MEM_GROW_ON_GPF) ? info->extension_pages : 0;
-   a.in.flags = flags;
-   a.in.fixed_address = info->fixed_address;
-   long ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC_EX, &a);
+   long ret = alloc_ex(kb, info, va_pages, commit_pages, flags, &a);
    /* A memory group manager may back only some groups: Google's Tensor
     * kernels (Pixel 7, 8, 9) answer ENOMEM for the blob's default groups
-    * 6 and 9 even for one page. Group 0 is always there; if it serves the
-    * request, it serves every later one too. */
+    * 6 and 9 even for one page. Retry in group 0, which is always there.
+    * Only a kernel that has refused the groups from the first allocation
+    * on moves the context to group 0 for good; once a group allocation has
+    * succeeded, an ENOMEM is real memory pressure, and only that one
+    * allocation goes to group 0. */
    if (ret == -ENOMEM && (flags & KB_MEM_GROUP_ID_MASK)) {
       const uint64_t group0 = flags & ~KB_MEM_GROUP_ID_MASK;
-      memset(&a, 0, sizeof(a));
-      a.in.va_pages = va_pages;
-      a.in.commit_pages = commit_pages;
-      a.in.extension = (flags & KB_MEM_GROW_ON_GPF) ? info->extension_pages : 0;
-      a.in.flags = group0;
-      a.in.fixed_address = info->fixed_address;
-      ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC_EX, &a);
-      if (ret >= 0 && !__atomic_exchange_n(&kb->csf_mem_group_0_only, true, __ATOMIC_RELAXED))
-         KB_LOG(kb, "MEM_ALLOC_EX in memory group %u failed with ENOMEM and group 0 did "
-                    "not; using group 0 from now on",
+      ret = alloc_ex(kb, info, va_pages, commit_pages, group0, &a);
+      if (ret >= 0 && !__atomic_load_n(&kb->csf_mem_group_ok, __ATOMIC_RELAXED) &&
+          !__atomic_exchange_n(&kb->csf_mem_group_0_only, true, __ATOMIC_RELAXED))
+         KB_LOG(kb, "MEM_ALLOC_EX: the kernel has no memory in group %u but has in group 0; "
+                    "using group 0 from now on",
                 (unsigned)((flags & KB_MEM_GROUP_ID_MASK) >> KB_MEM_GROUP_ID_SHIFT));
       if (ret >= 0)
          flags = group0;
+   } else if (ret >= 0 && (flags & KB_MEM_GROUP_ID_MASK) &&
+              !__atomic_load_n(&kb->csf_mem_group_ok, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&kb->csf_mem_group_ok, true, __ATOMIC_RELAXED);
    }
    if (ret < 0) {
       KB_LOG(kb, "MEM_ALLOC_EX of %llu pages, flags 0x%llx failed: %s",

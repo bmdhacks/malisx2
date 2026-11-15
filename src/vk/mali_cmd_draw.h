@@ -4,7 +4,8 @@
  */
 
 /*
- * What a draw puts in the vertex/tiler stream before its RUN_IDVS, for
+ * What a draw puts in the vertex/tiler stream before its RUN_IDVS
+ * (RUN_IDVS2 on v12), for
  * the direct draws (mali_cmd_draw.c) and the indirect ones
  * (mali_cmd_draw_indirect.c): the staging-register moves of the draw's
  * dirty state, collected and copied into the stream in one piece, the
@@ -22,10 +23,38 @@
 #include "mali_cmd_state.h"
 
 #if PAN_ARCH < 10
-#error "mali_cmd_draw.h is written for the command-stream archs (v10, v11)"
+#error "mali_cmd_draw.h is written for the command-stream archs (v10, v11, v12)"
 #endif
 
 #define IDVS(reg) MALI_IDVS_SR_##reg
+
+/* The staging registers of a draw's resources. v12 names them per stage
+ * (one vertex shader, no position/varying pair: IDVS2); on v10 and v11 the
+ * vertex stage reads group 0 for position and group 1 (SPD_1) for
+ * varyings, the fragment stage group 2, both TSD_0 (run_idvs_ins). */
+#if PAN_ARCH >= 12
+#define IDVS_VS_FAU IDVS(VERTEX_FAU)
+#define IDVS_FS_FAU IDVS(FRAGMENT_FAU)
+#define IDVS_VS_SRT IDVS(VERTEX_SRT)
+#define IDVS_FS_SRT IDVS(FRAGMENT_SRT)
+#define IDVS_FS_SPD IDVS(FRAGMENT_SPD)
+#else
+#define IDVS_VS_FAU IDVS(FAU_0)
+#define IDVS_FS_FAU IDVS(FAU_2)
+#define IDVS_VS_SRT IDVS(SRT_0)
+#define IDVS_FS_SRT IDVS(SRT_2)
+#define IDVS_FS_SPD IDVS(SPD_2)
+#endif
+
+/* The staging registers RUN_IDVS reads, by bit in
+ * mali_gfx_draw_state::regs_valid: 0..65 on v12, whose last is OQ, and
+ * 0..63 on v10 and v11, where OQ (46) is followed by VARY_SIZE, BLEND_DESC,
+ * ZSD, INDEX_BUFFER, TILER_FLAGS, the DCD words and PRIMITIVE_SIZE. */
+#if PAN_ARCH >= 12
+#define MALI_IDVS_SR_COUNT (IDVS(OQ) + 2)
+#else
+#define MALI_IDVS_SR_COUNT 64
+#endif
 
 /* ---------------------------------------------------------------------- */
 /* FAU                                                                     */
@@ -130,6 +159,24 @@ emit_ubo_push_general(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
 /* ---------------------------------------------------------------------- */
 /* Draw                                                                    */
 
+#if PAN_ARCH >= 12
+/* RUN_IDVS2 with the vertex stage shaded early, as panvk v12. The stages
+ * read their own staging registers (IDVS_VS_*, IDVS_FS_*). */
+static uint64_t
+run_idvs_ins(uint32_t flags_override)
+{
+   struct mali_cs_run_idvs2_packed ins;
+   pan_pack(&ins, CS_RUN_IDVS2, I) {
+      I.flags_override = flags_override;
+      I.malloc_enable = MALI_CS_MEMORY_ALLOCATION_ENABLE_MALLOC;
+      I.draw_id_register_enable = MALI_CS_DRAW_ID_REGISTER_ENABLE_NO_DRAWID;
+      I.vertex_shading_mode = MALI_IDVS_SHADING_MODE_EARLY;
+   }
+   uint64_t v;
+   memcpy(&v, &ins, sizeof(v));
+   return v;
+}
+#else
 /* RUN_IDVS, with bit 55 set on v11 (mali_cmd_draw.c). Selects as panvk:
  * varying stage from group 0/1 (SPD_1), fragment from group 2, both with
  * TSD_0. */
@@ -155,6 +202,7 @@ run_idvs_ins(uint32_t flags_override)
    memcpy(&v, &ins, sizeof(v));
    return v;
 }
+#endif
 
 static void
 emit_run_idvs(struct cs_builder *b, uint32_t flags_override)
@@ -182,9 +230,10 @@ static inline void
 batch_move32(struct idvs_batch *e, unsigned reg, uint32_t v)
 {
    struct mali_gfx_draw_state *d = e->d;
-   if ((d->regs_valid & BITFIELD64_BIT(reg)) && d->regs[reg] == v)
+   assert(reg < MALI_IDVS_SR_COUNT);
+   if (BITSET_TEST(d->regs_valid, reg) && d->regs[reg] == v)
       return;
-   d->regs_valid |= BITFIELD64_BIT(reg);
+   BITSET_SET(d->regs_valid, reg);
    d->regs[reg] = v;
    struct mali_cs_move32_packed m;
    pan_pack(&m, CS_MOVE32, I) {
@@ -200,13 +249,15 @@ batch_move64(struct idvs_batch *e, unsigned reg, uint64_t v)
 {
    struct mali_gfx_draw_state *d = e->d;
    const uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
-   const bool lo_ok = (d->regs_valid & BITFIELD64_BIT(reg)) && d->regs[reg] == lo;
-   const bool hi_ok = (d->regs_valid & BITFIELD64_BIT(reg + 1)) && d->regs[reg + 1] == hi;
+   assert(reg + 1 < MALI_IDVS_SR_COUNT);
+   const bool lo_ok = BITSET_TEST(d->regs_valid, reg) && d->regs[reg] == lo;
+   const bool hi_ok = BITSET_TEST(d->regs_valid, reg + 1) && d->regs[reg + 1] == hi;
    if (lo_ok && hi_ok)
       return;
    if (!lo_ok && !hi_ok && v < (1ull << 48)) {
       /* MOVE48 zero-extends into the high register. */
-      d->regs_valid |= BITFIELD64_BIT(reg) | BITFIELD64_BIT(reg + 1);
+      BITSET_SET(d->regs_valid, reg);
+      BITSET_SET(d->regs_valid, reg + 1);
       d->regs[reg] = lo;
       d->regs[reg + 1] = hi;
       struct mali_cs_move48_packed m;
@@ -304,7 +355,7 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (d->dirty & MALI_GFX_DIRTY_VS_FAU) {
       if (!mali_gfx_build_vs_fau(cmd, &sv, &v))
          return false;
-      batch_move64(e, IDVS(FAU_0), v);
+      batch_move64(e, IDVS_VS_FAU, v);
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_FAU) {
       if (!mali_gfx_build_fs_fau(cmd, &sv, &v))
@@ -312,17 +363,17 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       /* Straight into the stream, ahead of the batched moves and RUN_IDVS. */
       if (p->fs && p->fs->fau.ubo_push_count)
          emit_ubo_push(cmd, e, p->fs, v & BITFIELD64_MASK(56));
-      batch_move64(e, IDVS(FAU_2), v);
+      batch_move64(e, IDVS_FS_FAU, v);
    }
    if (d->dirty & MALI_GFX_DIRTY_VS_SRT) {
       if (!mali_gfx_build_vs_srt(cmd, &v))
          return false;
-      batch_move64(e, IDVS(SRT_0), v);
+      batch_move64(e, IDVS_VS_SRT, v);
    }
    if (d->dirty & MALI_GFX_DIRTY_FS_SRT) {
       if (!mali_gfx_build_fs_srt(cmd, &v))
          return false;
-      batch_move64(e, IDVS(SRT_2), v);
+      batch_move64(e, IDVS_FS_SRT, v);
    }
    if (d->dirty & MALI_GFX_DIRTY_ZSD) {
       if (!mali_gfx_build_zsd(cmd, dbk, &v))
@@ -332,18 +383,26 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (d->dirty & MALI_GFX_DIRTY_PIPELINE) {
       bool lines;
       if (unlikely(dbk)) {
+#if PAN_ARCH >= 12
+         batch_move64(e, IDVS(VERTEX_SPD), dbk->vs_pos_spd);
+#else
          batch_move64(e, IDVS(SPD_0), dbk->vs_pos_spd);
          batch_move64(e, IDVS(SPD_1), dbk->vs_var_spd);
-         batch_move64(e, IDVS(SPD_2), dbk->fs_spd);
+#endif
+         batch_move64(e, IDVS_FS_SPD, dbk->fs_spd);
          batch_move32(e, IDVS(TILER_FLAGS), dbk->tiler_flags);
          batch_move32(e, IDVS(DCD0), mali_gfx_dcd0(d, dbk));
          batch_move32(e, IDVS(DCD1), dbk->dcd1);
          batch_move32(e, IDVS(DCD2), dbk->dcd2);
          lines = u_reduced_prim(dbk->prim) == MESA_PRIM_LINES;
       } else {
+#if PAN_ARCH >= 12
+         batch_move64(e, IDVS(VERTEX_SPD), bd->spd[0]);
+#else
          batch_move64(e, IDVS(SPD_0), bd->spd[0]);
          batch_move64(e, IDVS(SPD_1), bd->spd[1]);
-         batch_move64(e, IDVS(SPD_2), bd->spd[2]);
+#endif
+         batch_move64(e, IDVS_FS_SPD, bd->spd[2]);
          batch_move32(e, IDVS(TILER_FLAGS), bd->tiler_flags);
          batch_move32(e, IDVS(DCD0), mali_gfx_dcd0(d, NULL));
          batch_move32(e, IDVS(DCD1), bd->dcd1);
@@ -364,14 +423,26 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
       batch_move64(e, IDVS(OQ), d->oq_addr);
    }
    if (d->dirty & MALI_GFX_DIRTY_VIEWPORT) {
-      const VkViewport *vp = &dyn->vp.viewports[0];
       batch_move64(e, IDVS(SCISSOR_BOX), mali_gfx_scissor_box(cmd));
+#if PAN_ARCH >= 12
+      uint64_t words[2];
+      mali_gfx_viewport(cmd, words);
+      batch_move64(e, IDVS(VIEWPORT_HIGH), words[0]);
+      batch_move64(e, IDVS(VIEWPORT_LOW), words[1]);
+#else
+      const VkViewport *vp = &dyn->vp.viewports[0];
       batch_move32(e, IDVS(LOW_DEPTH_CLAMP), fui(MIN2(vp->minDepth, vp->maxDepth)));
       batch_move32(e, IDVS(HIGH_DEPTH_CLAMP), fui(MAX2(vp->minDepth, vp->maxDepth)));
+#endif
    }
    if (d->dirty & MALI_GFX_DIRTY_PASS) {
       batch_move64(e, IDVS(TILER_CTX), r->tiler);
+#if PAN_ARCH >= 12
+      batch_move64(e, IDVS(VERTEX_TSD), r->tsd);
+      batch_move64(e, IDVS(FRAGMENT_TSD), r->tsd);
+#else
       batch_move64(e, IDVS(TSD_0), r->tsd);
+#endif
    }
    if (di->indexed && (d->dirty & MALI_GFX_DIRTY_INDEX)) {
       batch_move64(e, IDVS(INDEX_BUFFER), d->ib.addr);

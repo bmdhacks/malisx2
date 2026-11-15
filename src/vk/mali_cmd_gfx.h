@@ -330,12 +330,12 @@ struct mali_gfx_draw_state {
    /* Descriptor sets bound since each stage's table was built. */
    uint32_t vs_sets_dirty, fs_sets_dirty;
 
-   /* What the IDVS staging registers 0..63 hold, per 32-bit register,
-    * where regs_valid says it is known: a draw writes only the registers
-    * whose value changes. Only mali_cmd_draw.c writes these registers;
-    * anything else that does clears regs_valid. */
-   uint64_t regs_valid;
-   uint32_t regs[64];
+   /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on
+    * v12), per 32-bit register, where regs_valid says it is known: a draw
+    * writes only the registers whose value changes. Only mali_cmd_draw.c
+    * writes these registers; anything else that does clears regs_valid. */
+   BITSET_DECLARE(regs_valid, 66);
+   uint32_t regs[66];
 
    /* The pipeline's words repacked with this command buffer's dynamic
     * state, for pipelines whose baked words depend on it. */

@@ -312,8 +312,8 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    const unsigned arch = mali_device_physical(dev)->arch;
    image->vk.drm_format_mod = choose_modifier(image, formats, arch, pCreateInfo);
-   /* CRC on the command-stream archs (v10 and v11). Not on v7 and v9 yet:
-    * the job manager cannot update the CRC state from the GPU, and the
+   /* CRC on the command-stream archs (v10, v11 and v12). Not on v7 and v9
+    * yet: the job manager cannot update the CRC state from the GPU, and the
     * CPU-side state it needs is not written yet. */
    const bool crc = mali_arch_is_csf(arch) &&
                     mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);

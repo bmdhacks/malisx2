@@ -917,12 +917,22 @@ MALI_PER_ARCH(meta_fs_dcd)(struct mali_cmd_buffer *cmd, const struct mali_shader
       cfg.blend = blend;
       cfg.blend_count = blend_count;
       cfg.depth_stencil = zsd.gpu;
+#if PAN_ARCH >= 12
+      /* The fragment stage's own fields (panvk v12 cmd_draw_rects); the
+       * depth range left the descriptor with the Viewport. */
+      cfg.fragment_resources = table.gpu | 4;
+      cfg.fragment_shader = fs->spd[MALI_SPD_MAIN];
+      cfg.thread_storage = r->tsd;
+      cfg.fragment_fau.pointer = fau & BITFIELD64_MASK(56);
+      cfg.fragment_fau.count = fs->fau.total_count;
+#else
       cfg.maximum_z = 1.0f;
       cfg.shader.resources = table.gpu | 4;
       cfg.shader.shader = fs->spd[MALI_SPD_MAIN];
       cfg.shader.thread_storage = r->tsd;
       cfg.shader.fau = fau & BITFIELD64_MASK(56);
       cfg.shader.fau_count = fs->fau.total_count;
+#endif
    }
    return true;
 #endif /* PAN_ARCH >= 9 */

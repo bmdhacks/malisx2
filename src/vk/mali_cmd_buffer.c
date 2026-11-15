@@ -41,12 +41,12 @@
 /* Layout                                                                  */
 
 /*
- * This back half is built at v10 and v11 into one driver, and the
- * structures below must come out the same in both (no field may depend on
- * PAN_ARCH): the v11 build defines the command buffer's layout and the v10
- * build checks its own against it, and both check what they share with the
- * code built once against that build's view (mali_device.c). A difference
- * fails the link (mali_layout_check.h).
+ * This back half is built at v10, v11 and v12 into one driver, and the
+ * structures below must come out the same in all of them (no field may
+ * depend on PAN_ARCH): the v11 build defines the command buffer's layout
+ * and the v10 and v12 builds check their own against it, and all check
+ * what they share with the code built once against that build's view
+ * (mali_device.c). A difference fails the link (mali_layout_check.h).
  */
 static void __attribute__((used))
 layout_check(void)
@@ -222,6 +222,11 @@ init_streams(struct mali_cmd_buffer *cmd)
       const struct cs_builder_conf conf = {
          .nr_registers = csf->nr_registers,
          .nr_kernel_registers = MALI_CS_KERNEL_REGS,
+#if PAN_ARCH >= 12
+         /* RUN_COMPUTE's endpoint limit: the tasks a core takes at once,
+          * THREAD_FEATURES bits 31:24 (panvk, panthor_kmod). */
+         .compute_ep_limit = cmd->dev->kbase->props.thread_features >> 24,
+#endif
          .alloc_buffer = cs_alloc_chunk,
          .cookie = cmd,
          .ls_sb_slot = MALI_SB_LS,

@@ -348,7 +348,9 @@ mali_csf_device_init(struct mali_device *dev)
    csf->dev = dev;
    csf->kb = dev->kbase;
    csf->wake_fd = -1;
-   csf->nr_registers = dev->kbase->glb.cs_work_registers;
+   /* The register layout (mali_cs.h) is the 96-register one of v11; v12
+    * has 128, of which the layout leaves the top 32 unused. */
+   csf->nr_registers = MIN2(dev->kbase->glb.cs_work_registers, MALI_CS_REG_COUNT);
 
    /* STREAM_FEATURES bits 15:8: scoreboard entries per CS. The layout
     * needs the three fixed entries plus at least one iterator. */

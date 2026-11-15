@@ -142,7 +142,7 @@ static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==
 
 /*
  * Only a v7 build adds the compute v7_desc words, so the struct keeps one
- * layout on v9, v10 and v11 and in the files built once (which see that
+ * layout on v9, v10, v11 and v12 and in the files built once (which see that
  * layout: nothing built once looks at a v7 compute sysval block).
  */
 #if defined(PAN_ARCH)
@@ -458,11 +458,13 @@ extern const struct vk_pipeline_cache_object_ops mali_v7_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v9_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v10_shader_cache_ops;
 extern const struct vk_pipeline_cache_object_ops mali_v11_shader_cache_ops;
+extern const struct vk_pipeline_cache_object_ops mali_v12_shader_cache_ops;
 /* NULL-terminated lists for vk_physical_device::pipeline_cache_import_ops. */
 extern const struct vk_pipeline_cache_object_ops *const mali_v7_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v9_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v10_pipeline_cache_import_ops[];
 extern const struct vk_pipeline_cache_object_ops *const mali_v11_pipeline_cache_import_ops[];
+extern const struct vk_pipeline_cache_object_ops *const mali_v12_pipeline_cache_import_ops[];
 
 static inline struct mali_shader *
 mali_shader_ref(struct mali_shader *s)

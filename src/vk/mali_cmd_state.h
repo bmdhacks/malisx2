@@ -722,7 +722,9 @@ mali_gfx_pack_varying_descs(const struct mali_shader *vs, const struct mali_shad
          cfg.table = 61;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
          cfg.offset = 1024 + offset;
-         cfg.buffer_index = 0;
+         /* v12 puts the hardware's varying buffer at index 1 (panvk
+          * emit_varying_descs). */
+         cfg.buffer_index = PAN_ARCH >= 12 ? 1 : 0;
          cfg.attribute_stride = vl->generic_size_B;
          cfg.packet_stride = vl->generic_size_B + 16;
       }
@@ -1064,6 +1066,37 @@ mali_gfx_scissor_box(const struct mali_cmd_buffer *cmd)
    return mali_gfx_pack_scissor(minx, miny, maxx, maxy);
 }
 
+#endif
+
+#if PAN_ARCH >= 12
+/*
+ * The packed Viewport (128 bits) of viewport 0, for the VIEWPORT_HIGH and
+ * VIEWPORT_LOW staging registers (panvk v12 prepare_vp): the rectangle as
+ * inclusive bounds, and the depth range the v11 LOW/HIGH_DEPTH_CLAMP
+ * registers held.
+ */
+static inline void
+mali_gfx_viewport(const struct mali_cmd_buffer *cmd, uint64_t words[2])
+{
+   const VkViewport *vp = &cmd->vk.dynamic_graphics_state.vp.viewports[0];
+   int minx = (int)vp->x;
+   int maxx = (int)(vp->x + vp->width);
+   int miny = (int)MIN2(vp->y, vp->y + vp->height);
+   int maxy = (int)MAX2(vp->y, vp->y + vp->height);
+   maxx = maxx > minx ? maxx - 1 : maxx;
+   maxy = maxy > miny ? maxy - 1 : maxy;
+
+   struct mali_viewport_packed v;
+   pan_pack(&v, VIEWPORT, cfg) {
+      cfg.min_x = CLAMP(minx, 0, UINT16_MAX);
+      cfg.min_y = CLAMP(miny, 0, UINT16_MAX);
+      cfg.max_x = CLAMP(maxx, 0, UINT16_MAX);
+      cfg.max_y = CLAMP(maxy, 0, UINT16_MAX);
+      cfg.min_depth = MIN2(vp->minDepth, vp->maxDepth);
+      cfg.max_depth = MAX2(vp->minDepth, vp->maxDepth);
+   }
+   memcpy(words, &v, 2 * sizeof(uint64_t));
+}
 #endif
 
 static inline enum mali_index_type

@@ -31,9 +31,9 @@ project(
 # Every arch we generate genxml packers and a pixel-format library for, and
 # build the per-arch vk/ files for (src/meson.build), Mesa numbering: 7 for
 # the G52's and 9 for the G57's job-manager back half, 10 for the G610's
-# and G710's and 11 for the G615's command-stream back half. The device's
-# arch picks one at vkCreateDevice.
-pan_archs = [7, 9, 10, 11]
+# and G710's, 11 for the G615's and 12 for the G720's command-stream back
+# half. The device's arch picks one at vkCreateDevice.
+pan_archs = [7, 9, 10, 11, 12]
 
 # The arch the tests and the host-side tools build their command-stream
 # code for when they need one: the G615's.

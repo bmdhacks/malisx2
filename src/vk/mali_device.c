@@ -119,7 +119,7 @@ mali_device_intern_key(struct mali_device *dev, const void *data, size_t size)
 /*
  * The structures this file and the rest of the code built once share with
  * the command-stream back half, as this build sees them: each build of
- * that back half (v10 and v11) checks its own view against these when the
+ * that back half (v10, v11 and v12) checks its own view against these when the
  * driver is linked (mali_layout_check.h, mali_cmd_buffer.c).
  */
 static void __attribute__((used))
@@ -243,6 +243,7 @@ queue_init(struct mali_device *dev, struct mali_queue *queue,
    queue->vk.driver_submit = arch == 7    ? mali_v7_queue_submit
                              : arch == 9  ? mali_v9_queue_submit
                              : arch == 10 ? mali_v10_queue_submit
+                             : arch == 12 ? mali_v12_queue_submit
                                           : mali_v11_queue_submit;
    return VK_SUCCESS;
 }
@@ -341,7 +342,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /*
     * Four layers, first match wins: the device's own arch (mali_v7_*,
-    * mali_v9_*, mali_v10_* or mali_v11_*, MALI_PER_ARCH in the per-arch and
+    * mali_v9_*, mali_v10_*, mali_v11_* or mali_v12_*, MALI_PER_ARCH in the per-arch and
     * command-stream files), then our arch-independent entry points, then
     * Mesa's common entry points (added by vk_device_init), then the waist
     * stubs. Only the first layer depends on pdev->arch; everything below
@@ -353,6 +354,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       pdev->arch == 7    ? &mali_v7_device_entrypoints
       : pdev->arch == 9  ? &mali_v9_device_entrypoints
       : pdev->arch == 10 ? &mali_v10_device_entrypoints
+      : pdev->arch == 12 ? &mali_v12_device_entrypoints
                          : &mali_v11_device_entrypoints,
       true);
    vk_device_dispatch_table_from_entrypoints(&dispatch, &mali_device_entrypoints, false);
@@ -471,7 +473,7 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    /* Command buffers and the queue's shared state: the frontend the
-    * physical device's arch has (CSF on v10 and v11, the job manager on v7
+    * physical device's arch has (CSF on v10, v11 and v12, the job manager on v7
     * and v9). */
    if (pdev->arch == 7) {
       dev->vk.command_buffer_ops = &mali_v7_cmd_buffer_ops;
@@ -482,9 +484,12 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    } else if (pdev->arch == 10) {
       dev->vk.command_buffer_ops = &mali_v10_cmd_buffer_ops;
       result = mali_v10_csf_device_init(dev);
-   } else {
+   } else if (pdev->arch == 11) {
       dev->vk.command_buffer_ops = &mali_v11_cmd_buffer_ops;
       result = mali_v11_csf_device_init(dev);
+   } else {
+      dev->vk.command_buffer_ops = &mali_v12_cmd_buffer_ops;
+      result = mali_v12_csf_device_init(dev);
    }
    if (result != VK_SUCCESS) {
       device_destroy(dev, pAllocator);

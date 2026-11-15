@@ -51,7 +51,7 @@
 #include "mali_queue.h"
 
 #if PAN_ARCH < 10
-#error "mali_cmd_render.c is written for the command-stream archs (v10, v11)"
+#error "mali_cmd_render.c is written for the command-stream archs (v10, v11, v12)"
 #endif
 
 /* ---------------------------------------------------------------------- */
@@ -140,6 +140,11 @@ pack_tiler_context(struct mali_cmd_buffer *cmd, const struct mali_render_state *
       cfg.layer_count = MIN2(layers - i * MALI_LAYERS_PER_TILER_CTX,
                              MALI_LAYERS_PER_TILER_CTX);
       cfg.layer_offset = -(int32_t)(i * MALI_LAYERS_PER_TILER_CTX);
+#if PAN_ARCH >= 12
+      /* The tile size the pass's framebuffer descriptor names (panvk v12
+       * get_tiler_desc). */
+      cfg.effective_tile_size = r->tile_size;
+#endif
    }
 }
 

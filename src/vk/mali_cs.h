@@ -20,7 +20,7 @@
 #ifndef MALI_CS_H
 #define MALI_CS_H
 
-/* Built per command-stream arch (10 and 11), never once. */
+/* Built per command-stream arch (10, 11 and 12), never once. */
 #ifndef PAN_ARCH
 #error "mali_cs.h needs PAN_ARCH"
 #endif

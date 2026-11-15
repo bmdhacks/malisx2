@@ -72,7 +72,7 @@ idep_mali_kbase = declare_dependency(
 # Mesa's generator; the stubs themselves come from waist.txt.
 # Device-level commands (vkCmd*, vkQueue*, vkCreate{Sampler,ImageView,
 # BufferView,*Pipelines}, vkUpdateDescriptorSets, ...) get a dispatch table
-# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v10/mali_v11, so every
+# per GPU architecture, --device-prefix mali_v7/mali_v9/mali_v10/mali_v11/mali_v12, so every
 # arch's MALI_PER_ARCH-named functions can sit in the same .so without
 # colliding; mali_CreateDevice picks the table that matches the device
 # (mali_device.c).
@@ -88,6 +88,7 @@ mali_entrypoints = custom_target(
     '--prefix', 'mali', '--prefix', 'mali_waist',
     '--device-prefix', 'mali_v7', '--device-prefix', 'mali_v9',
     '--device-prefix', 'mali_v10', '--device-prefix', 'mali_v11',
+    '--device-prefix', 'mali_v12',
     '--beta', with_vulkan_beta.to_string(),
   ],
   depend_files : vk_entrypoints_gen_depend_files,
@@ -122,7 +123,7 @@ mali_shader_cache_id_h = custom_target(
   output : 'mali_shader_cache_id.h',
   command : [prog_python, files('vk/gen_shader_cache_id.py'),
              '--root', meson.project_source_root(),
-             '--arch', '11', '--arch', '10', '--arch', '9', '--arch', '7',
+             '--arch', '11', '--arch', '10', '--arch', '12', '--arch', '9', '--arch', '7',
              '--out-h', '@OUTPUT@'],
   build_always_stale : true,
 )
@@ -139,7 +140,7 @@ _vk_c_args = [
 # (mali_cmd_copy.c, on each back half's dispatch) and the image copies,
 # clears and blits (mali_cmd_image.c, on each back half's dispatch and
 # render pass). Each copy names its
-# functions mali_v7_*, mali_v9_*, mali_v10_* or mali_v11_* (MALI_PER_ARCH,
+# functions mali_v7_*, mali_v9_*, mali_v10_*, mali_v11_* or mali_v12_* (MALI_PER_ARCH,
 # vk/mali_arch.h).
 _vk_per_arch_files = files(
   'vk/mali_blend.c', 'vk/mali_cmd_copy.c', 'vk/mali_cmd_image.c', 'vk/mali_cmd_meta_gfx.c',
@@ -175,7 +176,7 @@ malisx2_vk = static_library(
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
         'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
   # VkEvent: the host side and the object, for every arch; the vkCmd*
-  # commands are mali_cmd_event.c (v10, v11) and mali_jm_event.c (v7, v9).
+  # commands are mali_cmd_event.c (v10, v11, v12) and mali_jm_event.c (v7, v9).
   files('vk/mali_event.c'),
   # Sync files (the command-stream back half's kcpu queue) and the window
   # systems: the gralloc and swapchain-image side of mali_wsi.c that does
@@ -198,9 +199,9 @@ malisx2_vk = static_library(
 # The command-stream (CSF) back half: command buffers, dispatches, events,
 # queries, render passes, draws, the queue, submit and sync, the per-arch
 # side of mali_wsi.c, and the recording side of the measurement layer.
-# Built at PAN_ARCH 10 (Mali-G610, G710) and 11 (Mali-G615) with the
-# per-arch files; each copy names its own functions mali_v10_* or
-# mali_v11_* (MALI_CSF_NAMES, vk/mali_arch.h).
+# Built at PAN_ARCH 10 (Mali-G610, G710), 11 (Mali-G615) and 12 (Mali-G720)
+# with the per-arch files; each copy names its own functions mali_v10_*,
+# mali_v11_* or mali_v12_* (MALI_CSF_NAMES, vk/mali_arch.h).
 _vk_csf_files = files(
   'vk/mali_cmd_buffer.c', 'vk/mali_cmd_dispatch.c', 'vk/mali_cmd_event.c',
   'vk/mali_cmd_query.c', 'vk/mali_query.c',
@@ -210,7 +211,7 @@ _vk_csf_files = files(
 )
 
 malisx2_vk_csf = {}
-foreach arch : ['10', '11']
+foreach arch : ['10', '11', '12']
   malisx2_vk_csf += {arch : static_library(
     'mali_vk_v' + arch,
     _vk_csf_files, _vk_per_arch_files,
@@ -226,6 +227,7 @@ foreach arch : ['10', '11']
 endforeach
 malisx2_vk_v10 = malisx2_vk_csf['10']
 malisx2_vk_v11 = malisx2_vk_csf['11']
+malisx2_vk_v12 = malisx2_vk_csf['12']
 
 # The files both job-manager back halves build, at PAN_ARCH 7 and 9:
 # command buffers, dispatches, render passes, the tiler heap, queries, the
@@ -304,8 +306,10 @@ endforeach
 # For the driver .so and the tests: the front half, the runtime, kbase, the
 # compiler. The waist behaviour is added by the user of the dependency.
 idep_mali_vk = declare_dependency(
-  link_whole : [malisx2_vk, malisx2_vk_v11, malisx2_vk_v10, malisx2_vk_v9, malisx2_vk_v7],
-  link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['11'],
+  link_whole : [malisx2_vk, malisx2_vk_v12, malisx2_vk_v11, malisx2_vk_v10, malisx2_vk_v9,
+                malisx2_vk_v7],
+  link_with : [malisx2_kbase, libpanfrost_pixel_format_by_arch['12'],
+               libpanfrost_pixel_format_by_arch['11'],
                libpanfrost_pixel_format_by_arch['10'],
                libpanfrost_pixel_format_by_arch['9'],
                libpanfrost_pixel_format_by_arch['7']],

@@ -268,7 +268,8 @@ select_tile_size(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
    if (tile < 16)
       tile *= 2;
    /* The effective tile size limit (pan_max_effective_tile_size): 32x32 on
-    * v10/v11, 16x16 on v7 and v9. */
+    * v10/v11, 16x16 on v7 and v9. v12 allows 64x64; it is held to 32x32,
+    * the size the tile-buffer layout here was written for. */
    tile = MIN2(tile, PAN_ARCH >= 10 ? 32 * 32 : 16 * 16);
    r->tile_size = tile;
    r->cbuf_alloc = ALIGN_POT(rt_bytes * tile, 1024);

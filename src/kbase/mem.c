@@ -11,7 +11,8 @@
  * - Allocations use MEM_ALLOC_EX; flags are normalized first (the output
  *   bit NEED_MMAP is dropped, GPU_EX implies GPU_RD) and get the memory
  *   group of their class in bits 22..25 (group 0 for every class on the
- *   job manager).
+ *   job manager, and on a kernel that has no memory for the class's
+ *   group).
  * - SAME_VA allocations come back as a cookie; mmap at offset = cookie
  *   gives the memory its address, CPU and GPU alike. Such a region is
  *   freed by munmap alone. Everything else is freed with MEM_FREE.
@@ -265,7 +266,8 @@ mali_kbase_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info
       /* The job-manager devices (Unisoc) have no memory group manager:
        * every class goes to group 0 until the T820 blob's class table is
        * decoded. */
-      if (kb->frontend != MALI_KBASE_FRONTEND_JM)
+      if (kb->frontend != MALI_KBASE_FRONTEND_JM &&
+          !__atomic_load_n(&kb->csf_mem_group_0_only, __ATOMIC_RELAXED))
          flags |= KB_MEM_GROUP_ID(mali_kbase_mem_class_group(info->mem_class));
    }
 
@@ -280,6 +282,26 @@ mali_kbase_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info
    a.in.flags = flags;
    a.in.fixed_address = info->fixed_address;
    long ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC_EX, &a);
+   /* A memory group manager may back only some groups: Google's Tensor
+    * kernels (Pixel 7, 8, 9) answer ENOMEM for the blob's default groups
+    * 6 and 9 even for one page. Group 0 is always there; if it serves the
+    * request, it serves every later one too. */
+   if (ret == -ENOMEM && (flags & KB_MEM_GROUP_ID_MASK)) {
+      const uint64_t group0 = flags & ~KB_MEM_GROUP_ID_MASK;
+      memset(&a, 0, sizeof(a));
+      a.in.va_pages = va_pages;
+      a.in.commit_pages = commit_pages;
+      a.in.extension = (flags & KB_MEM_GROW_ON_GPF) ? info->extension_pages : 0;
+      a.in.flags = group0;
+      a.in.fixed_address = info->fixed_address;
+      ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC_EX, &a);
+      if (ret >= 0 && !__atomic_exchange_n(&kb->csf_mem_group_0_only, true, __ATOMIC_RELAXED))
+         KB_LOG(kb, "MEM_ALLOC_EX in memory group %u failed with ENOMEM and group 0 did "
+                    "not; using group 0 from now on",
+                (unsigned)((flags & KB_MEM_GROUP_ID_MASK) >> KB_MEM_GROUP_ID_SHIFT));
+      if (ret >= 0)
+         flags = group0;
+   }
    if (ret < 0) {
       KB_LOG(kb, "MEM_ALLOC_EX of %llu pages, flags 0x%llx failed: %s",
              (unsigned long long)va_pages, (unsigned long long)flags,

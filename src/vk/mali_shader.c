@@ -1109,6 +1109,36 @@ layout_check_deref(struct layout_check *c, nir_src *src)
 }
 
 static bool
+clamp_private_array_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type != nir_instr_type_deref)
+      return false;
+   nir_deref_instr *d = nir_instr_as_deref(instr);
+   if (d->deref_type != nir_deref_type_array)
+      return false;
+   if (!nir_deref_mode_is_one_of(d, nir_var_function_temp | nir_var_shader_temp))
+      return false;
+   if (nir_src_is_const(d->arr.index))
+      return false;
+   nir_deref_instr *parent = nir_src_as_deref(d->parent);
+   if (!parent)
+      return false;
+   const struct glsl_type *pt = parent->type;
+   if (!glsl_type_is_array(pt) && !glsl_type_is_matrix(pt) && !glsl_type_is_vector(pt))
+      return false;
+   unsigned len = glsl_get_length(pt);
+   if (len == 0)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *idx = d->arr.index.ssa;
+   nir_def *mx = nir_imm_intN_t(b, len - 1, idx->bit_size);
+   nir_def *c = nir_umin(b, idx, mx);
+   nir_src_rewrite(&d->arr.index, c);
+   return true;
+}
+
+static bool
 layout_check_instr(nir_builder *b, nir_instr *instr, void *data)
 {
    struct layout_check *c = data;
@@ -1187,6 +1217,8 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
 
+   NIR_PASS(_, nir, nir_shader_instructions_pass, clamp_private_array_idx,
+            nir_metadata_none, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo, ubo_addr_format());
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo, ssbo_addr_format(rs));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,

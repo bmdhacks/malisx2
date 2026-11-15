@@ -123,6 +123,10 @@ struct mali_graphics_sysvals {
       } v7_desc;
    };
    struct mali_input_attachment_info iam[MALI_INPUT_ATTACHMENT_MAP_SIZE];
+   /* v7 vertex shaders that write memory: the draw's referenced-vertex
+    * bitmask (bit = raw vertex id), 0 when every vertex in the range is
+    * referenced (mali_shader.c v7_guard_vs_stores). */
+   mali_aligned_u64 vs_ref_mask;
 } __attribute__((aligned(8)));
 
 static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==

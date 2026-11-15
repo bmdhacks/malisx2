@@ -731,7 +731,7 @@ mali_csf_queue_finish(struct mali_device *dev, struct mali_queue *queue)
 static struct mali_sync *
 to_mali_sync(struct vk_sync *s)
 {
-   assert(s->type == &MALI_PER_ARCH(sync_type) || MALI_PER_ARCH(sync_is_timeline_point)(s));
+   assert(MALI_PER_ARCH(sync_is_binary)(s) || MALI_PER_ARCH(sync_is_timeline_point)(s));
    return container_of(s, struct mali_sync, vk);
 }
 

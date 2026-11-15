@@ -433,6 +433,12 @@ const struct vk_sync_type *const *mali_v9_sync_types(void);
 const struct vk_sync_type *const *mali_v10_sync_types(void);
 const struct vk_sync_type *const *mali_v11_sync_types(void);
 const struct vk_sync_type *const *mali_v12_sync_types(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *mali_v7_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v9_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v10_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v11_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v12_sync_types_no_sync_file(void);
 
 /* Log a failed sync-file import or export (mali_sync.c, every arch; the
  * per-arch headers declare each build's own). */

@@ -690,6 +690,18 @@ arm_wsi_layer_loaded(void)
 }
 #endif
 
+/*
+ * Sampler features the hardware's Sampler descriptor already has: custom
+ * border colours (Mesa's runtime gives the colour, mali_sampler.c packs it as
+ * it packs the standard ones), a seamless-cube bit to clear, and the
+ * mirrored-clamp-to-edge wrap mode. Checked with the CTS on the G31 and G52.
+ */
+static bool
+sampler_features_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -704,6 +716,9 @@ device_extensions_for_arch(uint32_t arch)
 
    ext.KHR_buffer_device_address = bda_for_arch(arch);
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
+   ext.EXT_custom_border_color = sampler_features_for_arch(arch);
+   ext.EXT_non_seamless_cube_map = sampler_features_for_arch(arch);
+   ext.KHR_sampler_mirror_clamp_to_edge = sampler_features_for_arch(arch);
 #ifndef __ANDROID__
    /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
    ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
@@ -985,6 +1000,12 @@ get_features(struct vk_features *f, uint32_t arch)
    };
 
    get_descriptor_indexing_features(f, arch);
+   if (sampler_features_for_arch(arch)) {
+      f->customBorderColors = true;
+      f->customBorderColorWithoutFormat = true;
+      f->nonSeamlessCubeMap = true;
+      f->samplerMirrorClampToEdge = true;
+   }
 }
 
 /* The sample counts we report. Rendering is single-sampled (mali_fb.c) and
@@ -1370,6 +1391,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .dynamicRenderingLocalReadDepthStencilAttachments = true,
       .dynamicRenderingLocalReadMultisampledAttachments = false,
    };
+   /* VK_EXT_custom_border_color (sampler_features_for_arch). */
+   if (sampler_features_for_arch(pdev->arch))
+      props->maxCustomBorderColorSamplers = 4000;
 
    /*
     * VK_EXT_descriptor_indexing's properties on v9 and v11 (v7 has its own

@@ -8,8 +8,8 @@
  * at creation as panvk does (panvk_vX_sampler.c, MIT), built per arch. The
  * blob packs the same fields; the two value differences are settled in
  * panvk's favour (round-to-nearest-even, and the compare function of a
- * non-comparison sampler). No YCbCr conversion, no custom border colours
- * (neither is advertised). v9's Sampler has no reduction mode (min/max
+ * non-comparison sampler). No YCbCr conversion (not advertised). Custom
+ * border colours (v7) come from Mesa's runtime like the standard ones. v9's Sampler has no reduction mode (min/max
  * filtering is not advertised there).
  */
 
@@ -118,7 +118,8 @@ pack_sampler(const struct mali_sampler *sampler, const VkSamplerCreateInfo *info
       cfg.wrap_mode_r = info->unnormalizedCoordinates ?
                            MALI_WRAP_MODE_CLAMP_TO_EDGE :
                            wrap_mode(info->addressModeW);
-      cfg.seamless_cube_map = true;
+      cfg.seamless_cube_map =
+         !(info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT);
       cfg.compare_function = compare_func(info);
       cfg.border_color_r = border.uint32[0];
       cfg.border_color_g = border.uint32[1];

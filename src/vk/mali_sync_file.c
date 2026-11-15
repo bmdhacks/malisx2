@@ -203,14 +203,20 @@ mali_sync_file_create(struct mali_csf_device *csf, uint32_t fd_count, const int 
    }
 
    struct kb_kcpu_command cmd;
-   if (nwaits) {
+   /* One CQS_WAIT_OPERATION per object. The r44p1 kernel prints a pending
+    * command into a fixed 256-byte buffer when a kcpu command times out
+    * (kbasep_csf_sync_kcpu_dump_locked); a command with three objects
+    * overflows it and the kernel dies in a BRK, turning a GPU hang into a
+    * device reboot. A queue executes in order, so several single-object
+    * waits mean the same as one with all of them. */
+   for (uint32_t w = 0; w < nwaits; w++) {
       /* A done slot's error word (a faulted stream) puts the kcpu queue in
        * error; the device is lost then anyway. */
       memset(&cmd, 0, sizeof(cmd));
       cmd.type = KB_KCPU_COMMAND_CQS_WAIT_OPERATION;
-      cmd.info.cqs.objs = (uint64_t)(uintptr_t)waits;
-      cmd.info.cqs.nr_objs = nwaits;
-      cmd.info.cqs.inherit_err_flags = (1u << nwaits) - 1;
+      cmd.info.cqs.objs = (uint64_t)(uintptr_t)&waits[w];
+      cmd.info.cqs.nr_objs = 1;
+      cmd.info.cqs.inherit_err_flags = 1;
       result = enqueue(csf, k, &cmd);
       if (result != VK_SUCCESS)
          return result;

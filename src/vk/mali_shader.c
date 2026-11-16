@@ -196,6 +196,11 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_base_instance:
       val = load_sysval(b, graphics, bit_size, vs.base_instance);
       break;
+#if PAN_ARCH < 9
+   case nir_intrinsic_load_draw_id:
+      val = load_sysval(b, graphics, bit_size, draw_id);
+      break;
+#endif
    case nir_intrinsic_load_noperspective_varyings_pan:
       val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
       break;

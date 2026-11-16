@@ -127,6 +127,10 @@ struct mali_graphics_sysvals {
     * bitmask (bit = raw vertex id), 0 when every vertex in the range is
     * referenced (mali_shader.c v7_guard_vs_stores). */
    mali_aligned_u64 vs_ref_mask;
+   /* v7: DrawIndex, the draw's index in a multi-draw indirect (0 for a
+    * direct draw). */
+   uint32_t draw_id;
+   uint32_t _pad_draw_id;
 } __attribute__((aligned(8)));
 
 static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==

@@ -292,13 +292,65 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    vk_free2(&dev->vk.physical->instance->alloc, alloc, dev);
 }
 
-/* VK_TIME_DOMAIN_DEVICE for Mesa's calibrated-timestamp entry points: the
+/*
+ * VK_TIME_DOMAIN_DEVICE for Mesa's calibrated-timestamp entry points: the
  * GPU system timestamp, the counter timestamp queries write (ticks of
- * timestampPeriod). */
+ * timestampPeriod).
+ *
+ * On the Mali-G57 (job-manager kbase, Unisoc T820) and the Mali-G615 (CSF
+ * kbase, Dimensity 8300) that counter is the SoC's system counter, which
+ * the CPU reads as CNTVCT_EL0: every GET_CPU_GPU_TIMEINFO sample lies
+ * between two CNTVCT_EL0 reads taken around the ioctl, also right after
+ * the GPU powers up. The ioctl costs 31 us on the G57 and 1.5 us on the
+ * G615, and with the GPU idle it first powers the GPU up: 5 ms on the G57,
+ * 0.7 ms on the G615. Mesa's common code reports that whole time as the
+ * calibration's maximum deviation. Reading CNTVCT_EL0 costs nanoseconds
+ * and leaves the GPU asleep. timestamp_is_cntvct() checks the match once
+ * per device; where it fails, the ioctl stays.
+ */
+#if defined(__aarch64__)
+static inline uint64_t
+read_cntvct(void)
+{
+   uint64_t v;
+   __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)::"memory");
+   return v;
+}
+#endif
+
+static bool
+timestamp_is_cntvct(struct mali_kbase *kb)
+{
+#if defined(__aarch64__)
+   /* The first sample's window may include the GPU's power-up; the second
+    * one's is the bare ioctl. A counter that is not CNTVCT_EL0 but lands in
+    * that window anyway is off by less than the ioctl's own deviation. */
+   for (int i = 0; i < 2; i++) {
+      uint64_t mono_ns, ts;
+      const uint64_t before = read_cntvct();
+      if (mali_kbase_timeinfo(kb, &mono_ns, &ts) != MALI_KBASE_SUCCESS)
+         return false;
+      const uint64_t after = read_cntvct();
+      if (ts < before || ts > after)
+         return false;
+   }
+   return true;
+#else
+   (void)kb;
+   return false;
+#endif
+}
+
 static VkResult
 device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
 {
    struct mali_device *dev = container_of(vk_dev, struct mali_device, vk);
+#if defined(__aarch64__)
+   if (dev->timestamp_is_cntvct) {
+      *timestamp = read_cntvct();
+      return VK_SUCCESS;
+   }
+#endif
    uint64_t mono_ns;
    return mali_kbase_timeinfo(dev->kbase, &mono_ns, timestamp) == MALI_KBASE_SUCCESS ?
              VK_SUCCESS :
@@ -447,6 +499,14 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
    dev->vk.get_timestamp = device_get_timestamp;
+   if (dev->vk.enabled_extensions.KHR_calibrated_timestamps ||
+       dev->vk.enabled_extensions.EXT_calibrated_timestamps) {
+      dev->timestamp_is_cntvct = timestamp_is_cntvct(dev->kbase);
+      /* No "malisx2:" prefix: this is information, not a warning. */
+      if (!dev->timestamp_is_cntvct)
+         mesa_logi("malisx2 GPU timestamps are not the CPU's CNTVCT_EL0: calibrated "
+                   "timestamps read them through the kernel");
+   }
    if (dev->kbase->frontend == MALI_KBASE_FRONTEND_JM) {
       /* No "malisx2:" prefix: this is information, not a warning. */
       char layout[192];

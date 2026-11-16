@@ -356,9 +356,10 @@ void mali_kbase_abandon(struct mali_kbase *kb);
  * compares against). */
 uint32_t mali_kbase_latest_flush_id(const struct mali_kbase *kb);
 
-/* GET_CPU_GPU_TIMEINFO: CLOCK_MONOTONIC in ns and the GPU system timestamp
- * (the counter STORE_STATE{Timestamp} writes), sampled together. The
- * timestamp runs at the CPU's architected timer frequency (CNTFRQ_EL0). */
+/* GET_CPU_GPU_TIMEINFO: CLOCK_MONOTONIC_RAW in ns (ktime_get_raw_ts64 in
+ * r44p1) and the GPU system timestamp (the counter STORE_STATE{Timestamp}
+ * writes), sampled together. The timestamp runs at the CPU's architected
+ * timer frequency (CNTFRQ_EL0). */
 enum mali_kbase_result mali_kbase_timeinfo(struct mali_kbase *kb, uint64_t *mono_ns,
                                            uint64_t *gpu_ts);
 

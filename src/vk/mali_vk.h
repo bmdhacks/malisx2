@@ -299,6 +299,11 @@ struct mali_device {
    /* This device's kbase context (a VkDevice owns one, as in the blob). */
    struct mali_kbase *kbase;
 
+   /* The GPU's system timestamp is the CPU's CNTVCT_EL0, checked at device
+    * creation when calibrated timestamps are enabled: VK_TIME_DOMAIN_DEVICE
+    * reads the CPU register instead of asking kbase (mali_device.c). */
+   bool timestamp_is_cntvct;
+
    struct mali_queue queues[MALI_QUEUE_COUNT];
    uint32_t queue_count;
 

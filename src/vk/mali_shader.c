@@ -1360,17 +1360,20 @@ static bool
 v7_guard_vs_stores(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   nir_intrinsic_instr *list[256];
-   unsigned n = 0;
+   struct util_dynarray list;
+   util_dynarray_init(&list, NULL);
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          if (instr->type == nir_instr_type_intrinsic &&
-             is_vs_side_effect(nir_instr_as_intrinsic(instr)) && n < ARRAY_SIZE(list))
-            list[n++] = nir_instr_as_intrinsic(instr);
+             is_vs_side_effect(nir_instr_as_intrinsic(instr)))
+            util_dynarray_append_typed(&list, nir_intrinsic_instr *,
+                                       nir_instr_as_intrinsic(instr));
       }
    }
-   if (!n)
+   if (!list.size) {
+      util_dynarray_fini(&list);
       return false;
+   }
 
    nir_builder b = nir_builder_at(nir_before_impl(impl));
    nir_def *mask = load_sysval(&b, graphics, 64, vs_ref_mask);
@@ -1386,8 +1389,8 @@ v7_guard_vs_stores(nir_shader *nir)
    nir_pop_if(&b, NULL);
    nir_def *ref = nir_if_phi(&b, bit, all);
 
-   for (unsigned i = 0; i < n; i++) {
-      nir_intrinsic_instr *intr = list[i];
+   util_dynarray_foreach(&list, nir_intrinsic_instr *, it) {
+      nir_intrinsic_instr *intr = *it;
       b.cursor = nir_before_instr(&intr->instr);
       nir_def *undef = NULL, *tmp = NULL;
       const bool has_def = nir_intrinsic_infos[intr->intrinsic].has_dest;
@@ -1409,6 +1412,7 @@ v7_guard_vs_stores(nir_shader *nir)
          nir_instr_remove(nir_def_instr(tmp));
       }
    }
+   util_dynarray_fini(&list);
    nir_progress(true, impl, nir_metadata_none);
    return true;
 }

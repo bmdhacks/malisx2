@@ -510,6 +510,108 @@ copy_to_buffer_frag(struct mali_cmd_buffer *cmd, const struct mali_image *img, u
 
 #if PAN_ARCH < 9
 /*
+ * v7: an image -> buffer copy into a linear buffer done as a render pass
+ * whose target is the buffer itself, seen as a linear image of the copy's
+ * size: the frame shader outputs each source block as a uint colour
+ * (MALI_META_FS_COPY_OUT) and the tile write-back stores whole rows of the
+ * tile. copy_to_buffer_frag's stores go out one block per fragment through
+ * the load/store unit; a linear write-back moves the same bytes in
+ * burst-sized rows (0.2 ms less for Vita3K's 512x1024 surface sync on the
+ * G52). Linear render targets want a 64-byte
+ * aligned base and row stride and blocks of 1 to 8 bytes; anything else
+ * returns false and copy_to_buffer_frag runs. Same conditions as that one
+ * otherwise (callers try this first).
+ */
+static bool
+copy_to_buffer_rt(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned plane,
+                  unsigned level, unsigned layer, int sx, int sy, const struct copy_surface *src,
+                  const struct copy_surface *dst, uint32_t w, uint32_t h, uint32_t layers)
+{
+   const unsigned elem = src->block_bytes;
+   if (!((img->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ||
+         mali_jm_cmd_transfer_waits_frag(cmd)) ||
+       img->vk.image_type != VK_IMAGE_TYPE_2D || layers != 1 || src->block_w != 1 ||
+       src->block_h != 1 || !util_is_power_of_two_nonzero(elem) || elem > 8 || !w || !h ||
+       w > 16384 || h > 16384 || dst->tile_shift || (dst->base & 63) || (dst->row_stride & 63) ||
+       dst->row_stride < (uint64_t)w * elem)
+      return false;
+   const bool afbc = mali_image_is_afbc(img);
+
+   /* The target: lives as long as the command buffer, like the
+    * descriptors built from it. */
+   struct mali_ptr mem = mali_cmd_alloc(cmd, sizeof(struct mali_image), 8);
+   if (!mem.cpu)
+      return false;
+   struct mali_image *target = mem.cpu;
+   memset(target, 0, sizeof(*target));
+   target->vk.image_type = VK_IMAGE_TYPE_2D;
+   target->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
+   target->vk.extent = (VkExtent3D){w, h, 1};
+   target->vk.samples = VK_SAMPLE_COUNT_1_BIT;
+   target->vk.mip_levels = 1;
+   target->vk.array_layers = 1;
+   target->plane_count = 1;
+   target->planes[0].format = uint_format(elem);
+   target->planes[0].layout.slices[0].row_stride = dst->row_stride;
+   target->planes[0].layout.slices[0].surface_stride = (uint64_t)dst->row_stride * h;
+   target->planes[0].layout.slices[0].size = (uint64_t)dst->row_stride * h;
+   target->planes[0].layout.array_stride = (uint64_t)dst->row_stride * h;
+   target->base = dst->base;
+
+   struct mali_meta_fs_key key = {
+      .copy_src_tex = afbc,
+      .copy_elem_log2 = util_logbase2(elem),
+   };
+   key.rt_op[0] = MALI_META_FS_COPY_OUT;
+   key.rt_type[0] = MALI_META_FS_UINT;
+   if (afbc)
+      key.copy_src_fmt = v7_copy_fmt(img, plane);
+
+   struct mali_meta_fs_push push = {
+      .area = {0, 0, (int32_t)w - 1, (int32_t)h - 1},
+      .copy_delta = {sx, sy},
+      .copy_row_stride = src->row_stride,
+      .copy_tile_shift = src->tile_shift,
+      .copy_src = src->base,
+      .copy_layer_stride = src->layer_stride,
+   };
+
+   uint32_t tex[1][8];
+   unsigned ntex = 0;
+   if (afbc) {
+      if (!MALI_PER_ARCH(cmd_pack_plane_texture)(cmd, img, plane, copy_read_format(img, plane),
+                                                 level, layer, 1, tex[ntex++])) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return true;
+      }
+   }
+   const struct mali_render_blit blit = {
+      .key = &key,
+      .push = &push,
+      .textures = (const uint32_t(*)[8])tex,
+      .texture_count = ntex,
+   };
+   struct mali_render_desc d = {
+      .width = w,
+      .height = h,
+      .area = {{0, 0}, {w, h}},
+      .layer_count = 1,
+      .rt_count = 1,
+      .blit = &blit,
+   };
+   d.rt[0] = (struct mali_fb_target){
+      .image = target,
+      .format = uint_format(elem),
+      .load = MALI_ATT_LOAD_DONT_CARE,
+      .store = true,
+      .always_write = true,
+   };
+   transfer_pass(cmd, &d);
+   return true;
+}
+
+/*
  * v7: a buffer -> image copy that the compute copy would do while it has to
  * wait for fragment work (a texture upload into an image that passes
  * before it sampled), done by a fragment-side pass over the destination
@@ -836,6 +938,10 @@ MALI_PER_ARCH(CmdCopyImageToBuffer2)(VkCommandBuffer commandBuffer, const VkCopy
                                       (uint64_t)w * d.block_bytes);
 #endif
 #if PAN_ARCH < 9
+      if (copy_to_buffer_rt(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
+                            r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer, sx,
+                            sy, &s, &d, w, h, layers))
+         continue;
       if (copy_to_buffer_frag(cmd, img, aspect_plane(img, r->imageSubresource.aspectMask),
                               r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer,
                               sx, sy, &s, &d, w, h, layers))

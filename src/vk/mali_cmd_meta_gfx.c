@@ -325,6 +325,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
       need_area |= key->rt_op[i] == MALI_META_FS_CLEAR_IN_AREA ||
                    key->rt_op[i] == MALI_META_FS_BLIT ||
                    key->rt_op[i] == MALI_META_FS_COPY ||
+                   key->rt_op[i] == MALI_META_FS_COPY_OUT ||
                    key->rt_op[i] == MALI_META_FS_STORE;
    need_area |= key->z_op == MALI_META_FS_CLEAR_IN_AREA ||
                 key->s_op == MALI_META_FS_CLEAR_IN_AREA;
@@ -446,6 +447,31 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          tex += key->copy_src_tex ? 2 : 1;
          break;
       }
+#if PAN_ARCH < 9
+      case MALI_META_FS_COPY_OUT: {
+         /* The source block as COPY reads it, as the target's uint colour.
+          * An if, not a select: a raw load outside the area could read
+          * anything. */
+         nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
+         nir_def *sxy = nir_iadd(b, xy, delta);
+         nir_push_if(b, inside);
+         nir_def *in;
+         if (key->copy_src_fmt) {
+            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+            in = raw_to_uvec4(
+               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+         } else {
+            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                                   : copy_raw_load(b, key, sxy, layer);
+         }
+         nir_push_else(b, NULL);
+         nir_def *zero = nir_imm_zero(b, 4, 32);
+         nir_pop_if(b, NULL);
+         v = nir_if_phi(b, in, zero);
+         tex += key->copy_src_tex ? 1 : 0;
+         break;
+      }
+#endif
       default:
          UNREACHABLE("meta fs op");
       }

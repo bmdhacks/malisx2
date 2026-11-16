@@ -564,6 +564,13 @@ enum mali_meta_fs_op {
                                 * Render target 0 only, with no target: the
                                 * fragment-side image -> buffer and buffer ->
                                 * image copies. */
+   MALI_META_FS_COPY_OUT,      /* v7: inside the area, the source block at the
+                                * fragment's position + copy_delta (read as
+                                * COPY reads it) output raw as a uint colour;
+                                * 0 outside. Render target 0 only: the
+                                * image -> buffer copy through the tile
+                                * buffer into the buffer seen as a linear
+                                * render target (copy_to_buffer_rt). */
    MALI_META_FS_QUERY,         /* v7: vkCmdCopyQueryPoolResults on the fragment
                                 * side, one fragment per query (query x + y *
                                 * MALI_META_QUERY_ROW), what the compute copy

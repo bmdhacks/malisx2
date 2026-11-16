@@ -667,13 +667,19 @@ float_controls_for_arch(uint32_t arch)
  * The features and extensions added on the command-stream back half for
  * Eden (geometry and tessellation shaders, polygon modes, cull distances,
  * multiple viewports, logic ops, wide lines, draw parameters, variable
- * pointers, float controls, host query reset): on v11 and v12. v10, whose
- * stream encodes some of what they record differently, is not tried yet.
+ * pointers, float controls, host query reset): on v10, v11 and v12. The
+ * descriptors they write (primitive, viewport, scissor, blend, RUN_IDVS
+ * and RUN_COMPUTE) are the same on v10 as on v11 (genxml v10.xml,
+ * v11.xml). Where v10's stream lacks an instruction the back half uses
+ * (NEXT_SB_ENTRY and the indirect waits, the shared scoreboard entries,
+ * 32-bit logic ops, the TILER_FLAGS2 staging register), it has a v10 form
+ * of its own. Checked on a Mali-G710 (v10, Pixel 7), G715 (v11, Pixel 8
+ * and 9) and G720 (v12).
  */
 static bool
 csf_ext_for_arch(uint32_t arch)
 {
-   return arch == 11 || arch == 12;
+   return arch == 10 || arch == 11 || arch == 12;
 }
 
 /* maxDrawIndirectCount. v10, v11, v12: the stream compares the count as a signed
@@ -1566,10 +1572,6 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
     * 4096 16-byte entries (genxml v7.xml). Warps are 8 lanes
     * (pan_subgroup_size).
     */
-   if (p->arch_major == 10) {
-      props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
-      props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
-   }
    if (csf_ext_for_arch(p->arch_major)) {
       props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
       props->maxCullDistances = MALI_V11_MAX_CLIP_DISTANCES;

@@ -21,11 +21,11 @@ compiler (Mesa's Bifrost compiler on v7); the driver is built on Mesa's
 shared Vulkan runtime. Midgard, the arch 6 Bifrost parts (G71, G72) and
 arch 13 on are not served.
 
-On v11 and v12, geometry and tessellation shaders are run through Mesa's
-libpoly: geometry shaders by the vertex shader of the draw, tessellation
-by compute jobs on the vertex/tiler stream (`src/vk/cl/mali_tess.cl`).
-Patches whose tessellation levels are constant when the pipeline is
-created use a pattern tessellated on the CPU instead.
+On v10, v11 and v12, geometry and tessellation shaders are run through
+Mesa's libpoly: geometry shaders by the vertex shader of the draw,
+tessellation by compute jobs on the vertex/tiler stream
+(`src/vk/cl/mali_tess.cl`). Patches whose tessellation levels are constant
+when the pipeline is created use a pattern tessellated on the CPU instead.
 
 ## Building
 

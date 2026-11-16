@@ -10,8 +10,7 @@
  * application finds no display to present to.
  *
  * mali_wsi_fbdev_init (from mali_wsi_init, after wsi_device_init) takes
- * over when the DRM search found no node and /dev/fb0 (or the device
- * MALISX2_FBDEV names; MALISX2_FBDEV=0 turns this off) answers the
+ * over when the DRM search found no node and /dev/fb0 answers the
  * framebuffer ioctls:
  *
  *  - the VK_KHR_display queries (the mali_ entry points below, which win
@@ -37,6 +36,16 @@
  * puts first), else a per-pixel conversion to 32 or 16 bpp. The images
  * are in host-cached memory (fb_create_image_mem), invalidated before
  * the copy reads them.
+ *
+ * Rotation: a panel mounted turned (the H700 handhelds' portrait panels in
+ * a landscape case) says so through the console's rotation,
+ * /sys/class/graphics/fbcon/rotate, set by fbcon=rotate:N on the kernel
+ * command line or by the kernel from the panel's orientation. The display
+ * is reported as the user sees it (width and height swapped for a quarter
+ * turn), and the surface's currentTransform is the panel's turn. An
+ * application that renders turned itself (preTransform = currentTransform,
+ * image extent the framebuffer's own) gets a plain copy; for any other
+ * the present copy turns each frame.
  */
 
 #include "mali_vk.h"
@@ -74,10 +83,10 @@ struct mali_fbdev {
    char path[64];
    struct fb_var_screeninfo var;       /* as read at init */
    uint32_t refresh_mhz;
-   /* Quarter turns between what the application draws and the panel
-    * (MALISX2_FBDEV_ROTATE; default 1 on a portrait framebuffer, as
-    * Knulli's SDL2 mali-fbdev driver does). Odd: the display is reported
-    * with width and height swapped and the present copy turns each frame. */
+   /* Clockwise quarter turns from the picture the user sees to the
+    * framebuffer (fbcon's rotate: 1 FB_ROTATE_CW, 3 FB_ROTATE_CCW), which
+    * is also the surface's currentTransform. Odd: the display is reported
+    * with width and height swapped. */
    unsigned rotate;
    /* The display, mode and plane exist once; their handles are the
     * addresses of these two bytes. */
@@ -102,6 +111,43 @@ fb_extent(const struct mali_fbdev *fb)
 {
    return (fb->rotate & 1) ? (VkExtent2D){fb->var.yres, fb->var.xres}
                            : (VkExtent2D){fb->var.xres, fb->var.yres};
+}
+
+static VkSurfaceTransformFlagBitsKHR
+fb_transform(unsigned quarter_turns)
+{
+   static const VkSurfaceTransformFlagBitsKHR t[4] = {
+      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR,
+      VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR};
+   return t[quarter_turns & 3];
+}
+
+/* The clockwise quarter turns a preTransform names (mirrors are not
+ * offered). */
+static unsigned
+fb_transform_turns(VkSurfaceTransformFlagBitsKHR t)
+{
+   switch (t) {
+   case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: return 1;
+   case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return 2;
+   case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return 3;
+   default: return 0;
+   }
+}
+
+/* The panel's turn from the console's rotation; 0 when there is no
+ * console on the framebuffer. */
+static unsigned
+fb_panel_rotation(void)
+{
+   FILE *f = fopen("/sys/class/graphics/fbcon/rotate", "r");
+   if (!f)
+      return 0;
+   unsigned r = 0;
+   if (fscanf(f, "%u", &r) != 1)
+      r = 0;
+   fclose(f);
+   return r & 3;
 }
 
 static struct mali_fbdev *
@@ -382,9 +428,16 @@ fb_surface_get_capabilities2(VkIcdSurfaceBase *surface, struct wsi_device *wsi_d
    c->currentExtent = e;
    c->minImageExtent = e;
    c->maxImageExtent = e;
+   if (fb->rotate & 1) {
+      /* An application that renders turned itself makes its images the
+       * framebuffer's own size, e swapped. */
+      const uint32_t lo = MIN2(e.width, e.height), hi = MAX2(e.width, e.height);
+      c->minImageExtent = (VkExtent2D){lo, lo};
+      c->maxImageExtent = (VkExtent2D){hi, hi};
+   }
    c->maxImageArrayLayers = 1;
-   c->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-   c->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+   c->currentTransform = fb_transform(fb->rotate);
+   c->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | c->currentTransform;
    c->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
    c->supportedUsageFlags = wsi_caps_get_image_usage();
 
@@ -519,13 +572,10 @@ struct mali_fb_swapchain {
    bool same_order;              /* swapchain format = framebuffer byte order */
    bool image_rgba;              /* R8G8B8A8 image (else B8G8R8A8) */
    bool swap_rb;                 /* 32-bit fb in the image's order with red and blue swapped */
-   unsigned rotate;              /* fb->rotate */
+   /* Clockwise quarter turns the copy applies: the panel's, less what
+    * the application's preTransform did. */
+   unsigned rotate;
    uint32_t *rot_rows;           /* rotated copy: FB_ROT_ROWS framebuffer rows, converted */
-   /* MALISX2_FBDEV_STATS=1: where each present's time goes, logged every
-    * 120 presents (fence wait, invalidate + copy, pan, vsync wait). */
-   bool stats;
-   unsigned stats_n;
-   uint64_t stats_ns[4];
    PFN_vkInvalidateMappedMemoryRanges invalidate;
    /* The present thread: queue_present queues the image, the thread waits
     * for its fence, copies it and pans, so the application renders the
@@ -688,11 +738,10 @@ fb_copy(struct mali_fb_swapchain *chain, const struct wsi_image *img, uint8_t *d
  * FB_ROT_ROWS adjacent image pixels at a time. */
 #define FB_ROT_ROWS 8
 
-/* The copy for a turned display: the image is fb_extent() (W x H), the
- * framebuffer W x H turned. Framebuffer pixel (fx, fy) shows image pixel
- * (W-1-fy, fx) for one turn (the picture turned a quarter counter-clockwise
- * on the panel, as Knulli's SDL_ROTATION=1 does), (W-1-fx, H-1-fy) for two
- * and (fy, H-1-fx) for three: as an address, a fixed start plus fx and fy
+/* The copy that turns the picture chain->rotate quarter turns clockwise
+ * onto the framebuffer: for an image W x H, framebuffer pixel (fx, fy)
+ * shows image pixel (fy, H-1-fx) for one turn, (W-1-fx, H-1-fy) for two
+ * and (W-1-fy, fx) for three: as an address, a fixed start plus fx and fy
  * steps. The rows are built in cached memory and written to the
  * framebuffer whole. */
 static void
@@ -707,9 +756,9 @@ fb_copy_rotated(struct mali_fb_swapchain *chain, const struct wsi_image *img, ui
    const ptrdiff_t sp = img->row_pitches[0], dp = chain->fix.line_length;
    ptrdiff_t start, step_x, step_y;
    switch (chain->rotate) {
-   case 1: start = (ptrdiff_t)(iw - 1) * 4; step_x = sp; step_y = -4; break;
+   case 1: start = (ptrdiff_t)(ih - 1) * sp; step_x = -sp; step_y = 4; break;
    case 2: start = (ptrdiff_t)(ih - 1) * sp + (ptrdiff_t)(iw - 1) * 4; step_x = -4; step_y = -sp; break;
-   default: start = (ptrdiff_t)(ih - 1) * sp; step_x = -sp; step_y = 4; break;
+   default: start = (ptrdiff_t)(iw - 1) * 4; step_x = sp; step_y = -4; break;
    }
 
    for (unsigned y0 = 0; y0 < fh; y0 += FB_ROT_ROWS) {
@@ -755,8 +804,6 @@ fb_present_one(struct mali_fb_swapchain *chain, uint32_t image_index)
    struct mali_fb_image *image = &chain->images[image_index];
    const struct wsi_device *wsi = chain->base.wsi;
 
-   uint64_t t[5];
-   t[0] = os_time_get_nano();
    /* The frame is finished when the present's fence is. wsi_common waits
     * on and resets this fence again only at the image's next present,
     * which cannot come before the image is free again below. */
@@ -764,7 +811,6 @@ fb_present_one(struct mali_fb_swapchain *chain, uint32_t image_index)
                                    VK_TRUE, UINT64_MAX);
    if (r != VK_SUCCESS)
       return r;
-   t[1] = os_time_get_nano();
 
    /* Cached, not coherent memory (fb_create_image_mem): drop what the
     * CPU may hold of it before reading the GPU's writes. */
@@ -774,26 +820,10 @@ fb_present_one(struct mali_fb_swapchain *chain, uint32_t image_index)
    const unsigned page = chain->pages > 1 ? chain->shown ^ 1 : 0;
    const size_t page_bytes = (size_t)chain->var.yres * chain->fix.line_length;
    fb_copy(chain, &image->base, chain->map + page * page_bytes);
-   {
-      /* MALISX2_FBDEV_DUMP=path,frame: one frame as the framebuffer mapping holds it. */
-      static unsigned presents;
-      const char *dump = getenv("MALISX2_FBDEV_DUMP");
-      const char *comma = dump ? strchr(dump, ',') : NULL;
-      if (comma && ++presents == (unsigned)atoi(comma + 1)) {
-         char path[256];
-         snprintf(path, sizeof(path), "%.*s", (int)(comma - dump), dump);
-         FILE *f = fopen(path, "wb");
-         if (f) {
-            fwrite(chain->map + page * page_bytes, 1, chain->fix.line_length * chain->var.yres, f);
-            fclose(f);
-         }
-      }
-   }
    mtx_lock(&chain->lock);
    image->busy = false;
    cnd_broadcast(&chain->cond);
    mtx_unlock(&chain->lock);
-   t[2] = os_time_get_nano();
 
    if (chain->pages > 1) {
       struct fb_var_screeninfo v = chain->var;
@@ -804,24 +834,9 @@ fb_present_one(struct mali_fb_swapchain *chain, uint32_t image_index)
       else
          mesa_logw("malisx2: FBIOPAN_DISPLAY to page %u failed: %s", page, strerror(errno));
    }
-   t[3] = os_time_get_nano();
    if (chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR) {
       uint32_t crtc = 0;
       ioctl(chain->fd, FBIO_WAITFORVSYNC, &crtc);
-   }
-   t[4] = os_time_get_nano();
-
-   if (chain->stats) {
-      for (unsigned i = 0; i < 4; i++)
-         chain->stats_ns[i] += t[i + 1] - t[i];
-      if (++chain->stats_n == 120) {
-         mesa_logi("malisx2 fbdev present, mean of 120: fence %.2f ms, copy %.2f ms, "
-                   "pan %.2f ms, vsync %.2f ms",
-                   chain->stats_ns[0] / 120e6, chain->stats_ns[1] / 120e6,
-                   chain->stats_ns[2] / 120e6, chain->stats_ns[3] / 120e6);
-         chain->stats_n = 0;
-         memset(chain->stats_ns, 0, sizeof(chain->stats_ns));
-      }
    }
    return VK_SUCCESS;
 }
@@ -1012,9 +1027,7 @@ fb_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device,
    chain->same_order = image_bgra ? fb_is_bgra(&chain->var) : fb_is_rgba(&chain->var);
    chain->image_rgba = !image_bgra;
    chain->swap_rb = image_bgra ? fb_is_rgba(&chain->var) : fb_is_bgra(&chain->var);
-   chain->rotate = fb->rotate;
-   const char *stats = getenv("MALISX2_FBDEV_STATS");
-   chain->stats = stats && *stats == '1';
+   chain->rotate = (fb->rotate - fb_transform_turns(pCreateInfo->preTransform)) & 3;
    if (chain->var.bits_per_pixel != 32 && chain->var.bits_per_pixel != 16) {
       mesa_loge("malisx2: %s is %u bpp; only 16 and 32 are supported", fb->path,
                 chain->var.bits_per_pixel);
@@ -1092,10 +1105,7 @@ mali_wsi_fbdev_init(struct mali_physical_device *pdev)
    pdev->fbdev = NULL;
    if (pdev->drm_fd >= 0 || !pdev->wsi)
       return;
-   const char *env = getenv("MALISX2_FBDEV");
-   if (env && !strcmp(env, "0"))
-      return;
-   const char *path = env && *env ? env : "/dev/fb0";
+   const char *path = "/dev/fb0";
 
    const int fd = open(path, O_RDWR | O_CLOEXEC);
    if (fd < 0)
@@ -1114,8 +1124,7 @@ mali_wsi_fbdev_init(struct mali_physical_device *pdev)
    snprintf(fb->path, sizeof(fb->path), "%s", path);
    fb->var = var;
    fb->refresh_mhz = fb_refresh_mhz(&var);
-   const char *rot = getenv("MALISX2_FBDEV_ROTATE");
-   fb->rotate = rot && *rot ? (unsigned)atoi(rot) & 3 : var.xres < var.yres ? 1 : 0;
+   fb->rotate = fb_panel_rotation();
    fb->base.get_support = fb_surface_get_support;
    fb->base.get_capabilities2 = fb_surface_get_capabilities2;
    fb->base.get_formats = fb_surface_get_formats;
@@ -1136,8 +1145,9 @@ mali_wsi_fbdev_init(struct mali_physical_device *pdev)
              var.xres, var.yres, var.bits_per_pixel, fb->refresh_mhz / 1000,
              fb->refresh_mhz % 1000, fb->rotate ? ", turned" : "");
    if (fb->rotate)
-      mesa_logi("malisx2 fbdev: %u quarter turn%s, the display is %ux%u", fb->rotate,
-                fb->rotate > 1 ? "s" : "", fb_extent(fb).width, fb_extent(fb).height);
+      mesa_logi("malisx2 fbdev: the panel is turned %u quarter%s clockwise (fbcon rotate), "
+                "the display is %ux%u",
+                fb->rotate, fb->rotate > 1 ? "s" : "", fb_extent(fb).width, fb_extent(fb).height);
 }
 
 void

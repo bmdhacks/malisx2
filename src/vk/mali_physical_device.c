@@ -638,6 +638,24 @@ ubo_std_layout_for_arch(uint32_t arch)
    return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
+/*
+ * VK_KHR_shader_float_controls on v7: Bifrost keeps fp16 and fp32 denormals,
+ * signed zeros, infinities and NaNs and rounds to nearest even, with or
+ * without the shader's execution modes asking for it (checked on a G52 in
+ * compute and fragment shaders: fp32 add, mul, fma, min, max and compares
+ * into and on denormals, ties, -0, inf and NaN; fp16 subnormals through
+ * 16-bit storage loads and stores, packHalf2x16 and unpackHalf2x16).
+ * Reported as preserving, as panvk reports v7; the flush-to-zero and
+ * round-toward-zero modes are not claimed, as they are not checked here.
+ * Vita3K builds subnormal halves in software on every F16 pack when a
+ * driver does not say it preserves them.
+ */
+static bool
+float_controls_for_arch(uint32_t arch)
+{
+   return arch == 7;
+}
+
 /* maxDrawIndirectCount. v10, v11, v12: the stream compares the count as a signed
  * word. v7, v9: the smallest limit Vulkan allows with multiDrawIndirect,
  * which bounds what one call records. */
@@ -704,6 +722,7 @@ device_extensions_for_arch(uint32_t arch)
 
    ext.KHR_buffer_device_address = bda_for_arch(arch);
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
+   ext.KHR_shader_float_controls = float_controls_for_arch(arch);
 #ifndef __ANDROID__
    /* For Arm's older WSI layer only (arm_wsi_layer_loaded). */
    ext.KHR_sampler_ycbcr_conversion = arm_wsi_layer_loaded();
@@ -1357,6 +1376,16 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = false,
       .independentResolve = false,
+
+      /* VK_KHR_shader_float_controls (float_controls_for_arch) */
+      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+      .shaderSignedZeroInfNanPreserveFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderSignedZeroInfNanPreserveFloat32 = float_controls_for_arch(p->arch_major),
+      .shaderDenormPreserveFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderDenormPreserveFloat32 = float_controls_for_arch(p->arch_major),
+      .shaderRoundingModeRTEFloat16 = float_controls_for_arch(p->arch_major),
+      .shaderRoundingModeRTEFloat32 = float_controls_for_arch(p->arch_major),
 
       /* VK_EXT_provoking_vertex: the hardware bit is per render pass, not
        * per pipeline (panvk reports the same). */

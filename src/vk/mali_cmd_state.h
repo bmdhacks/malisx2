@@ -775,7 +775,7 @@ mali_gfx_pack_blend_constant(enum pipe_format format, float c)
    const struct util_format_description *desc = util_format_description(format);
    unsigned size = 0;
    for (unsigned i = 0; i < desc->nr_channels; i++)
-      size = MAX2(desc->channel[0].size, size);
+      size = MAX2(desc->channel[i].size, size);
    if (!size || size > 16)
       return 0;
    float factor = (float)(((1u << size) - 1) << (16 - size));

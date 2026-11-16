@@ -68,7 +68,12 @@
 #include "pan_format.h"
 #endif
 
-#define META_FS_CACHE_SIZE 64
+/* The meta fragment shaders by key: a growing array (shaders stay alive
+ * until the device goes, command buffers may still use them). */
+struct mali_meta_fs_entry {
+   struct mali_meta_fs_key key;
+   struct mali_shader *shader;
+};
 
 struct mali_meta_gfx {
 #if PAN_ARCH < 9
@@ -81,11 +86,8 @@ struct mali_meta_gfx {
    struct mali_shader *copy[2][5];   /* [source is a texture][log2 block bytes] */
 #endif
    struct mali_shader *copy_quad[3]; /* [log2 block bytes] */
-   unsigned count;
-   struct {
-      struct mali_meta_fs_key key;
-      struct mali_shader *shader;
-   } e[META_FS_CACHE_SIZE];
+   unsigned count, cap;
+   struct mali_meta_fs_entry *e;
 };
 
 /* The push constants become the fragment shader's FAU words, which a
@@ -534,7 +536,15 @@ MALI_PER_ARCH(meta_fs_get)(struct mali_cmd_buffer *cmd, const struct mali_meta_f
          }
       }
    }
-   if (mg && !s && mg->count < META_FS_CACHE_SIZE) {
+   if (mg && !s && mg->count == mg->cap) {
+      const unsigned cap = mg->cap ? mg->cap * 2 : 64;
+      struct mali_meta_fs_entry *e = realloc(mg->e, cap * sizeof(*e));
+      if (e) {
+         mg->e = e;
+         mg->cap = cap;
+      }
+   }
+   if (mg && !s && mg->count < mg->cap) {
       nir_shader *nir = build_fs(dev, key);
       MALI_PER_ARCH(shader_preprocess)(dev, nir);
 
@@ -585,6 +595,7 @@ MALI_PER_ARCH(meta_gfx_finish)(struct mali_device *dev)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_quad[i]);
    for (unsigned i = 0; i < mg->count; i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->e[i].shader);
+   free(mg->e);
 #if PAN_ARCH < 9
    for (unsigned i = 0; i < ARRAY_SIZE(mg->copy_tex_fmt); i++)
       MALI_PER_ARCH(shader_unref)(dev, mg->copy_tex_fmt[i]);

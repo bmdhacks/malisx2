@@ -102,8 +102,16 @@ mali_jm_heap_take(struct mali_cmd_buffer *cmd, struct mali_jm_batch *b)
    struct mali_jm_heap *h = &jd->heap;
 
    simple_mtx_lock(&h->lock);
-   const uint32_t slot = h->next;
+   uint32_t slot = h->next;
    bool ok = h->bo[slot].size || slot_alloc(jd, &h->bo[slot]);
+   if (!ok && slot > 0 && h->bo[0].size) {
+      /* Out of address space for another region: the ring stops at the
+       * slots it has (they are reused in turn) and this batch takes slot 0. */
+      mesa_logw("malisx2: tiler heap ring capped at %u slots", slot);
+      h->count = slot;
+      slot = 0;
+      ok = true;
+   }
    if (ok)
       h->next = (slot + 1) % h->count;
    const uint64_t base = h->bo[slot].gpu_va;

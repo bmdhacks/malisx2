@@ -536,9 +536,8 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_create_renderpass2 = true,
 
    /* What Vulkan 1.3 made core, on every arch. The device stays 1.1: 1.2
-    * and 1.3 also require host query reset, buffer device address,
-    * maintenance4, inline uniform blocks and subgroup size control, which
-    * no arch has.
+    * and 1.3 also require buffer device address, maintenance4, inline
+    * uniform blocks and subgroup size control, which no arch has.
     *
     *  - synchronization2: the driver's barrier, submit and timestamp
     *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
@@ -558,6 +557,11 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .EXT_vertex_input_dynamic_state = true,
    .EXT_shader_demote_to_helper_invocation = true,
    .EXT_private_data = true,
+
+   /* Host query reset (Vulkan 1.2 core), on every arch: vkResetQueryPool
+    * zeroes a query's counters and availability word through the pool's
+    * host mapping (mali_query.c). hakuX uses it for its occlusion queries. */
+   .EXT_host_query_reset = true,
 
    /* Reads of the bound colour and depth/stencil attachments inside a
     * dynamic rendering pass, and the maps that decide which output location
@@ -999,6 +1003,10 @@ get_features(struct vk_features *f, uint32_t arch)
        * parts. */
       .synchronization2 = true,
       .privateData = true,
+
+      /* VK_EXT_host_query_reset (mali_query.c vkResetQueryPool). */
+      .hostQueryReset = true,
+
       .shaderDemoteToHelperInvocation = true,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,

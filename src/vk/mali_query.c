@@ -4,9 +4,10 @@
  */
 
 /*
- * Query pools, the host side: vkCreateQueryPool, vkDestroyQueryPool and
- * vkGetQueryPoolResults, for timestamp and occlusion queries. Built once
- * per back half (v10, v11 and the job manager's v7 and v9), like mali_sync.c:
+ * Query pools, the host side: vkCreateQueryPool, vkDestroyQueryPool,
+ * vkResetQueryPool and vkGetQueryPoolResults, for timestamp and occlusion
+ * queries. Built once per back half (v10, v11 and the job manager's v7 and
+ * v9), like mali_sync.c:
  * what is recorded into command buffers differs (mali_cmd_query.c on the
  * command-stream frontend, mali_jm_query.c on the job manager), the pool
  * and its host reads do not. The layout is in mali_query.h.
@@ -159,6 +160,32 @@ MALI_PER_ARCH(DestroyQueryPool)(VkDevice _device, VkQueryPool _pool,
    if (pool->avail_bo.size)
       mali_kbase_free(dev->kbase, &pool->avail_bo);
    vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
+}
+
+/*
+ * vkResetQueryPool (Vulkan 1.2's hostQueryReset, VK_EXT_host_query_reset):
+ * the reset vkCmdResetQueryPool records, done by the host. The pool is
+ * host-mapped, uncached memory (query_pool_alloc), so the host's zeros
+ * reach it the same way as the zeros written when the pool is made; the
+ * application makes sure no GPU work still uses these queries. The queries'
+ * slots are zeroed whole, as vkCmdResetQueryPool's fill does: the counters,
+ * the availability word and the padding, and on the command-stream
+ * frontend's occlusion pools the slots of the second buffer too.
+ */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(ResetQueryPool)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,
+                              uint32_t queryCount)
+{
+   VK_FROM_HANDLE(mali_query_pool, pool, _pool);
+
+   memset(pool->val_cpu + (uint64_t)firstQuery * pool->val_stride, 0,
+          (size_t)queryCount * pool->val_stride);
+   if (pool->avail_bo.size)
+      memset((uint8_t *)pool->avail_bo.cpu + (uint64_t)firstQuery * pool->avail_stride, 0,
+             (size_t)queryCount * pool->avail_stride);
+   /* The zeros before anything the host does next (a submit that uses the
+    * queries). */
+   __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
 /* Waits for the availability word to become non-zero. With dev->lock not

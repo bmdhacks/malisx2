@@ -74,11 +74,7 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
                                VkDescriptorSetLayout *pSetLayout)
 {
    VK_FROM_HANDLE(mali_device, dev, _device);
-   const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags_info =
-      vk_find_struct_const(pCreateInfo->pNext,
-                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
-   VkDescriptorSetLayoutBinding *bindings = NULL;
-   VkDescriptorBindingFlags *binding_flags = NULL;
+   struct vk_sorted_bindings *sorted;
    uint32_t binding_count = 0, immutable_count = 0;
    VkResult result;
 
@@ -92,13 +88,9 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
          immutable_count += b->descriptorCount;
    }
 
-   if (pCreateInfo->bindingCount) {
-      result = vk_create_sorted_bindings(pCreateInfo->pBindings,
-                                         pCreateInfo->bindingCount, &bindings,
-                                         flags_info, &binding_flags);
-      if (result != VK_SUCCESS)
-         return vk_error(dev, result);
-   }
+   result = vk_create_sorted_bindings(&dev->vk, pCreateInfo, pAllocator, &sorted);
+   if (result != VK_SUCCESS)
+      return vk_error(dev, result);
 
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct mali_descriptor_set_layout, layout, 1);
@@ -107,8 +99,7 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
    VK_MULTIALLOC_DECL(&ma, struct mali_hw_desc, samplers, immutable_count);
 
    if (!vk_descriptor_set_layout_multizalloc(&dev->vk, &ma, pCreateInfo)) {
-      free(bindings);
-      free(binding_flags);
+      vk_destroy_sorted_bindings(&dev->vk, pAllocator, sorted);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
 
@@ -118,7 +109,7 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
 
    uint32_t desc_idx = 0, dyn_idx = 0, dyn_ubos = 0, dyn_ssbos_count = 0;
    for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
-      const VkDescriptorSetLayoutBinding *b = &bindings[i];
+      const VkDescriptorSetLayoutBinding *b = &sorted->bindings[i];
       struct mali_descriptor_set_binding_layout *bl = &layout->bindings[b->binding];
 
       if (b->descriptorCount == 0)
@@ -131,7 +122,7 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
              !vk_descriptor_type_is_dynamic(b->descriptorType));
 
       bl->type = b->descriptorType;
-      bl->flags = binding_flags ? binding_flags[i] : 0;
+      bl->flags = sorted->flags[i];
       /* Only the highest binding may have a variable count (the
        * specification's rule), and not a dynamic buffer: those have no
        * slots. An inline uniform block is not offered. */
@@ -174,8 +165,7 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
       }
    }
 
-   free(bindings);
-   free(binding_flags);
+   vk_destroy_sorted_bindings(&dev->vk, pAllocator, sorted);
 
    if (dyn_ubos > MALI_MAX_DYNAMIC_UNIFORM_BUFFERS ||
        dyn_ssbos_count > MALI_MAX_DYNAMIC_STORAGE_BUFFERS ||

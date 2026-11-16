@@ -12,6 +12,7 @@ _vvr = mesa_src / 'vulkan' / 'runtime'
 _lite_names = [
   'rmv/vk_rmv_common.c',
   'rmv/vk_rmv_exporter.c',
+  'vk_app_workarounds.c',
   'vk_blend.c',
   'vk_buffer.c',
   'vk_buffer_view.c',

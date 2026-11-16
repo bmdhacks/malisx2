@@ -4,10 +4,9 @@
 _vr = mesa_src / 'compiler' / 'rust'
 
 _compiler_rs_names = [
-  'as_slice.rs', 'bitset.rs', 'cfg.rs', 'dataflow.rs', 'depth_first_search.rs',
-  'enum_as_u8.rs', 'float16.rs', 'lower_bounded.rs', 'memstream.rs',
-  'nir_instr_printer.rs', 'nir.rs', 'smallvec.rs', 'union_find.rs',
-  'vec_pair.rs',
+  'as_slice.rs', 'cfg.rs', 'dataflow.rs', 'depth_first_search.rs',
+  'float16.rs', 'lower_bounded.rs', 'memstream.rs', 'nir_instr_printer.rs',
+  'nir.rs', 'smallvec.rs', 'union_find.rs', 'vec_pair.rs',
 ]
 
 _compiler_binding_types = [
@@ -28,6 +27,7 @@ _compiler_rust_args = [
 
 _compiler_bindgen_args = [
   bindgen_output_args,
+  util_rs_bindgen_args,
   '--allowlist-var', 'NIR_.*',
   '--allowlist-var', 'nir_.*_infos',
   '--allowlist-var', 'rust_.*',
@@ -62,10 +62,10 @@ _compiler_bindings_rs = rust.bindgen(
   input : files(_vr / 'bindings.h'),
   output : 'bindings.rs',
   output_inline_wrapper : 'bindings.c',
-  c_args : pre_args,
+  c_args : [pre_args, '-DMESA_BINDGEN=1'],
   include_directories : [_inc_rust_helpers, inc_nir],
   args : _compiler_bindgen_args,
-  dependencies : [idep_nir_headers, idep_mesautil],
+  dependencies : [idep_nir_headers, idep_mesautil, idep_mesa_util_rs],
 )
 
 _libcompiler_bindings = static_library(
@@ -93,16 +93,11 @@ _libcompiler_rs = static_library(
   gnu_symbol_visibility : 'hidden',
   rust_abi : 'rust',
   link_with : [_libcompiler_bindings, _libcompiler_c],
+  dependencies : [idep_mesa_util_rs],
   rust_args : _compiler_rust_args,
 )
 
 idep_compiler_rs = declare_dependency(link_with : _libcompiler_rs)
-
-dep_syn = dependency('syn',
-  version : '>= 2.0.15',
-  fallback : ['syn-2-rs', 'dep_syn'],
-  required : true,
-)
 
 _libcompiler_proc_rs = static_library(
   'compiler_proc',

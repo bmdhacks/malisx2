@@ -12,18 +12,17 @@ _pc_names = [
   'pan_nir_lower_image.c', 'pan_nir_lower_image_64bit.c',
   'pan_nir_lower_image_ms.c', 'pan_nir_lower_mem_to_global.c',
   'pan_nir_lower_noperspective.c', 'pan_nir_lower_sample_position.c',
-  'pan_nir_lower_tex.c', 'pan_nir_lower_var_special.c',
-  'pan_nir_lower_vertex_id.c', 'pan_nir_lower_vs_inputs.c',
-  'pan_nir_lower_vs_outputs.c', 'pan_nir_opt_push_ubo.c',
-  'pan_nir_resize_varying_io.c', 'pan_nir_xfb.c',
+  'pan_nir_lower_tex.c', 'pan_nir_lower_trig.c',
+  'pan_nir_lower_var_special.c', 'pan_nir_lower_vertex_id.c',
+  'pan_nir_lower_vs_inputs.c', 'pan_nir_lower_vs_outputs.c',
+  'pan_nir_opt_push_ubo.c', 'pan_nir_resize_varying_io.c', 'pan_nir_xfb.c',
 ]
 libpanfrost_compiler_files = []
 foreach n : _pc_names
   libpanfrost_compiler_files += files(_vpc / n)
 endforeach
 
-libpanfrost_compiler_c_args = [mesa_c_args, '-DWITH_PANFROST_RUST',
-                               '-DWITH_PANFROST_DISASSEMBLE']
+libpanfrost_compiler_c_args = [mesa_c_args, '-DWITH_PANFROST_RUST']
 
 subdir('kraid')
 subdir('bifrost')

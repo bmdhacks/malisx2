@@ -73,7 +73,7 @@ _nir_names = [
   'nir_convert_address_format.c', 'nir_clip_cull_distance_io_utils.c',
   'nir_clone.c', 'nir_control_flow.c', 'nir_deref.c',
   'nir_divergence_analysis.c', 'nir_dominance.c', 'nir_dominance_lca.c',
-  'nir_downgrade_pls_vars.c', 'nir_fixup_is_exported.c',
+  'nir_fixup_is_exported.c',
   'nir_format_convert.c', 'nir_from_ssa.c', 'nir_functions.c',
   'nir_gather_info.c', 'nir_gather_output_deps.c', 'nir_gather_tcs_info.c',
   'nir_gather_types.c', 'nir_gather_xfb_info.c', 'nir_opt_group_loads.c',

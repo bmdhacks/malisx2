@@ -25,8 +25,14 @@
  * or, on Android, the property debug.malisx2.measure:
  *
  *   timing | draws | csf | both | shaders | cpuprof | off, then any of
- *   dir=PATH chunk=N ring=N start=N count=N csfmax=N trigger=PATH,
+ *   dir=PATH chunk=N ring=N start=N count=N csfmax=N trigger=PATH direct,
  *   comma-separated
+ *
+ * Files are written with fopen, so that libadrenotools' file redirection
+ * moves them inside the app; "direct" opens them with open(2) instead, so
+ * they land in dir= as given (for an app whose private storage cannot be
+ * read, such as a non-debuggable emulator, with dir= in its external files
+ * directory).
  *
  * With neither set, dev->measure and every cmd->measure are NULL and the
  * driver pays one pointer test per hook. shaders and cpuprof work without
@@ -75,6 +81,7 @@ struct mali_measure_config {
    uint64_t count;         /* submits written from start; 0 = no limit */
    uint32_t csf_max;       /* captures written at most; 0 = no limit */
    char trigger[512];      /* if set: write only while this file exists */
+   bool direct;            /* open files with open(2), past the redirection */
 };
 
 /* Parse a configuration string. Unknown words and bad numbers are an
@@ -86,6 +93,13 @@ bool mali_measure_config_parse(const char *str, struct mali_measure_config *cfg,
 /* The configuration of this process: MALISX2_MEASURE, else (Android)
  * debug.malisx2.measure. False when nothing is enabled. */
 bool mali_measure_config_get(struct mali_measure_config *cfg);
+
+/* fopen, or with cfg->direct, open(2) + fdopen ("w", "wb" or "a"). */
+FILE *mali_measure_fopen(const struct mali_measure_config *cfg, const char *path,
+                         const char *mode);
+
+/* Like mali_measure_fopen for files under mali_measure_shader_dir(). */
+FILE *mali_measure_shader_fopen(const char *path, const char *mode);
 
 /* The directory compiled shaders are written to ("shaders" mode:
  * <dir>/shaders, created on first use), or NULL when the mode is off.
@@ -112,6 +126,7 @@ void mali_cpuprof_install(struct vk_device_dispatch_table *t);
 enum mali_cpuprof_part {
    MALI_CPUPROF_IDXSCAN,  /* v7: an indexed draw's index range scan */
    MALI_CPUPROF_DRAWPREP, /* v7: a draw's descriptors and state (prepare_draw) */
+   MALI_CPUPROF_IDXREUSE, /* v7: an indexed draw that took the previous one's range */
    MALI_CPUPROF_PART_COUNT
 };
 extern bool mali_cpuprof_on;

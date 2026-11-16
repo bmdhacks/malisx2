@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #include "kbase_priv.h"
 
@@ -74,10 +75,13 @@ open_device(struct mali_kbase *kb, const char *path)
  * answers with another version, or a failure other than EPERM, is refused
  * at once, as before there was a job-manager path, so a CSF device sees
  * exactly the ioctls it always did. On the job-manager side we accept
- * 11.22 (KB_JM_UK_MIN_MINOR) to 11.36 back. The kernel answers
+ * 11.17 (KB_JM_UK_MIN_MINOR) to 11.36 back. The kernel answers
  * min(ours, its own) for a matching major, so there is no upper bound to
- * check, and 11.22 is the first minor that takes the 64-byte atom (see
- * uapi_jm.h). Only one of kb->uk_major/minor and kb->frontend is
+ * check; what differs below 11.22 (the atom size, MEM_JIT_INIT's struct)
+ * is chosen by the minor (see uapi_jm.h). The r20p0 kernel (11.17)
+ * predates the reservation of ioctl 52 and answers it with EPERM before
+ * setup, like any ioctl other than VERSION_CHECK and SET_FLAGS. Only one
+ * of kb->uk_major/minor and kb->frontend is
  * meaningful once this returns success; the other
  * frontend's fields in struct mali_kbase stay zero.
  */
@@ -95,7 +99,10 @@ version_handshake(struct mali_kbase *kb)
       kb->uk_minor = vc.minor;
       return MALI_KBASE_SUCCESS;
    }
-   if (ret < 0 && ret != -EPERM) {
+   /* Job-manager kernels before the ioctl's reservation answer an unknown
+    * ioctl before setup with EINVAL instead (r12p0, 11.7: "Block call until
+    * version handshake and setup is complete"). */
+   if (ret < 0 && ret != -EPERM && ret != -EINVAL) {
       KB_LOG(kb, "refusing device: VERSION_CHECK (CSF ioctl 52) failed: %s; "
                  "not a CSF kbase kernel?",
              strerror((int)-ret));
@@ -135,11 +142,10 @@ version_handshake(struct mali_kbase *kb)
    else
       KB_LOG(kb, "refusing device: %s (this driver speaks CSF UK %u.%u); "
                  "job-manager VERSION_CHECK (ioctl 0) answered UK %u.%u; this driver "
-                 "needs job-manager UK %u.%u to %u.%u (the 64-byte atom first appears "
-                 "in %u.%u)",
+                 "needs job-manager UK %u.%u to %u.%u",
              csf_detail, KB_UK_VERSION_MAJOR, KB_UK_VERSION_MINOR, jvc.major, jvc.minor,
              KB_JM_UK_VERSION_MAJOR, KB_JM_UK_MIN_MINOR, KB_JM_UK_VERSION_MAJOR,
-             KB_JM_UK_VERSION_MINOR, KB_JM_UK_VERSION_MAJOR, KB_JM_UK_MIN_MINOR);
+             KB_JM_UK_VERSION_MINOR);
    return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
 }
 
@@ -258,7 +264,7 @@ map_user_reg_page(struct mali_kbase *kb)
 
 /*
  * BASE_MEM_MAP_TRACKING_HANDLE: on a job-manager kernel older than UK 11.38
- * (every one we accept, 11.22 to 11.36) an allocation before this mapping exists fails with EINVAL
+ * (every one we accept, 11.17 to 11.36) an allocation before this mapping exists fails with EINVAL
  * (kbase_mem_allow_alloc), and munmapping it again blocks allocation once
  * more. We never touch the mapping's contents (PROT_NONE); mali_kbase_destroy
  * unmaps it.
@@ -281,7 +287,11 @@ exec_init(struct mali_kbase *kb)
 {
    /* On r44p1 CSF kernels the executable zone always exists and this only
     * validates the size; the blob issues it anyway, with the full 4 GiB,
-    * and so do we. */
+    * and so do we. Job-manager kernels before 11.13 have no such ioctl and
+    * no executable zone on a 64-bit context: shader code is SAME_VA there
+    * (mali_kbase_has_exec_zone, mem.c). */
+   if (!mali_kbase_has_exec_zone(kb))
+      return MALI_KBASE_SUCCESS;
    struct kb_ioctl_mem_exec_init ei = {.va_pages = KB_EXEC_VA_PAGES};
    long ret = kb_ioctl(kb, KB_IOCTL_MEM_EXEC_INIT, &ei);
    if (ret < 0) {
@@ -317,7 +327,20 @@ jit_init(struct mali_kbase *kb)
       .group_id = 0,
       .phys_pages = KB_JIT_VA_PAGES,
    };
-   long ret = kb_ioctl(kb, KB_IOCTL_MEM_JIT_INIT, &ji);
+   long ret;
+   if (kb->frontend == MALI_KBASE_FRONTEND_JM && kb->uk_minor < KB_JM_UK_JIT_PHYS_MINOR) {
+      /* Before 11.20 the struct ends before phys_pages: a different size,
+       * so a different ioctl number. */
+      struct kb_ioctl_mem_jit_init_11_5 old = {
+         .va_pages = ji.va_pages,
+         .max_allocations = ji.max_allocations,
+         .trim_level = ji.trim_level,
+         .group_id = ji.group_id,
+      };
+      ret = kb_ioctl(kb, KB_JM_IOCTL_MEM_JIT_INIT_11_5, &old);
+   } else {
+      ret = kb_ioctl(kb, KB_IOCTL_MEM_JIT_INIT, &ji);
+   }
    if (ret == -ENOMEM && kb->frontend == MALI_KBASE_FRONTEND_JM) {
       /* The kernel cuts the JIT zone from the end of the SAME_VA zone (at
        * most 2^(GPU VA bits) bytes, less the 4 GiB executable zone) and
@@ -440,6 +463,23 @@ mali_kbase_latest_flush_id(const struct mali_kbase *kb)
 enum mali_kbase_result
 mali_kbase_timeinfo(struct mali_kbase *kb, uint64_t *mono_ns, uint64_t *gpu_ts)
 {
+   if (kb->frontend == MALI_KBASE_FRONTEND_JM && kb->uk_minor < KB_JM_UK_TIMEINFO_MINOR) {
+      /* No GET_CPU_GPU_TIMEINFO before 11.17. The GPU's system timestamp
+       * counts the Arm generic timer on the SoCs we run on (the driver's
+       * timestampPeriod comes from CNTFRQ_EL0 for the same reason), so
+       * read that counter next to the monotonic clock. */
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+#if defined(__aarch64__)
+      uint64_t cnt;
+      __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
+      *gpu_ts = cnt;
+#else
+      *gpu_ts = 0;
+#endif
+      *mono_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+      return MALI_KBASE_SUCCESS;
+   }
    union kb_ioctl_get_cpu_gpu_timeinfo t;
    memset(&t, 0, sizeof(t));
    t.in.request_flags = KB_TIMEINFO_MONOTONIC | KB_TIMEINFO_TIMESTAMP;

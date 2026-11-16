@@ -69,6 +69,9 @@ struct mali_physical_device {
    char path[32];                      /* "/dev/mali0" */
    struct mali_kbase_gpu_props props;  /* decoded GET_GPUPROPS */
    uint32_t cs_work_registers;
+   /* Whether images may be AFBC (mali_image.c choose_modifier): not on the
+    * Mali-G31, whose AFBC render targets fault (seen on the Allwinner H700). */
+   bool afbc;
 
    /* props.arch_major, cached here so code outside the kbase layer picks
     * the per-arch device entry points (mali_CreateDevice) and internals
@@ -438,6 +441,12 @@ const struct vk_sync_type *const *mali_v9_sync_types(void);
 const struct vk_sync_type *const *mali_v10_sync_types(void);
 const struct vk_sync_type *const *mali_v11_sync_types(void);
 const struct vk_sync_type *const *mali_v12_sync_types(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *mali_v7_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v9_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v10_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v11_sync_types_no_sync_file(void);
+const struct vk_sync_type *const *mali_v12_sync_types_no_sync_file(void);
 
 /* Log a failed sync-file import or export (mali_sync.c, every arch; the
  * per-arch headers declare each build's own). */

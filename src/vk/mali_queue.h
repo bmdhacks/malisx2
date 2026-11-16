@@ -221,10 +221,14 @@ extern const struct vk_sync_type MALI_PER_ARCH(sync_type);
 /* The device's sync types, binary first and then the timeline semaphore
  * type wrapped around it (mali_sync.c): what vk_physical_device_init gets. */
 const struct vk_sync_type *const *MALI_PER_ARCH(sync_types)(void);
+/* The same without sync-file import/export, for kernels without sync files. */
+const struct vk_sync_type *const *MALI_PER_ARCH(sync_types_no_sync_file)(void);
 
 /* Whether sync is one value of a timeline semaphore (a point sync): the
  * queue does not consume those when it waits on them. */
 bool MALI_PER_ARCH(sync_is_timeline_point)(const struct vk_sync *sync);
+/* The binary type of either set (sync_types or sync_types_no_sync_file). */
+bool MALI_PER_ARCH(sync_is_binary)(const struct vk_sync *sync);
 
 /* Drop a sync's payload (close its sync file). With dev->lock held. */
 void MALI_PER_ARCH(sync_clear)(struct mali_sync *s);

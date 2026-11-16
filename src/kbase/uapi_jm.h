@@ -41,16 +41,49 @@
  * so a kernel at or above 11.36 shows up as 11.36 and an older one as its
  * own minor. Proposing less would buy nothing on a newer kernel.
  *
- * KB_JM_UK_MIN_MINOR is the oldest minor we accept back. 11.22 is the
- * first kernel whose JOB_SUBMIT takes the 64-byte base_jd_atom that
- * struct kb_jm_atom is (11.19 to 11.21 take only 48 or 56 bytes and answer
- * EINVAL to every real submit). From 11.22 to 11.36 every ioctl we use has
- * the same number and size, so nothing inside the range branches on the
- * minor. The MediaTek 72-byte atom layout is not a function of the minor
- * and is found by the probe in mali_kbase_create, not by this check. */
+ * KB_JM_UK_MIN_MINOR is the oldest minor we accept back: 11.7 (DDK r12p0,
+ * the Rockchip RK3326 4.4 BSP kernel that AmberELEC, dArkOS, Knulli and muOS
+ * ship). 11.5 is the first with this MEM_JIT_INIT struct, 11.3 the first
+ * with sticky resources. What differs on the way up, and what the minor
+ * picks:
+ *
+ *   - JOB_SUBMIT takes only base_jd_atom_v2 before 11.22, which is struct
+ *     kb_jm_atom without its leading seq_nr: 56 bytes from 11.19
+ *     (renderpass_id added), 48 bytes before that (no renderpass_id;
+ *     jit_id[2] is compat_core_req there, which the kernel no longer
+ *     reads; jobslot is padding before 11.17). The stride check is exact,
+ *     so each kernel accepts its own size and nothing else; base_jd_atom
+ *     (64 bytes) arrives in 11.22.
+ *   - MEM_JIT_INIT has no phys_pages before 11.20: 16 bytes, so a
+ *     different ioctl number (KB_JM_IOCTL_MEM_JIT_INIT_11_5). Before 11.14
+ *     group_id is padding, which we leave 0.
+ *   - GET_CPU_GPU_TIMEINFO arrives in 11.17; before it mali_kbase_timeinfo
+ *     reads the CPU's counter instead (context.c).
+ *   - From 11.16 an imported dma-buf is mapped on the GPU at import; before
+ *     it only the sticky mapping we always make maps it.
+ *   - MEM_EXEC_INIT arrives in 11.13. Before it a 64-bit context has no
+ *     executable zone at all (only 32-bit contexts get the fixed 16 MiB
+ *     one), so shader code is SAME_VA, and kbase's get_unmapped_area
+ *     aligns an executable SAME_VA mapping to 2^log2_program_counter_size
+ *     so it never crosses that boundary (mem.c).
+ *   - BASE_MEM_GPU_VA_SAME_4GB_PAGE arrives in 11.11; before it bit 6 is
+ *     a reserved bit the kernel accepts and ignores, so mem.c checks the
+ *     4 GiB window itself.
+ *
+ * Every other ioctl we use has the same number and size from 11.7 to
+ * 11.36 (checked against the r12p0 and r20p0 kernels' mali_kbase_ioctl.h).
+ * The MediaTek 72-byte atom layout is not a function of the minor and is
+ * found by the probe in mali_kbase_create, not by this check; the probe
+ * only runs from 11.22. */
 #define KB_JM_UK_VERSION_MAJOR 11
 #define KB_JM_UK_VERSION_MINOR 36
-#define KB_JM_UK_MIN_MINOR     22
+#define KB_JM_UK_MIN_MINOR     7
+#define KB_JM_UK_ATOM_V3_MINOR 22 /* base_jd_atom (with seq_nr) accepted */
+#define KB_JM_UK_JIT_PHYS_MINOR 20 /* MEM_JIT_INIT has phys_pages */
+#define KB_JM_UK_ATOM_RP_MINOR 19 /* base_jd_atom_v2 has renderpass_id */
+#define KB_JM_UK_TIMEINFO_MINOR 17 /* GET_CPU_GPU_TIMEINFO */
+#define KB_JM_UK_EXEC_INIT_MINOR 13 /* MEM_EXEC_INIT, the 64-bit executable zone */
+#define KB_JM_UK_SAME_4GB_MINOR 11 /* BASE_MEM_GPU_VA_SAME_4GB_PAGE */
 
 /* MEM_JIT_INIT's trim level for a job-manager context; the CSF side's
  * KB_JIT_TRIM_LEVEL (5) is unrelated. */
@@ -94,6 +127,20 @@ struct kb_jm_job_submit {
 
 #define KB_JM_IOCTL_JOB_SUBMIT _IOW(KB_IOCTL_TYPE, 2, struct kb_jm_job_submit)
 #define KB_JM_IOCTL_POST_TERM  _IO(KB_IOCTL_TYPE, 4)
+
+/* MEM_JIT_INIT before 11.20 (kbase_ioctl_mem_jit_init_11_5 in later
+ * kernels' compatibility code): struct kb_ioctl_mem_jit_init without
+ * phys_pages. Same number, smaller size. */
+struct kb_ioctl_mem_jit_init_11_5 {
+   uint64_t va_pages;
+   uint8_t max_allocations;
+   uint8_t trim_level;
+   uint8_t group_id;
+   uint8_t padding[5];
+};
+
+#define KB_JM_IOCTL_MEM_JIT_INIT_11_5 \
+   _IOW(KB_IOCTL_TYPE, 14, struct kb_ioctl_mem_jit_init_11_5)
 
 struct kb_jm_soft_event_update {
    uint64_t event;      /* GPU address of the event byte */
@@ -336,11 +383,18 @@ KB_CHECK_OFF(struct kb_jm_atom, jobslot, 51);
 KB_CHECK_OFF(struct kb_jm_atom, core_req, 52);
 KB_CHECK_OFF(struct kb_jm_atom, renderpass_id, 56);
 KB_CHECK_OFF(struct kb_jm_atom, padding, 57);
-/* base_jd_atom_v2 is base_jd_atom from jc on: the other two accepted
- * JOB_SUBMIT strides. */
+/* base_jd_atom_v2 is base_jd_atom from jc on: 56 bytes from 11.19, and
+ * before that the same without renderpass_id and the padding after it
+ * (48 bytes, ending with core_req). mali_kbase_jm_submit copies those
+ * bytes out of each struct kb_jm_atom. */
 _Static_assert(sizeof(struct kb_jm_atom) - 8 == 56, "base_jd_atom_v2 size");
 _Static_assert(offsetof(struct kb_jm_atom, renderpass_id) - 8 == 48,
                "base_jd_atom_v2.renderpass_id");
+_Static_assert(offsetof(struct kb_jm_atom, core_req) + 4 - 8 == 48,
+               "base_jd_atom_v2 before 11.19 ends with core_req");
+
+KB_CHECK_SIZE(struct kb_ioctl_mem_jit_init_11_5, 16);
+KB_CHECK_OFF(struct kb_ioctl_mem_jit_init_11_5, group_id, 10);
 
 KB_CHECK_SIZE(struct kb_jm_atom_frame_nr, 72);
 KB_CHECK_OFF(struct kb_jm_atom_frame_nr, frame_nr, 64);
@@ -375,5 +429,6 @@ _Static_assert(KB_JM_IOCTL_POST_TERM == 0x8004, "POST_TERM");
 _Static_assert(KB_JM_IOCTL_SOFT_EVENT_UPDATE == 0x4010801c, "SOFT_EVENT_UPDATE");
 _Static_assert(KB_JM_IOCTL_STREAM_CREATE == 0x40208018, "STREAM_CREATE");
 _Static_assert(KB_JM_IOCTL_MEM_IMPORT_HUAWEI == 0xc0208016, "MEM_IMPORT (Huawei)");
+_Static_assert(KB_JM_IOCTL_MEM_JIT_INIT_11_5 == 0x4010800e, "MEM_JIT_INIT before 11.20");
 
 #endif /* MALI_KBASE_UAPI_JM_H */

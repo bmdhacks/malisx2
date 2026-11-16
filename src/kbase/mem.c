@@ -189,8 +189,11 @@ jm_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info, uint64
     * executable memory (KCTX_FORCE_SAME_VA,
     * context/backend/mali_kbase_context_jm.c): the context's executable
     * zone is already set up by mali_kbase_create (exec_init), before any
-    * allocation can reach here. */
-   if (!(flags & KB_MEM_PROT_GPU_EX))
+    * allocation can reach here. Before 11.13 there is no executable zone
+    * for a 64-bit context, and shader code is SAME_VA too: the kernel's
+    * get_unmapped_area aligns an executable SAME_VA mapping to
+    * 2^log2_program_counter_size, so it does not cross that boundary. */
+   if (!(flags & KB_MEM_PROT_GPU_EX) || !mali_kbase_has_exec_zone(kb))
       flags |= KB_MEM_SAME_VA;
 
    /* Unlike the CSF side (which only ever has GROW_ON_GPF to worry about
@@ -204,27 +207,57 @@ jm_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info, uint64
       return MALI_KBASE_ERROR_INVALID_ARGUMENT;
    }
 
-   union kb_ioctl_mem_alloc a;
-   memset(&a, 0, sizeof(a));
-   a.in.va_pages = va_pages;
-   a.in.commit_pages = commit_pages;
-   a.in.extension = extension;
-   a.in.flags = flags;
-   long ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC, &a);
-   if (ret < 0) {
-      KB_LOG(kb, "MEM_ALLOC of %llu pages, flags 0x%llx failed: %s",
-             (unsigned long long)va_pages, (unsigned long long)flags, strerror((int)-ret));
-      return kb_result_from_errno((int)-ret, KB_ERRNO_DEVICE_MEMORY);
+   /* Before 11.11 bit 6 is a reserved bit the kernel takes and ignores:
+    * keep the allocation inside one 4 GiB window by checking where it
+    * landed, below. */
+   const bool check_4g = (flags & KB_MEM_GPU_VA_SAME_4GB_PAGE) &&
+                         kb->uk_minor < KB_JM_UK_SAME_4GB_MINOR;
+   if (check_4g)
+      flags &= ~KB_MEM_GPU_VA_SAME_4GB_PAGE;
+
+   /* Regions that crossed a 4 GiB boundary, held until a later one does
+    * not so that the kernel places that one elsewhere. */
+   struct mali_kbase_bo crossed[4];
+   unsigned n_crossed = 0;
+   enum mali_kbase_result r;
+   for (;;) {
+      union kb_ioctl_mem_alloc a;
+      memset(&a, 0, sizeof(a));
+      a.in.va_pages = va_pages;
+      a.in.commit_pages = commit_pages;
+      a.in.extension = extension;
+      a.in.flags = flags;
+      long ret = kb_ioctl(kb, KB_IOCTL_MEM_ALLOC, &a);
+      if (ret < 0) {
+         KB_LOG(kb, "MEM_ALLOC of %llu pages, flags 0x%llx failed: %s",
+                (unsigned long long)va_pages, (unsigned long long)flags,
+                strerror((int)-ret));
+         r = kb_result_from_errno((int)-ret, KB_ERRNO_DEVICE_MEMORY);
+         break;
+      }
+
+      bo->gpu_va = a.out.gpu_va;
+      bo->va_pages = va_pages;
+      bo->size = va_pages << KB_PAGE_SHIFT;
+      bo->flags = a.out.flags;
+      bo->attrs = attrs_from_flags(a.out.flags);
+
+      r = finish_region(kb, bo, (a.out.flags & KB_MEM_SAME_VA) != 0, info->cpu_map);
+      if (r != MALI_KBASE_SUCCESS)
+         break;
+      if (!check_4g || (bo->gpu_va >> 32) == ((bo->gpu_va + bo->size - 1) >> 32))
+         break;
+      if (n_crossed == sizeof(crossed) / sizeof(crossed[0])) {
+         KB_LOG(kb, "alloc: %llu pages keep crossing a 4 GiB boundary",
+                (unsigned long long)va_pages);
+         mali_kbase_free(kb, bo);
+         r = MALI_KBASE_ERROR_OUT_OF_DEVICE_MEMORY;
+         break;
+      }
+      crossed[n_crossed++] = *bo;
    }
-
-   bo->gpu_va = a.out.gpu_va;
-   bo->va_pages = va_pages;
-   bo->size = va_pages << KB_PAGE_SHIFT;
-   bo->flags = a.out.flags;
-   bo->attrs = attrs_from_flags(a.out.flags);
-
-   enum mali_kbase_result r =
-      finish_region(kb, bo, (a.out.flags & KB_MEM_SAME_VA) != 0, info->cpu_map);
+   for (unsigned i = 0; i < n_crossed; i++)
+      mali_kbase_free(kb, &crossed[i]);
    if (r != MALI_KBASE_SUCCESS)
       memset(bo, 0, sizeof(*bo));
    return r;
@@ -268,7 +301,8 @@ mali_kbase_alloc(struct mali_kbase *kb, const struct mali_kbase_alloc_info *info
    if (flags & KB_MEM_PROT_GPU_EX)
       flags |= KB_MEM_PROT_GPU_RD;
    /* SAME_VA wins over GPU_EX in the kernel's zone choice, which would
-    * put code outside the executable zone. */
+    * put code outside the executable zone (where there is one: jm_alloc
+    * makes shader code SAME_VA itself where there is not). */
    if ((flags & KB_MEM_PROT_GPU_EX) && (flags & KB_MEM_SAME_VA)) {
       KB_LOG(kb, "alloc: GPU_EX with SAME_VA would miss the executable zone");
       return MALI_KBASE_ERROR_INVALID_ARGUMENT;

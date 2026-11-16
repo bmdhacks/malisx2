@@ -39,6 +39,15 @@ kb_ioctl(struct mali_kbase *kb, unsigned long request, void *arg)
    return ret < 0 ? -(long)errno : ret;
 }
 
+/* Whether the context has an executable VA zone (MEM_EXEC_INIT): every CSF
+ * kernel and job-manager kernels from 11.13 (uapi_jm.h). Without one,
+ * shader code is SAME_VA. */
+static inline bool
+mali_kbase_has_exec_zone(const struct mali_kbase *kb)
+{
+   return kb->frontend != MALI_KBASE_FRONTEND_JM || kb->uk_minor >= KB_JM_UK_EXEC_INIT_MINOR;
+}
+
 /* jm.c: pick the context's atom layout with one stride-72 JOB_SUBMIT
  * (mali_kbase_create, job manager only, last step). */
 enum mali_kbase_result kb_jm_probe_atom_layout(struct mali_kbase *kb);

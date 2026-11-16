@@ -1752,6 +1752,17 @@ physical_device_create(struct mali_instance *instance, const char *path,
       pdev->model = &pa->model;
    }
    const enum mali_kbase_frontend frontend = kb->frontend;
+   /* A job-manager kbase built without sync files (the RK3326's 4.4 BSP
+    * one) answers STREAM_CREATE with ENOENT: its fences and semaphores
+    * then get no SYNC_FD handle type (mali_sync.c). */
+   bool sync_files = true;
+   if (frontend == MALI_KBASE_FRONTEND_JM) {
+      int sfd;
+      if (mali_kbase_stream_create(kb, "malisx2_probe", &sfd) == MALI_KBASE_SUCCESS)
+         close(sfd);
+      else
+         sync_files = false;
+   }
    mali_kbase_destroy(kb);
 
    /* The arch has to match the frontend the kernel speaks: CSF with v10,
@@ -1769,6 +1780,9 @@ physical_device_create(struct mali_instance *instance, const char *path,
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
+   /* The Mali-G31 (arch 7, product major 3): an AFBC render target faults
+    * (0x58) on the H700's, so it gets linear and u-interleaved images only. */
+   pdev->afbc = !(pdev->arch == 7 && pdev->props.product_major == 3);
    pdev->timestamp_hz = timestamp_frequency();
    init_memory(pdev);
    /* driverInfo carries the shader cache ID, not the commit; say which build
@@ -1824,11 +1838,21 @@ physical_device_create(struct mali_instance *instance, const char *path,
    vk_physical_device_dispatch_table_from_entrypoints(
       &pdev->vk.dispatch_table, &mali_waist_physical_device_entrypoints, false);
 
-   pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
-                                   : pdev->arch == 9  ? mali_v9_sync_types()
-                                   : pdev->arch == 10 ? mali_v10_sync_types()
-                                   : pdev->arch == 12 ? mali_v12_sync_types()
-                                                      : mali_v11_sync_types();
+   if (sync_files) {
+      pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types()
+                                      : pdev->arch == 9  ? mali_v9_sync_types()
+                                      : pdev->arch == 10 ? mali_v10_sync_types()
+                                      : pdev->arch == 12 ? mali_v12_sync_types()
+                                                         : mali_v11_sync_types();
+   } else {
+      pdev->vk.supported_sync_types = pdev->arch == 7    ? mali_v7_sync_types_no_sync_file()
+                                      : pdev->arch == 9  ? mali_v9_sync_types_no_sync_file()
+                                      : pdev->arch == 10 ? mali_v10_sync_types_no_sync_file()
+                                      : pdev->arch == 12 ? mali_v12_sync_types_no_sync_file()
+                                                         : mali_v11_sync_types_no_sync_file();
+      mesa_logi("malisx2 kbase without sync files (STREAM_CREATE failed): fences and "
+                "semaphores have no SYNC_FD handle type");
+   }
 
    /* Compiled shaders are what pipeline caches hold. */
    pdev->vk.pipeline_cache_import_ops =

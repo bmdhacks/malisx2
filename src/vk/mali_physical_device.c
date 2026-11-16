@@ -720,6 +720,10 @@ arm_wsi_layer_loaded(void)
  * border colours (Mesa's runtime gives the colour, mali_sampler.c packs it as
  * it packs the standard ones), a seamless-cube bit to clear, and the
  * mirrored-clamp-to-edge wrap mode. Checked with the CTS on the G31 and G52.
+ * customBorderColorWithoutFormat holds because v7_afbc_format (mali_image.c)
+ * makes only R8, RG8 and RGBA8 AFBC: a BGR-order AFBC image on v7 would need
+ * the border colour's red and blue swapped per format, as panvk does
+ * (panvk_afbc_reswizzle_border_color), and would end it.
  */
 static bool
 sampler_features_for_arch(uint32_t arch)

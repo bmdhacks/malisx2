@@ -9,8 +9,9 @@
  * blob packs the same fields; the two value differences are settled in
  * panvk's favour (round-to-nearest-even, and the compare function of a
  * non-comparison sampler). No YCbCr conversion (not advertised). Custom
- * border colours (v7) come from Mesa's runtime like the standard ones. v9's Sampler has no reduction mode (min/max
- * filtering is not advertised there).
+ * border colours (v7) come from Mesa's runtime like the standard ones.
+ * v9's Sampler has no reduction mode (min/max filtering is not advertised
+ * there).
  */
 
 #ifndef PAN_ARCH

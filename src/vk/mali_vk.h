@@ -528,6 +528,27 @@ VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetDepthCullMALISX2(VkCommandBuffer comman
                                                          uint32_t flags);
 
 /*
+ * With vkCmdSetDepthCullMALISX2, also from vkGetDeviceProcAddr on v7: where
+ * VK_DEPTH_CULL_BELOW_BIT_MALISX2 culls. With enable set, the draws recorded
+ * after it in this command buffer have their fragments discarded below
+ * `depth` instead of below the viewport's minDepth, and a fragment whose
+ * depth lies between the two keeps that depth (it is not clamped to
+ * minDepth: a float depth attachment stores it, a normalised one stores its
+ * own limit). enable clear returns to minDepth. A command buffer starts
+ * there.
+ *
+ * For an emulator whose near plane is not at the bottom of the depth range:
+ * the Vita's GPU clips at z = -w, which a game that sets depth = z / w
+ * (scale 1, offset 0) puts at depth -1, and clamps what lies between -1 and
+ * 0. The tiler has one Minimum Z for both, so the near cull can sit at -1
+ * only if the clamp does too.
+ */
+typedef void(VKAPI_PTR *PFN_vkCmdSetDepthCullBelowMALISX2)(VkCommandBuffer commandBuffer,
+                                                          VkBool32 enable, float depth);
+VKAPI_ATTR void VKAPI_CALL mali_v7_CmdSetDepthCullBelowMALISX2(VkCommandBuffer commandBuffer,
+                                                              VkBool32 enable, float depth);
+
+/*
  * malisx2's own device extension on v7, in place of
  * VK_EXT_descriptor_indexing (whose required features and 500000
  * update-after-bind limits v7's 16-bit descriptor tables cannot meet). v9

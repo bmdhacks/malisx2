@@ -509,6 +509,12 @@ emit_viewport(struct mali_cmd_buffer *cmd)
        * ULP or two past it (a 24-bit depth stores it as maxDepth). */
       if (cmd->jm.depth_cull & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
          cfg.maximum_z += 1e-5f;
+      /* vkCmdSetDepthCullBelowMALISX2: the near cull sits at its depth
+       * instead of minDepth. The Minimum Z is both what the tiler and the
+       * fragment near discard cull below and what depth is clamped to, so
+       * a depth between the two is kept as it is. */
+      if ((cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2) && cmd->jm.depth_cull_below_set)
+         cfg.minimum_z = cmd->jm.depth_cull_below;
    }
    return p.gpu;
 }
@@ -1947,11 +1953,27 @@ MALI_PER_ARCH(CmdSetDepthCullMALISX2)(VkCommandBuffer commandBuffer, uint32_t fl
    const uint8_t cull = (flags & VK_DEPTH_CULL_OVERRIDE_BIT_MALISX2) ? (uint8_t)(flags & 7) : 0;
    /* The Viewport's Maximum Z carries the far-plane tolerance, the
     * fragment RSD the near and far discards. */
-   if ((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2)
+   if (((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_ABOVE_BIT_MALISX2) ||
+       (((cull ^ cmd->jm.depth_cull) & VK_DEPTH_CULL_BELOW_BIT_MALISX2) && cmd->jm.depth_cull_below_set))
       cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
    if (cull != cmd->jm.depth_cull)
       cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_ZSD;
    cmd->jm.depth_cull = cull;
+}
+
+/* vkCmdSetDepthCullBelowMALISX2 (malisx2's own, from vkGetDeviceProcAddr;
+ * mali_vk.h): the Viewport's Minimum Z carries the depth. */
+VKAPI_ATTR void VKAPI_CALL
+MALI_PER_ARCH(CmdSetDepthCullBelowMALISX2)(VkCommandBuffer commandBuffer, VkBool32 enable, float depth)
+{
+   VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   const bool set = enable && depth == depth;
+   if (set != cmd->jm.depth_cull_below_set || (set && depth != cmd->jm.depth_cull_below)) {
+      if (cmd->jm.depth_cull & VK_DEPTH_CULL_BELOW_BIT_MALISX2)
+         cmd->gfx.draw.dirty |= MALI_GFX_DIRTY_VIEWPORT;
+      cmd->jm.depth_cull_below_set = set;
+      cmd->jm.depth_cull_below = depth;
+   }
 }
 
 /*

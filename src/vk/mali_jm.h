@@ -395,6 +395,10 @@ struct mali_jm_cmd {
    /* vkCmdSetDepthCullMALISX2: its flags, 0 for the pipeline's depth
     * clip and clamp (mali_jm_cmd_draw_v7.c). */
    uint8_t depth_cull;
+   /* vkCmdSetDepthCullBelowMALISX2: whether it moved the depth below
+    * which VK_DEPTH_CULL_BELOW_BIT_MALISX2 culls, and where to. */
+   bool depth_cull_below_set;
+   float depth_cull_below;
    /* vkCmdSetIndexRangeMALISX2: the smallest and largest index of the
     * next indexed draw, if it is the one named (index buffer, first index,
     * count); its index scan is then skipped (mali_jm_cmd_draw_v7.c). */

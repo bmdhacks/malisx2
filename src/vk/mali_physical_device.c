@@ -427,6 +427,14 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_external_semaphore_fd = true,
    /* ARMSX2 logs the fault records after VK_ERROR_DEVICE_LOST. */
    .EXT_device_fault = true,
+   /* ARMSX2's "Spin GPU During Readbacks" turns GPU timestamps into CPU
+    * time with these; Arm's WSI layer on Linux calibrates present timing
+    * with them. Both names: ARMSX2 releases before the KHR name was
+    * accepted ask for EXT only. The device domain is the GPU TIMESTAMP
+    * register (device_get_timestamp, mali_device.c); Mesa's common code
+    * reads the host clocks around it. */
+   .KHR_calibrated_timestamps = true,
+   .EXT_calibrated_timestamps = true,
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* Without it the Android loader builds no swapchain. */
    .ANDROID_native_buffer = true,
@@ -449,7 +457,6 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .EXT_external_memory_dma_buf = true,
    .EXT_image_drm_format_modifier = true,
    .KHR_image_format_list = true,
-   .KHR_calibrated_timestamps = true,
    /* Vulkan 1.1 core; for an application that asks for Vulkan 1.0 the
     * layer enables them by name. */
    .KHR_bind_memory2 = true,

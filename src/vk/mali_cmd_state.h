@@ -1290,7 +1290,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    }
    d->first_vertex = di->vertex_offset;
    d->base_instance = di->first_instance;
-   if (d->draw_id != di->draw_id)
+   if (d->draw_id != di->draw_id && bd->vs_draw_id)
       d->dirty |= MALI_GFX_DIRTY_VS_FAU;
    d->draw_id = di->draw_id;
 

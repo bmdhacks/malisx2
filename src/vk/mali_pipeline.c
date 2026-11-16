@@ -641,6 +641,9 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    bd->vs_base_instance =
       BITSET_TEST(p->vs->fau.used_sysvals,
                   offsetof(struct mali_graphics_sysvals, vs.base_instance) / MALI_FAU_WORD_SIZE);
+   bd->vs_draw_id =
+      BITSET_TEST(p->vs->fau.used_sysvals,
+                  offsetof(struct mali_graphics_sysvals, draw_id) / MALI_FAU_WORD_SIZE);
    bd->fs_sets = p->fs ? stage_sets(p->fs) : 0;
 
    bd->static_mask = 0;

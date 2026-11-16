@@ -175,8 +175,8 @@ struct mali_gfx_bind {
    /* Descriptor sets each stage's resource table reads. */
    uint16_t vs_sets, fs_sets;
    /* The vertex shader reads these system values (FAU inputs that change
-    * per draw). */
-   bool vs_first_vertex, vs_base_instance;
+    * per draw; draw_id only on v7). */
+   bool vs_first_vertex, vs_base_instance, vs_draw_id;
    bool dynamic;                  /* baked.uses_dynamic_state */
    bool discard;                  /* static rasterizer discard (v9, v11: such a
                                    * draw is dropped); false when dynamic */

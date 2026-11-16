@@ -182,7 +182,7 @@ malisx2_vk = static_library(
   # systems: the gralloc and swapchain-image side of mali_wsi.c that does
   # not depend on the arch, mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
-  with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c'),
+  with_platform_android ? files('vk/mali_android.c') : files('vk/mali_wsi_linux.c', 'vk/mali_wsi_fbdev.c'),
   # The measurement layer's configuration, output and CPU profile
   # (MALISX2_MEASURE); the recording side is per back half.
   files('measurement/config.c', 'measurement/cpuprof.c'),

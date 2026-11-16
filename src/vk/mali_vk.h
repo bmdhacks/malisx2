@@ -109,6 +109,9 @@ struct mali_physical_device {
     * first use; mali_wsi_linux.c). */
    int drm_fd;
    struct gbm_device *gbm;
+   /* VK_KHR_display on a framebuffer device when there is no DRM node, or
+    * NULL (mali_wsi_fbdev.c). */
+   struct mali_fbdev *fbdev;
 #endif
 };
 
@@ -128,6 +131,10 @@ void mali_wsi_finish(struct mali_physical_device *pdev);
 VkResult mali_wsi_alloc_scanout(struct mali_physical_device *pdev, VkFormat format,
                                 unsigned width, unsigned height, uint32_t *stride,
                                 uint64_t *size, int *fd);
+/* VK_KHR_display on /dev/fb0 when no DRM node was found (mali_wsi_fbdev.c),
+ * called by mali_wsi_init and mali_wsi_finish. */
+void mali_wsi_fbdev_init(struct mali_physical_device *pdev);
+void mali_wsi_fbdev_finish(struct mali_physical_device *pdev);
 #endif
 
 /* The deviceName for a GPU, or false if it is not a GPU this driver was

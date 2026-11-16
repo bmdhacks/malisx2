@@ -241,7 +241,7 @@ enum mali_kbase_jm_atom_layout {
    MALI_KBASE_JM_ATOM_FRAME_NR,   /* base_jd_atom + u32 frame_nr, stride 72 */
    MALI_KBASE_JM_ATOM_V2,         /* base_jd_atom_v2, stride 56 (UK 11.19 to 11.21) */
    MALI_KBASE_JM_ATOM_V2_48,      /* base_jd_atom_v2 without renderpass_id,
-                                     stride 48 (UK 11.17 and 11.18) */
+                                     stride 48 (UK 11.7 to 11.18) */
 };
 
 typedef void (*mali_kbase_log_fn)(void *user, const char *msg);
@@ -267,7 +267,7 @@ struct mali_kbase {
    const struct mali_kbase_backend *backend;
    int fd;
    enum mali_kbase_frontend frontend;
-   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.17 to 11.36 on JM */
+   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.7 to 11.36 on JM */
    struct mali_kbase_gpu_props props;
    struct mali_kbase_glb_iface glb;          /* CSF only; zero on JM */
    /* The GPU's user register page, mapped read-only. CSF only; NULL on JM. */
@@ -315,7 +315,7 @@ struct mali_kbase {
  *      order: SET_FLAGS, GET_GPUPROPS, CS_GET_GLB_IFACE, map the user
  *      register page, MEM_EXEC_INIT, MEM_JIT_INIT (trim level 5).
  *   2. Otherwise, VERSION_CHECK (ioctl 0) proposing 11.36 on the same fd
- *      and accepting 11.17 to 11.36 back:
+ *      and accepting 11.7 to 11.36 back:
  *      each frontend's kernel answers the other's version-check ioctl
  *      with EPERM without touching setup state, so trying both on one fd
  *      is valid. On a matching answer the frontend is job-manager and the

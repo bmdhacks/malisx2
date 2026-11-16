@@ -75,7 +75,7 @@ open_device(struct mali_kbase *kb, const char *path)
  * answers with another version, or a failure other than EPERM, is refused
  * at once, as before there was a job-manager path, so a CSF device sees
  * exactly the ioctls it always did. On the job-manager side we accept
- * 11.17 (KB_JM_UK_MIN_MINOR) to 11.36 back. The kernel answers
+ * 11.7 (KB_JM_UK_MIN_MINOR) to 11.36 back. The kernel answers
  * min(ours, its own) for a matching major, so there is no upper bound to
  * check; what differs below 11.22 (the atom size, MEM_JIT_INIT's struct)
  * is chosen by the minor (see uapi_jm.h). The r20p0 kernel (11.17)
@@ -264,10 +264,10 @@ map_user_reg_page(struct mali_kbase *kb)
 
 /*
  * BASE_MEM_MAP_TRACKING_HANDLE: on a job-manager kernel older than UK 11.38
- * (every one we accept, 11.17 to 11.36) an allocation before this mapping exists fails with EINVAL
- * (kbase_mem_allow_alloc), and munmapping it again blocks allocation once
- * more. We never touch the mapping's contents (PROT_NONE); mali_kbase_destroy
- * unmaps it.
+ * (every one we accept, 11.7 to 11.36) an allocation before this mapping
+ * exists fails with EINVAL (kbase_mem_allow_alloc), and munmapping it again
+ * blocks allocation once more. We never touch the mapping's contents
+ * (PROT_NONE); mali_kbase_destroy unmaps it.
  */
 static enum mali_kbase_result
 jm_map_tracking_page(struct mali_kbase *kb)

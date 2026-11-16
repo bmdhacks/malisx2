@@ -1075,6 +1075,10 @@ struct mali_jm_heap {
    simple_mtx_t lock;
    uint32_t next;           /* the slot the next batch takes */
    uint32_t count;          /* slots in the ring now; written under lock */
+   /* The most slots the ring may grow to: MALI_JM_HEAP_SLOTS_GROWN, or
+    * fewer once a slot's region could not be allocated
+    * (mali_jm_heap_take). Written under lock, never raised. */
+   uint32_t limit;
    /* The current window of submissions (the submit path only, under
     * dev->lock): how many there were, how many wrapped the ring, and the
     * most tiled batches one of those had. */

@@ -133,6 +133,28 @@ slab_new(struct mali_device *dev, uint64_t size, bool recycle)
 static void
 slab_release(struct mali_device *dev, struct mali_cmd_slab *s)
 {
+   if (s->wls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_wls_slab_count < MALI_FREE_WLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_wls_slabs);
+         dev->free_wls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
+   if (s->tls) {
+      simple_mtx_lock(&dev->slab_lock);
+      if (dev->free_tls_slab_count < MALI_FREE_TLS_SLABS_MAX) {
+         list_add(&s->link, &dev->free_tls_slabs);
+         dev->free_tls_slab_count++;
+         s = NULL;
+      }
+      simple_mtx_unlock(&dev->slab_lock);
+      if (!s)
+         return;
+   }
    if (s->recycle) {
       simple_mtx_lock(&dev->slab_lock);
       if (dev->free_slab_count < MALI_CMD_FREE_SLABS_MAX) {
@@ -197,6 +219,8 @@ cmd_release_memory(struct mali_cmd_buffer *cmd)
    cmd->cur_offset = 0;
    cmd->tls.size = 0;
    cmd->tls.gpu = 0;
+   cmd->wls = (struct mali_wls_state){0};
+   cmd->wls_vt = (struct mali_wls_state){0};
 }
 
 /* ---------------------------------------------------------------------- */
@@ -243,6 +267,7 @@ init_streams(struct mali_cmd_buffer *cmd)
        * (finish_stream, mali_queue.c). */
       cmd->cs[i].iter_sb = MALI_SB_ITER_START;
 #endif
+      cmd->cs[i].compute_res = false;
       cmd->cs[i].flushed = (struct mali_cache_flush){0};
       memset(cmd->cs[i].carried, 0, sizeof(cmd->cs[i].carried));
       memset(cmd->cs[i].waited, 0, sizeof(cmd->cs[i].waited));
@@ -427,6 +452,13 @@ finish_stream(struct mali_cmd_buffer *cmd, unsigned sq)
                    MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
                    cs_defer(0, MALI_SB_IMM_FLUSH));
    cs_wait_slot(b, MALI_SB_IMM_FLUSH);
+   /* Every job has finished (the wait above), so the compute resource the
+    * vertex/tiler stream asked for can go: the next command buffer starts
+    * with the stream's usual resources. */
+   if (cmd->cs[sq].compute_res) {
+      cs_req_res(b, mali_subqueue_resources(sq));
+      cmd->cs[sq].compute_res = false;
+   }
 #if PAN_ARCH == 10
    /* Hand the stream back with the first iterator entry selected, which
     * the next command buffer's recording assumes (mali_cmd_next_iter_sb). */

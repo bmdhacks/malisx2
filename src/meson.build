@@ -116,7 +116,7 @@ mali_version_h = vcs_tag(
 # binaries (vk/gen_shader_cache_id.py), not from the commit, so a driver
 # update that leaves the compiler alone keeps applications' pipeline caches.
 # One hash per architecture: a change only the v9 build sees leaves the
-# v10 and v11 ones alone.
+# v10, v11 and v12 ones alone.
 # The script runs on every build and rewrites the header only on a change.
 mali_shader_cache_id_h = custom_target(
   'mali_shader_cache_id.h',
@@ -130,6 +130,8 @@ mali_shader_cache_id_h = custom_target(
 
 _vk_c_args = [
   pre_args, malisx2_c_args,
+  # Geometry and tessellation shaders (mesa-glue/src/poly).
+  '-DMALI_WITH_POLY=@0@'.format(with_poly.to_int()),
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
 ]
 
@@ -186,6 +188,8 @@ malisx2_vk = static_library(
   # The measurement layer's configuration, output and CPU profile
   # (MALISX2_MEASURE); the recording side is per back half.
   files('measurement/config.c', 'measurement/cpuprof.c'),
+  # The tessellator on the CPU, for constant tessellation levels.
+  with_poly ? files('vk/mali_tess_cpu.c') : [],
   mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
@@ -195,6 +199,33 @@ malisx2_vk = static_library(
                  (with_platform_android ? [] : [idep_vulkan_wsi_headers]),
   gnu_symbol_visibility : 'hidden',
 )
+
+# The tessellator's kernels (vk/cl/mali_tess.cl) as SPIR-V, which the
+# driver compiles when it first tessellates (mali_cmd_copy.c).
+if with_poly
+  _mali_tess_cl = files('vk/cl/mali_tess.cl')
+  _mali_tess_spv = custom_target(
+    'mali_tess.spv',
+    input : _mali_tess_cl,
+    output : 'mali_tess.spv',
+    command : [
+      prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', _mali_tess_cl, '--',
+      '-I' + (mesa_src / '..' / 'include'), '-I' + (mesa_src / 'compiler' / 'libcl'),
+      '-I' + (mesa_src / 'poly' / 'cl'), '-I' + mesa_src,
+      '-cl-std=cl2.0', '-D__OPENCL_VERSION__=200',
+      '-DHAVE___BUILTIN_FFS', '-DHAVE___BUILTIN_CLZ', '-DNDEBUG',
+    ],
+    depfile : 'mali_tess.spv.d',
+  )
+  mali_tess_spv_h = custom_target(
+    'mali_tess_spv.h',
+    input : [files('vk/gen_spirv_h.py'), _mali_tess_spv],
+    output : 'mali_tess_spv.h',
+    command : [prog_python, '@INPUT0@', '--name', 'mali_tess_spv', '@INPUT1@', '@OUTPUT@'],
+  )
+else
+  mali_tess_spv_h = []
+endif
 
 # The command-stream (CSF) back half: command buffers, dispatches, events,
 # queries, render passes, draws, the queue, submit and sync, the per-arch
@@ -216,12 +247,11 @@ foreach arch : ['10', '11', '12']
     'mali_vk_v' + arch,
     _vk_csf_files, _vk_per_arch_files,
     mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
-    mali_version_h,
+    mali_version_h, mali_shader_cache_id_h, mali_tess_spv_h,
     include_directories : _vk_inc,
-    c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=' + arch,
-              '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version())],
+    c_args : [_vk_c_args, '-DPAN_ARCH=' + arch],
     dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch[arch],
-                    idep_pan_packers_by_arch[arch]],
+                    idep_pan_packers_by_arch[arch], idep_poly],
     gnu_symbol_visibility : 'hidden',
   )}
 endforeach

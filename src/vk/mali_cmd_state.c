@@ -203,7 +203,7 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
  * Inlined into cmd_gfx_fau, which every draw runs. */
 static ALWAYS_INLINE void
 gfx_fau_fill(const struct mali_shader *s, uint32_t total, const void *sysvals, const void *push,
-             uint32_t push_size, uint64_t self, void *out)
+             uint32_t push_size, const struct mali_desc_state *desc, uint64_t self, void *out)
 {
    /* The sysval words the shader reads, with the block's own address in
     * common.push_uniforms, then its push-constant words (zero past the
@@ -231,6 +231,23 @@ gfx_fau_fill(const struct mali_shader *s, uint32_t total, const void *sysvals, c
    assert(!s->fau.ubo_push_count || n == s->fau.ubo_push_start);
    for (unsigned i = n; i < total; i++)
       tmp[i] = 0;
+#if PAN_ARCH >= 9
+   /* The dynamic offsets the shader adds to its uniform buffer loads
+    * (mali_shader.c lower_dyn_ubo_offsets), two to a word. */
+   if (s->desc.dyn_off_mask) {
+      uint32_t offs[2 * MALI_FAU_WORD_COUNT];
+      unsigned k = 0;
+      u_foreach_bit(i, s->desc.dyn_off_mask) {
+         const uint32_t h = s->desc.dyn_bufs.map[i];
+         offs[k++] = desc->dyn_offsets[MALI_COPY_DESC_HANDLE_SET(h)]
+                                      [MALI_COPY_DESC_HANDLE_INDEX(h)];
+      }
+      if (k & 1)
+         offs[k++] = 0;
+      assert(s->fau.dyn_off_start + k / 2 <= total);
+      memcpy(&tmp[s->fau.dyn_off_start], offs, k * sizeof(offs[0]));
+   }
+#endif
 
    pan_fau_foreach_imm(&s->info.fau, i) {
       bool hi = i & 1;
@@ -254,16 +271,17 @@ MALI_PER_ARCH(cmd_gfx_fau)(struct mali_cmd_buffer *cmd, const struct mali_shader
    struct mali_ptr p = mali_cmd_alloc(cmd, total * 8, 16);
    if (!p.cpu)
       return 0;
-   gfx_fau_fill(s, total, sysvals, push, push_size, p.gpu, p.cpu);
+   gfx_fau_fill(s, total, sysvals, push, push_size, &cmd->gfx.desc, p.gpu, p.cpu);
    return p.gpu | ((uint64_t)total << 56);
 }
 
 #if PAN_ARCH >= 10
 void
 MALI_PER_ARCH(gfx_fau_fill)(const struct mali_shader *s, const void *sysvals, const void *push,
-                            uint32_t push_size, uint64_t self, void *out)
+                            uint32_t push_size, const struct mali_desc_state *desc, uint64_t self,
+                            void *out)
 {
-   gfx_fau_fill(s, s->fau.total_count, sysvals, push, push_size, self, out);
+   gfx_fau_fill(s, s->fau.total_count, sysvals, push, push_size, desc, self, out);
 }
 #endif
 
@@ -349,6 +367,64 @@ MALI_PER_ARCH(CmdBindPipeline)(VkCommandBuffer commandBuffer, VkPipelineBindPoin
    MALI_PER_ARCH(cmd_bind_pipeline)(cmd, pipeline);
 }
 
+/* The layout of set idx of a bind: the set's own, or the pipeline
+ * layout's for a null set. */
+static const struct mali_descriptor_set_layout *
+bound_set_layout(const struct mali_descriptor_set *set, const struct vk_pipeline_layout *layout,
+                 uint32_t idx)
+{
+   if (set)
+      return set->layout;
+   return layout && layout->set_layouts[idx] ? mali_descriptor_set_layout(layout->set_layouts[idx])
+                                             : NULL;
+}
+
+#if PAN_ARCH >= 9
+/*
+ * A graphics bind, before cmd->gfx.desc takes it. A set that is not the one
+ * already bound at its index dirties the tables of the stages that read it.
+ * A dynamic offset that differs from the bound one is recorded per stage
+ * for the table and for the FAU block: the draw rebuilds the table when
+ * the offset is in the slot (a storage buffer, or a shader that keeps it
+ * there) and the FAU block when the shader reads it from FAU
+ * (mali_gfx_dynoff_dirty). So the usual constant-buffer rebind, the same
+ * set at new offsets, rebuilds no table.
+ */
+static void
+gfx_note_bind(struct mali_cmd_buffer *cmd, const VkBindDescriptorSetsInfoKHR *info,
+              const struct vk_pipeline_layout *layout)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_desc_state *st = &cmd->gfx.desc;
+   uint32_t dyn = 0;
+
+   for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
+      const uint32_t idx = info->firstSet + i;
+      VK_FROM_HANDLE(mali_descriptor_set, set, info->pDescriptorSets[i]);
+      if (set != st->sets[idx] || !set) {
+         d->vs_sets_dirty |= BITFIELD_BIT(idx);
+         d->fs_sets_dirty |= BITFIELD_BIT(idx);
+      }
+      const struct mali_descriptor_set_layout *sl = bound_set_layout(set, layout, idx);
+      const uint32_t count = sl ? sl->dyn_buf_count : 0;
+      uint32_t changed = 0;
+      for (uint32_t k = 0; k < count; k++, dyn++) {
+         const uint32_t off = dyn < info->dynamicOffsetCount ? info->pDynamicOffsets[dyn] : 0;
+         if (off != st->dyn_offsets[idx][k])
+            changed |= BITFIELD_BIT(k);
+      }
+      if (changed) {
+         for (unsigned s = 0; s < 2; s++) {
+            d->dynoff_srt[s][idx] |= changed;
+            d->dynoff_fau[s][idx] |= changed;
+         }
+         d->dynoff_pending = MALI_GFX_DYNOFF_VS_SRT | MALI_GFX_DYNOFF_FS_SRT |
+                             MALI_GFX_DYNOFF_VS_FAU | MALI_GFX_DYNOFF_FS_FAU;
+      }
+   }
+}
+#endif
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdBindDescriptorSets2KHR)(VkCommandBuffer commandBuffer,
                                          const VkBindDescriptorSetsInfoKHR *info)
@@ -364,10 +440,14 @@ MALI_PER_ARCH(CmdBindDescriptorSets2KHR)(VkCommandBuffer commandBuffer,
       states[n++] = &cmd->gfx.desc;
 
    if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+#if PAN_ARCH >= 9
+      gfx_note_bind(cmd, info, layout);
+#else
       /* The draw rebuilds a stage's table when it reads one of these. */
       const uint32_t sets = BITFIELD_RANGE(info->firstSet, info->descriptorSetCount);
       cmd->gfx.draw.vs_sets_dirty |= sets;
       cmd->gfx.draw.fs_sets_dirty |= sets;
+#endif
    }
 
    for (unsigned s = 0; s < n; s++) {
@@ -378,10 +458,7 @@ MALI_PER_ARCH(CmdBindDescriptorSets2KHR)(VkCommandBuffer commandBuffer,
          VK_FROM_HANDLE(mali_descriptor_set, set, info->pDescriptorSets[i]);
          assert(idx < MALI_MAX_SETS);
          st->sets[idx] = set;
-         const struct mali_descriptor_set_layout *sl =
-            set ? set->layout :
-                  (layout && layout->set_layouts[idx] ?
-                      mali_descriptor_set_layout(layout->set_layouts[idx]) : NULL);
+         const struct mali_descriptor_set_layout *sl = bound_set_layout(set, layout, idx);
          uint32_t count = sl ? sl->dyn_buf_count : 0;
          for (uint32_t d = 0; d < count; d++) {
             st->dyn_offsets[idx][d] =

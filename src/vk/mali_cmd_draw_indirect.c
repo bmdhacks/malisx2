@@ -210,7 +210,7 @@ draw_indirect_pass(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, u
          const uint64_t gpu = p.gpu + (uint64_t)k * entry;
          if (sv_off >= 0)
             MALI_PER_ARCH(gfx_fau_fill)(vs, &sv, cmd->push_constants,
-                                        sizeof(cmd->push_constants), gpu, cpu);
+                                        sizeof(cmd->push_constants), &cmd->gfx.desc, gpu, cpu);
          if (attribs) {
             mali_gfx_pack_vs_drv(cmd, vs, d->vi, cpu + drv_off, vb_offset, vb_count);
             mali_gfx_pack_res_table(vs, &cmd->gfx.desc, gpu + drv_off, drv_count, rt_count,

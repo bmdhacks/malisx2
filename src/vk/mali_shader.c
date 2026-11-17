@@ -850,6 +850,112 @@ lower_ubo_push(nir_shader *nir, struct mali_shader *s)
 }
 #endif
 
+#if PAN_ARCH >= 9
+/* ---------------------------------------------------------------------- */
+/* Dynamic uniform buffer offsets in FAU                                   */
+
+/*
+ * A vertex or fragment shader reads a dynamic uniform buffer through its
+ * copy in the driver table (table 0). With the dynamic offset applied to
+ * that copy, every rebind that moves the offset (ARMSX2 rebinds its
+ * constant buffers at a new ring offset for most draws) makes the draw
+ * write a new table for each stage: on the vertex stage that is the 16
+ * attribute descriptors too, about 670 bytes, which the GPU then reads
+ * from memory the CPU has just written, at the start of a job the
+ * previous one waits on.
+ *
+ * Instead the copy covers the buffer from the bound offset to its end,
+ * and each load adds the dynamic offset, a 32-bit FAU word the draw fills
+ * when it builds the stage's FAU block (mali_cmd_state.c gfx_fau_fill).
+ * The table then depends on the bound set only, and an offset change
+ * costs the FAU block the draw writes anyway when its pipeline or other
+ * system values change.
+ *
+ * Runs after the uniform-buffer push (v10 and later), whose loads have
+ * been replaced by FAU reads and need no offset. The words go after the
+ * pushed ones and stay inside FAU words 0-31: a v9 instruction reads its
+ * FAU sources from one page (encode_v9.rs). A shader whose uniform
+ * buffer loads are not all through a constant handle, or whose words do
+ * not fit, keeps the offset in its table slots.
+ */
+struct dyn_off_ctx {
+   struct mali_shader *s;
+   uint32_t first_handle;   /* table-0 index of dynamic buffer copy 0 */
+   uint32_t used;           /* entries read by a load through a constant handle */
+   bool unknown;            /* a load through a handle that is not a constant */
+   bool lower;
+};
+
+static bool
+dyn_off_intr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct dyn_off_ctx *ctx = data;
+   if (intr->intrinsic != nir_intrinsic_load_ubo)
+      return false;
+   if (!nir_src_is_const(intr->src[0])) {
+      ctx->unknown = true;
+      return false;
+   }
+
+   const uint32_t handle = nir_src_as_uint(intr->src[0]);
+   if (pan_res_handle_get_table(handle) != 0)
+      return false;
+   const uint32_t idx = pan_res_handle_get_index(handle);
+   if (idx < ctx->first_handle || idx - ctx->first_handle >= ctx->s->desc.dyn_bufs.count)
+      return false;
+   const uint32_t dyn = idx - ctx->first_handle;
+
+   if (!ctx->lower) {
+      ctx->used |= BITFIELD_BIT(dyn);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   const unsigned k = util_bitcount(ctx->used & BITFIELD_MASK(dyn));
+   nir_def *off = nir_load_push_constant(
+      b, 1, 32, nir_imm_int(b, ctx->s->fau.dyn_off_start * MALI_FAU_WORD_SIZE + k * 4));
+   nir_src_rewrite(&intr->src[1], nir_iadd(b, intr->src[1].ssa, off));
+   nir_intrinsic_set_range_base(intr, 0);
+   nir_intrinsic_set_range(intr, ~0u);
+   return true;
+}
+
+static void
+lower_dyn_ubo_offsets(nir_shader *nir, struct mali_shader *s)
+{
+   struct mali_shader_desc_info *di = &s->desc;
+
+   di->dyn_unbaked_mask = 0;
+   di->dyn_off_mask = 0;
+   di->dyn_fau_mask = 0;
+   s->fau.dyn_off_start = s->fau.total_count;
+   for (unsigned i = 0; i < s->fau.ubo_push_count; i++)
+      di->dyn_fau_mask |= BITFIELD_BIT(s->fau.ubo_push[i].dyn);
+
+   if ((nir->info.stage != MESA_SHADER_VERTEX && nir->info.stage != MESA_SHADER_FRAGMENT) ||
+       !di->dyn_ubo_mask)
+      return;
+
+   struct dyn_off_ctx ctx = {
+      .s = s,
+      .first_handle = di->driver_table_prefix + 1,
+   };
+   nir_shader_intrinsics_pass(nir, dyn_off_intr, nir_metadata_all, &ctx);
+   const unsigned words = DIV_ROUND_UP(util_bitcount(ctx.used), 2);
+   if (ctx.unknown || (ctx.used & ~di->dyn_ubo_mask) || s->fau.total_count + words > 32)
+      return;
+
+   di->dyn_unbaked_mask = di->dyn_ubo_mask;
+   di->dyn_off_mask = ctx.used;
+   di->dyn_fau_mask |= ctx.used;
+   if (!words)
+      return;
+   ctx.lower = true;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, dyn_off_intr, nir_metadata_control_flow, &ctx);
+   s->fau.total_count += words;
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 /* Options and lowering                                                    */
 
@@ -2214,6 +2320,9 @@ compile_nir(struct mali_device *dev, nir_shader *nir,
             nir_metadata_control_flow, s);
    lower_load_push_consts(nir, s);
    lower_ubo_push(nir, s);
+#if PAN_ARCH >= 9
+   lower_dyn_ubo_offsets(nir, s);
+#endif
 
    /* The driver's words come first; the backend may put promoted
     * constants after them. */

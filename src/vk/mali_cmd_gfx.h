@@ -309,6 +309,12 @@ enum mali_gfx_dirty {
    MALI_GFX_DIRTY_ALL      = (1u << 11) - 1,
 };
 
+/* mali_gfx_draw_state::dynoff_pending. */
+#define MALI_GFX_DYNOFF_VS_SRT (1u << 0)
+#define MALI_GFX_DYNOFF_FS_SRT (1u << 1)
+#define MALI_GFX_DYNOFF_VS_FAU (1u << 2)
+#define MALI_GFX_DYNOFF_FS_FAU (1u << 3)
+
 struct mali_gfx_draw_state {
    struct mali_graphics_pipeline *pipeline;
    uint32_t dirty;
@@ -359,6 +365,16 @@ struct mali_gfx_draw_state {
    uint32_t vs_srt_key, fs_srt_key;
    /* Descriptor sets bound since each stage's table was built. */
    uint32_t vs_sets_dirty, fs_sets_dirty;
+   /* v9 and later: dynamic offsets that changed in a bind, one bit per
+    * dynamic buffer of each set, since the vertex [0] and fragment [1]
+    * stage's table (srt) or FAU block (fau) was built. A rebind of the
+    * set already bound with only new offsets leaves vs/fs_sets_dirty
+    * alone; the draw rebuilds what reads a changed offset
+    * (mali_gfx_dynoff_dirty). dynoff_pending: MALI_GFX_DYNOFF_* bits of
+    * the arrays that may hold a bit. */
+   uint32_t dynoff_srt[2][MALI_MAX_SETS];
+   uint32_t dynoff_fau[2][MALI_MAX_SETS];
+   uint32_t dynoff_pending;
 
    /* What the IDVS staging registers hold (0..63 on v10 and v11, 0..65 on v12),
     * per 32-bit register, where regs_valid says it is known: a draw writes
@@ -513,7 +529,9 @@ MALI_PER_ARCH_DECL(void, cmd_bind_graphics,
                    (struct mali_cmd_buffer *cmd, struct mali_graphics_pipeline *p));
 
 /* The FAU block of a graphics-stage shader: its used sysval words, then
- * its used push-constant words, then promoted constants. `sysvals` is a
+ * its used push-constant words, its constants, its pushed uniform-buffer
+ * words (zero; the GPU copies them), the dynamic offsets it reads (from
+ * cmd->gfx.desc), then promoted constants. `sysvals` is a
  * struct mali_graphics_sysvals. Returns the GPU address with the word
  * count in bits 56+, or 0 on failure / no FAU. */
 MALI_PER_ARCH_DECL(uint64_t, cmd_gfx_fau,
@@ -525,7 +543,8 @@ MALI_PER_ARCH_DECL(uint64_t, cmd_gfx_fau,
 #if !defined(PAN_ARCH) || PAN_ARCH >= 10
 MALI_PER_ARCH_DECL(void, gfx_fau_fill,
                    (const struct mali_shader *s, const void *sysvals, const void *push,
-                    uint32_t push_size, uint64_t self, void *out));
+                    uint32_t push_size, const struct mali_desc_state *desc, uint64_t self,
+                    void *out));
 #endif
 
 /* ---------------------------------------------------------------------- */

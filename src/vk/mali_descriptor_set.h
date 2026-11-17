@@ -94,6 +94,10 @@ struct mali_descriptor_set {
    struct {
       uint64_t addr;
       uint64_t range;
+      /* Bytes from addr to the end of the buffer: the size of the
+       * descriptor of a dynamic uniform buffer whose shader adds the
+       * dynamic offset itself (mali_shader_desc_info::dyn_unbaked_mask). */
+      uint64_t room;
    } dyn_bufs[MALI_MAX_DYNAMIC_BUFFERS];
 };
 
@@ -212,6 +216,15 @@ MALI_PER_ARCH_DECL(void, descriptor_set_pack_resource,
 MALI_PER_ARCH_DECL(void, descriptor_set_pack_dyn_buf,
                    (const struct mali_descriptor_set *set, uint32_t idx,
                     uint32_t dynamic_offset, void *out));
+
+/*
+ * The same slot for a dynamic uniform buffer whose shader adds the dynamic
+ * offset from its FAU block: the buffer from the bound offset to its end,
+ * so the descriptor does not change when only the dynamic offset does.
+ * Robust buffer access allows a read anywhere inside the buffer.
+ */
+MALI_PER_ARCH_DECL(void, descriptor_set_pack_dyn_buf_base,
+                   (const struct mali_descriptor_set *set, uint32_t idx, void *out));
 
 /* The dummy sampler of the driver table, or on v7 of a stage's Sampler
  * table (texel fetches still name a sampler on Valhall and Bifrost). out:

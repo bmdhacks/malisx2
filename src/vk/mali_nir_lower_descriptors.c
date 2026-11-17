@@ -55,6 +55,7 @@ struct lower_desc_ctx {
    uint32_t dummy_sampler_handle;
    uint32_t dyn_bufs_start;
    struct desc_map dyn_bufs;
+   uint32_t dyn_ubo_mask;          /* dyn_bufs entries that are uniform buffers */
    uint32_t driver_table_prefix;
 };
 
@@ -464,9 +465,12 @@ create_copy_table(nir_shader *nir, struct lower_desc_ctx *ctx)
          binding_layout(ctx, id.set, id.binding);
 
       uint32_t *first = &ctx->dyn_bufs.map[ctx->dyn_bufs.count];
-      for (uint32_t i = 0; i < count; i++)
+      for (uint32_t i = 0; i < count; i++) {
+         if (bl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+            ctx->dyn_ubo_mask |= BITFIELD_BIT(ctx->dyn_bufs.count);
          ctx->dyn_bufs.map[ctx->dyn_bufs.count++] =
             MALI_COPY_DESC_HANDLE(id.set, bl->desc_idx + i);
+      }
 
       /* From here on the table maps (set, binding) to its first copy. */
       _mesa_hash_table_u64_replace(ctx->ht, &he, first);
@@ -503,6 +507,7 @@ mali_nir_lower_descriptors(nir_shader *nir,
 
       assert(ctx.dyn_bufs.count <= ARRAY_SIZE(desc_info->dyn_bufs.map));
       desc_info->dyn_bufs.count = ctx.dyn_bufs.count;
+      desc_info->dyn_ubo_mask = ctx.dyn_ubo_mask;
       memcpy(desc_info->dyn_bufs.map, ctx.dyn_bufs.map,
              ctx.dyn_bufs.count * sizeof(*desc_info->dyn_bufs.map));
       desc_info->used_set_mask = ctx.used_set_mask;

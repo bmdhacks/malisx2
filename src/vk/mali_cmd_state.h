@@ -584,10 +584,12 @@ mali_gfx_pack_dyn_bufs(const struct mali_shader_desc_info *di, const struct mali
       uint32_t idx = MALI_COPY_DESC_HANDLE_INDEX(h);
       const struct mali_descriptor_set *s = desc->sets[set];
       uint8_t *o = out + i * MALI_DESCRIPTOR_SIZE;
-      if (s)
-         MALI_PER_ARCH(descriptor_set_pack_dyn_buf)(s, idx, desc->dyn_offsets[set][idx], o);
-      else
+      if (!s)
          memset(o, 0, MALI_DESCRIPTOR_SIZE);
+      else if (di->dyn_unbaked_mask & BITFIELD_BIT(i))
+         MALI_PER_ARCH(descriptor_set_pack_dyn_buf_base)(s, idx, o);
+      else
+         MALI_PER_ARCH(descriptor_set_pack_dyn_buf)(s, idx, desc->dyn_offsets[set][idx], o);
    }
 }
 
@@ -1285,6 +1287,62 @@ mali_gfx_collect_dynamic_dirty(struct mali_cmd_buffer *cmd)
  * register spills on every draw.
  */
 
+
+#if PAN_ARCH >= 9
+/* Whether an entry of mask (bits over s's dyn_bufs) names a dynamic buffer
+ * whose bit is set in changed (per set, bit = dynamic buffer index). */
+static inline bool
+mali_gfx_dynoff_hit(const struct mali_shader *s, const uint32_t *changed, uint32_t mask)
+{
+   u_foreach_bit(i, mask) {
+      const uint32_t h = s->desc.dyn_bufs.map[i];
+      if (changed[MALI_COPY_DESC_HANDLE_SET(h)] & BITFIELD_BIT(MALI_COPY_DESC_HANDLE_INDEX(h)))
+         return true;
+   }
+   return false;
+}
+
+/* Dynamic offsets changed in a rebind of the bound set (gfx_note_bind,
+ * mali_cmd_state.c): a stage's table again when the slot holds the
+ * offset, its FAU block again when the shader reads the offset or pushed
+ * words from FAU. The bits are cleared when the table or block is built. */
+static inline void
+mali_gfx_dynoff_dirty(struct mali_gfx_draw_state *d, const struct mali_graphics_pipeline *p)
+{
+   const struct mali_shader *st[2] = {p->vs, p->fs};
+   static const uint32_t srt_bit[2] = {MALI_GFX_DYNOFF_VS_SRT, MALI_GFX_DYNOFF_FS_SRT};
+   static const uint32_t fau_bit[2] = {MALI_GFX_DYNOFF_VS_FAU, MALI_GFX_DYNOFF_FS_FAU};
+   static const uint32_t srt_dirty[2] = {MALI_GFX_DIRTY_VS_SRT, MALI_GFX_DIRTY_FS_SRT};
+   static const uint32_t fau_dirty[2] = {MALI_GFX_DIRTY_VS_FAU, MALI_GFX_DIRTY_FS_FAU};
+
+   for (unsigned k = 0; k < 2; k++) {
+      const struct mali_shader *s = st[k];
+      if (!s || !s->desc.dyn_bufs.count)
+         continue;
+      const uint32_t baked =
+         BITFIELD_MASK(s->desc.dyn_bufs.count) & ~s->desc.dyn_unbaked_mask;
+      if ((d->dynoff_pending & srt_bit[k]) && mali_gfx_dynoff_hit(s, d->dynoff_srt[k], baked))
+         d->dirty |= srt_dirty[k];
+      if ((d->dynoff_pending & fau_bit[k]) &&
+          mali_gfx_dynoff_hit(s, d->dynoff_fau[k], s->desc.dyn_fau_mask))
+         d->dirty |= fau_dirty[k];
+   }
+}
+
+/* A stage's table (k = 0 vertex, 1 fragment) or FAU block was built with
+ * the current offsets. */
+static inline void
+mali_gfx_dynoff_built(struct mali_gfx_draw_state *d, unsigned k, bool fau)
+{
+   const uint32_t bit = fau ? (k ? MALI_GFX_DYNOFF_FS_FAU : MALI_GFX_DYNOFF_VS_FAU)
+                            : (k ? MALI_GFX_DYNOFF_FS_SRT : MALI_GFX_DYNOFF_VS_SRT);
+   if (d->dynoff_pending & bit) {
+      memset(fau ? d->dynoff_fau[k] : d->dynoff_srt[k], 0, sizeof(d->dynoff_srt[k]));
+      d->dynoff_pending &= ~bit;
+   }
+}
+#endif
+
 /* Step 1. *dbk_out: the pipeline's words repacked from dynamic state
  * (gfx.draw.dyn_baked) when the pipeline has any, else NULL (the bind
  * block's words apply). False on allocation failure. */
@@ -1375,6 +1433,10 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
    if (d->fs_sets_dirty & bd->fs_sets)
       d->dirty |= MALI_GFX_DIRTY_FS_SRT;
+#if PAN_ARCH >= 9
+   if (unlikely(d->dynoff_pending))
+      mali_gfx_dynoff_dirty(d, p);
+#endif
 #if PAN_ARCH < 9
    /* v7: the draw marks a stage's FAU group for its uniform-buffer words
     * when the stage's tables or dynamic offsets change
@@ -1445,6 +1507,9 @@ mali_gfx_build_vs_fau(struct mali_cmd_buffer *cmd, const struct mali_graphics_sy
                                              sizeof(cmd->push_constants));
    if (vs->fau.total_count && !fau)
       return false;
+#if PAN_ARCH >= 9
+   mali_gfx_dynoff_built(&cmd->gfx.draw, 0, true);
+#endif
    *out = fau;
    return true;
 }
@@ -1458,6 +1523,9 @@ mali_gfx_build_fs_fau(struct mali_cmd_buffer *cmd, const struct mali_graphics_sy
                                                   sizeof(cmd->push_constants)) : 0;
    if (fs && fs->fau.total_count && !fau)
       return false;
+#if PAN_ARCH >= 9
+   mali_gfx_dynoff_built(&cmd->gfx.draw, 1, true);
+#endif
    *out = fau;
    return true;
 }
@@ -1475,6 +1543,7 @@ mali_gfx_build_vs_srt(struct mali_cmd_buffer *cmd, uint64_t *out)
    *out = srt;
    d->vs_srt_key = d->pipeline->bind.vs_srt_key;
    d->vs_sets_dirty = 0;
+   mali_gfx_dynoff_built(d, 0, false);
    return true;
 }
 
@@ -1489,6 +1558,7 @@ mali_gfx_build_fs_srt(struct mali_cmd_buffer *cmd, uint64_t *out)
    *out = srt;
    d->fs_srt_key = p->bind.fs_srt_key;
    d->fs_sets_dirty = 0;
+   mali_gfx_dynoff_built(d, 1, false);
    return true;
 }
 

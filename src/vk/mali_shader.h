@@ -273,6 +273,10 @@ struct mali_shader_fau {
    uint32_t ubo_push_start;
    uint32_t ubo_push_count;
    struct mali_ubo_push_word ubo_push[MALI_MAX_UBO_PUSH_FAUS];
+   /* v9 and later: the dynamic offsets of the dynamic buffer copies in
+    * desc.dyn_off_mask, as 32-bit values in that order from FAU word
+    * dyn_off_start (after the pushed uniform-buffer words). */
+   uint32_t dyn_off_start;
 };
 
 /* Writes the shader's constant FAU words at out[0 .. const_count). */
@@ -293,8 +297,10 @@ mali_shader_fau_consts(const struct mali_shader_fau *fau, uint64_t *out)
  *                          attribute descriptor per input slot (written
  *                          only if needs_varying_descs); compute: none
  *   prefix                 a dummy sampler (texel fetches name one)
- *   prefix + 1 + i         copy of dynamic buffer map[i], with the dynamic
- *                          offset applied, for i < dyn_bufs.count
+ *   prefix + 1 + i         copy of dynamic buffer map[i], for i <
+ *                          dyn_bufs.count: with the dynamic offset applied,
+ *                          or, for the uniform buffers in dyn_unbaked_mask,
+ *                          from the bound offset to the end of the buffer
  *
  * map[i] is MALI_COPY_DESC_HANDLE(set, dynamic buffer index in the set):
  * the index in the low 28 bits, the set above them.
@@ -314,6 +320,22 @@ struct mali_shader_desc_info {
       uint32_t map[MALI_MAX_DYNAMIC_BUFFERS];
       uint32_t count;
    } dyn_bufs;
+   /* Bits over the dyn_bufs entries (v9 and later; zero on v7):
+    *  - dyn_ubo_mask: the entry is a dynamic uniform buffer;
+    *  - dyn_unbaked_mask: the entry's table slot is packed without the
+    *    dynamic offset (mali_descriptor_set_pack_dyn_buf_base), so a
+    *    rebind that only changes that offset leaves the table as it is.
+    *    Every load through it adds the offset from FAU (dyn_off_mask) or
+    *    was replaced by pushed FAU words; set only for uniform buffers;
+    *  - dyn_off_mask: the shader reads the entry's dynamic offset from FAU
+    *    (fau.dyn_off_start);
+    *  - dyn_fau_mask: the FAU block depends on the entry's dynamic offset
+    *    (dyn_off_mask and the entries of pushed words), so a change of
+    *    that offset rebuilds the block. */
+   uint32_t dyn_ubo_mask;
+   uint32_t dyn_unbaked_mask;
+   uint32_t dyn_off_mask;
+   uint32_t dyn_fau_mask;
    /* Fragment shaders: the shader loads some varyings with LD_VAR, which
     * reads the attribute descriptors at the start of table 0. */
    bool needs_varying_descs;

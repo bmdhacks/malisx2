@@ -334,9 +334,11 @@ write_dynamic_buffer(struct mali_descriptor_set *set, const VkDescriptorBufferIn
    if (buffer) {
       set->dyn_bufs[idx].addr = mali_buffer_gpu_va(buffer, info->offset);
       set->dyn_bufs[idx].range = vk_buffer_range(&buffer->vk, info->offset, info->range);
+      set->dyn_bufs[idx].room = vk_buffer_range(&buffer->vk, info->offset, VK_WHOLE_SIZE);
    } else {
       set->dyn_bufs[idx].addr = MALI_NULL_BUFFER_ADDR;
       set->dyn_bufs[idx].range = 0;
+      set->dyn_bufs[idx].room = 0;
    }
 }
 
@@ -978,6 +980,15 @@ MALI_PER_ARCH(descriptor_set_pack_dyn_buf)(const struct mali_descriptor_set *set
    assert(idx < set->layout->dyn_buf_count);
    pack_buffer(set->dyn_bufs[idx].addr + dynamic_offset, set->dyn_bufs[idx].range,
                set->layout->dyn_ssbos & BITFIELD_BIT(idx), out);
+}
+
+void
+MALI_PER_ARCH(descriptor_set_pack_dyn_buf_base)(const struct mali_descriptor_set *set, uint32_t idx,
+                                                void *out)
+{
+   assert(idx < set->layout->dyn_buf_count);
+   assert(!(set->layout->dyn_ssbos & BITFIELD_BIT(idx)));
+   pack_buffer(set->dyn_bufs[idx].addr, set->dyn_bufs[idx].room, false, out);
 }
 #endif
 

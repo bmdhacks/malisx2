@@ -1117,6 +1117,14 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       _mesa_blake3_update(&h, tes->stage_hash, sizeof(tes->stage_hash));
       hash_layout(&h, layout);
       _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+      /* The control shader runs the vertex shader for its patch's inputs
+       * when the patch size is known here (mali_shader.c fuse_vs_tcs), so
+       * the size is part of the shaders; 0 when it is dynamic, as there. */
+      const uint32_t patch_size =
+         state.ts && !BITSET_TEST(state.dynamic, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS)
+            ? state.ts->patch_control_points
+            : 0;
+      _mesa_blake3_update(&h, &patch_size, sizeof(patch_size));
       _mesa_blake3_final(&h, tes->key);
       struct mali_shader **const ts_slots[] = {&tess_shaders->sw_vs, &tess_shaders->tcs,
                                                &tess_shaders->tes};

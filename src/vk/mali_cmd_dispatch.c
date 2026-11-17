@@ -258,6 +258,7 @@ MALI_PER_ARCH(cmd_vt_dispatch)(struct mali_cmd_buffer *cmd, const struct mali_sh
       mali_measure_shader(cmd, mh, key);
    }
    mali_cmd_vt_compute_res(cmd);
+   cmd->gfx.render.vt_jobs = true;
 #if PAN_ARCH == 10
    mali_cmd_next_iter_sb(cmd, MALI_SUBQUEUE_VERTEX_TILER);
    cs_run_compute(b, inc, axis, cs_shader_res_sel(0, 0, 0, 0));

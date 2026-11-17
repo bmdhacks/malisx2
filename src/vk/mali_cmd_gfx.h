@@ -233,6 +233,11 @@ struct mali_render_state {
     * prebuilt stores the stream builder does not track (emit_ubo_push);
     * flush_tiling waits for them. */
    bool ubo_stores;
+   /* A compute job ran on the vertex/tiler stream in this pass
+    * (cmd_vt_dispatch). It takes an iterator entry of its own, and the
+    * draws after it signal that one, so the draws before it signal another
+    * entry than the one the end of the pass waits for (flush_tiling). */
+   bool vt_jobs;
    struct mali_render_desc desc;
 
    /* Tile-buffer layout (pan_select_fb_tile_size). */

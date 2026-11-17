@@ -423,6 +423,12 @@ flush_tiling(struct mali_cmd_buffer *cmd)
       cs_wait_slot(b, MALI_SB_LS);
       cmd->gfx.render.ubo_stores = false;
    }
+   /* After a compute job in the pass, the pass's draws signal more than one
+    * iterator entry; the deferred waits below cover the current one only. */
+   if (cmd->gfx.render.vt_jobs) {
+      cs_wait_slots(b, cmd->dev->csf->sb.all_iters_mask);
+      cmd->gfx.render.vt_jobs = false;
+   }
    cs_finish_tiling(b);
 #if PAN_ARCH >= 11
    if (cmd->dev->csf->shared_sb) {

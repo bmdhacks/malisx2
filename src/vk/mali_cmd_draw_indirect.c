@@ -385,11 +385,12 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
 }
 
 /* One indexed draw whose VkDrawIndexedIndirectCommand the GPU writes
- * (tessellation, mali_cmd_draw.c), without the viewport passes. */
+ * (tessellation, mali_cmd_draw.c), once per viewport when the evaluation
+ * shader writes gl_ViewportIndex. */
 void
 MALI_PER_ARCH(cmd_draw_indexed_indirect_one)(struct mali_cmd_buffer *cmd, uint64_t params)
 {
-   draw_indirect_pass(cmd, true, params, sizeof(VkDrawIndexedIndirectCommand), 0, 1);
+   draw_indirect(cmd, true, params, sizeof(VkDrawIndexedIndirectCommand), 0, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL

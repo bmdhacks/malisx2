@@ -464,8 +464,9 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 }
 
 /* How many times a draw runs: once per viewport for a pipeline whose
- * vertex shader writes gl_ViewportIndex (mali_shader.c, "Viewport
- * index"), else once. */
+ * vertex shader, or geometry or tessellation evaluation shader, writes
+ * gl_ViewportIndex (mali_shader.c, "Viewport index", lower_viewport_index_io),
+ * else once. */
 static inline uint32_t
 viewport_passes(const struct mali_cmd_buffer *cmd)
 {

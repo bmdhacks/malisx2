@@ -2987,6 +2987,94 @@ as_compute(struct mali_device *dev, nir_shader *nir)
    nir->xfb_info = NULL;
 }
 
+/*
+ * lower_viewport_index_vs for a shader whose outputs are already
+ * store_output intrinsics: the rasterization shader of a geometry shader
+ * and the tessellation evaluation shader, which run as the draw's vertex
+ * shader (gs_variant). Their stores of the position and the viewport index
+ * may be anywhere, in branches, so both go to variables, and one store of
+ * the position at the end moves the vertex off the screen on the passes
+ * for other viewports. True if the shader writes the viewport index.
+ */
+struct viewport_io_scan {
+   bool writes_viewport, whole_position;
+};
+
+static bool
+scan_viewport_io(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct viewport_io_scan *s = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+   if (loc == VARYING_SLOT_VIEWPORT)
+      s->writes_viewport = true;
+   else if (loc == VARYING_SLOT_POS &&
+            (nir_intrinsic_write_mask(intr) != 0xf || nir_intrinsic_component(intr) ||
+             intr->src[0].ssa->num_components != 4))
+      s->whole_position = false;
+   return false;
+}
+
+static bool
+lower_viewport_index_io(nir_shader *nir)
+{
+   /* The position is written whole, as a vec4, by libpoly's rasterization
+    * shader and the evaluation shader's lowered gl_Position; anything else
+    * is left as it is. */
+   struct viewport_io_scan scan = {.whole_position = true};
+   nir_shader_intrinsics_pass(nir, scan_viewport_io, nir_metadata_all, &scan);
+   if (!scan.writes_viewport || !scan.whole_position)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *vp = nir_local_variable_create(impl, glsl_uint_type(), "viewport_index");
+   nir_variable *pos = nir_local_variable_create(impl, glsl_vec4_type(), "position");
+   nir_intrinsic_instr *pos_tmpl = NULL;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_store_var(&b, vp, nir_imm_int(&b, 0), 0x1);
+   nir_store_var(&b, pos, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), 0xf);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+         if (loc != VARYING_SLOT_VIEWPORT && loc != VARYING_SLOT_POS)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *value = intr->src[0].ssa;
+         if (loc == VARYING_SLOT_VIEWPORT) {
+            nir_store_var(&b, vp, nir_u2u32(&b, nir_channel(&b, value, 0)), 0x1);
+         } else {
+            nir_store_var(&b, pos, value, 0xf);
+            if (!pos_tmpl)
+               pos_tmpl = nir_instr_as_intrinsic(nir_instr_clone(nir, instr));
+         }
+         nir_instr_remove(instr);
+      }
+   }
+
+   b.cursor = nir_after_impl(impl);
+   if (pos_tmpl) {
+      nir_def *index = nir_load_var(&b, vp);
+      nir_def *pass = load_sysval(&b, graphics, 32, vs.viewport_pass);
+      nir_def *away = nir_imm_vec4(&b, -4.0f, -4.0f, 0.0f, 1.0f);
+      nir_def *p = nir_bcsel(&b, nir_ieq(&b, index, pass), nir_load_var(&b, pos), away);
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_builder_instr_insert(&b, &pos_tmpl->instr);
+      nir_src_rewrite(&pos_tmpl->src[0], p);
+      nir_src_rewrite(&pos_tmpl->src[1], zero);
+   }
+   nir->info.outputs_written &= ~VARYING_BIT_VIEWPORT;
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   return true;
+}
+
 /* The rasterization shader's outputs numbered by slot, as
  * nir_assign_io_var_locations numbers a vertex shader's: libpoly's stores
  * keep the geometry shader's bases, which need not be distinct per slot. */
@@ -3082,6 +3170,9 @@ gs_variant(struct mali_device *dev, const struct mali_shader_compile_info *info,
    if (stage == MESA_SHADER_VERTEX) {
       s->vs.clip_distances = nir->info.clip_distance_array_size;
       lower_cull_distance_vs(nir);
+      /* A geometry or evaluation shader that writes gl_ViewportIndex: one
+       * pass per viewport, as for a vertex shader (viewport_passes). */
+      s->vs.viewport_index = lower_viewport_index_io(nir);
       gather_vs_info(nir);
       uint64_t written = nir->info.outputs_written;
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, renumber_output, nir_metadata_all, &written);

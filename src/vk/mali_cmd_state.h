@@ -1344,6 +1344,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
                          : p->tess->points     ? MESA_PRIM_POINTS
                          : p->tess->mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
                                                                    : MESA_PRIM_TRIANGLES,
+            .tess_ccw = p->tess && p->tess->ccw,
 #endif
          };
          d->dyn_baked.uses_dynamic_state = true;

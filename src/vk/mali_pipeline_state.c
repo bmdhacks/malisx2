@@ -919,6 +919,17 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 
          cfg.aligned_line_ends = rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
          cfg.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+#if MALI_WITH_POLY && PAN_ARCH >= 10
+         /* libpoly's tessellator emits its triangles in one winding whatever
+          * the evaluation shader's vertex order (it does not read
+          * poly_tess_params.ccw), so the front face follows the vertex order
+          * and the domain origin here instead, as on Asahi
+          * (hk_cmd_draw.c): each turns the triangles over. Tessellation
+          * never comes with a geometry shader here (mali_pipeline.c). */
+         if (in->has_tess)
+            cfg.front_face_ccw ^=
+               in->tess_ccw ^ (in->dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT);
+#endif
          /* Face culling is for polygons only. */
          const bool polygon = reduced == MESA_PRIM_TRIANGLES;
          cfg.cull_front_face = polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT);

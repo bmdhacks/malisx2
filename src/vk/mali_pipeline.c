@@ -1270,6 +1270,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       .gs_prim = p->gs ? p->gs->info.mode : 0,
       .has_tess = p->tess != NULL,
       .tess_prim = p->tess ? tess_prim(p->tess) : 0,
+      .tess_ccw = p->tess && p->tess->ccw,
 #endif
    };
    MALI_PER_ARCH(gfx_pack_state)(&pack, &p->baked);

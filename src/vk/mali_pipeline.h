@@ -260,6 +260,9 @@ struct mali_gfx_pack_input {
    uint8_t gs_prim;
    bool has_tess;
    uint8_t tess_prim;
+   /* The evaluation shader's vertex order is counter-clockwise (with the
+    * domain origin, it decides the tessellated triangles' front face). */
+   bool tess_ccw;
 };
 
 MALI_PER_ARCH_DECL(void, gfx_pack_state,

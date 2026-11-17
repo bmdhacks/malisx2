@@ -1457,8 +1457,13 @@ io_type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* mediump_io: narrow relaxed-precision vertex outputs and fragment inputs
+ * to 16 bits (pan_nir_lower_mediump_io), which the varyings of a vertex
+ * shader feeding the fragment shader take. Not for a vertex shader whose
+ * outputs a geometry or tessellation stage reads back from memory as 32-bit
+ * values. */
 static void
-lower_nir_io(nir_shader *nir)
+lower_nir_io(nir_shader *nir, bool mediump_io)
 {
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
@@ -1469,7 +1474,8 @@ lower_nir_io(nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_constant_folding);
    /* Vertex and fragment I/O only; a geometry shader's goes to memory
     * (mali_shader.c, "Geometry shaders"). */
-   if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_FRAGMENT)
+   if (mediump_io &&
+       (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_FRAGMENT))
       pan_nir_lower_mediump_io(nir);
 }
 
@@ -2732,7 +2738,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
       }
       nir_assign_io_var_locations(nir, nir_var_shader_out);
-      lower_nir_io(nir);
+      lower_nir_io(nir, true);
 #if PAN_ARCH == 7
       /* Stores of vertices the indices do not name: v7 runs a vertex
        * shader over the whole index range (no IDVS). */
@@ -2779,7 +2785,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          goto fail;
 
       nir_assign_io_var_locations(nir, nir_var_shader_out);
-      lower_nir_io(nir);
+      lower_nir_io(nir, true);
       if (!MALI_PER_ARCH(shader_fs_keeps_dual_source)(dev, state) &&
           nir_shader_intrinsics_pass(nir, drop_dual_source_output,
                                      nir_metadata_control_flow, NULL)) {
@@ -3528,7 +3534,7 @@ MALI_PER_ARCH(shader_compile_gs)(struct mali_device *dev,
    nir_foreach_shader_in_variable(var, vs)
       var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
    nir_assign_io_var_locations(vs, nir_var_shader_out);
-   lower_nir_io(vs);
+   lower_nir_io(vs, false);
    NIR_PASS(_, vs, nir_opt_constant_folding);
    nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
    out->vs_outputs = vs->info.outputs_written;
@@ -3551,7 +3557,7 @@ MALI_PER_ARCH(shader_compile_gs)(struct mali_device *dev,
    gs_desc = tmp.desc;
    nir_assign_io_var_locations(gs, nir_var_shader_in);
    nir_assign_io_var_locations(gs, nir_var_shader_out);
-   lower_nir_io(gs);
+   lower_nir_io(gs, false);
    NIR_PASS(_, gs, nir_opt_constant_folding);
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
 
@@ -3638,7 +3644,7 @@ sw_vs_lower(struct mali_device *dev, const struct mali_shader_compile_info *info
    nir_foreach_shader_in_variable(var, vs)
       var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
    nir_assign_io_var_locations(vs, nir_var_shader_out);
-   lower_nir_io(vs);
+   lower_nir_io(vs, false);
    NIR_PASS(_, vs, nir_opt_constant_folding);
    nir_shader_gather_info(vs, nir_shader_get_entrypoint(vs));
    *outputs = vs->info.outputs_written;
@@ -3668,7 +3674,7 @@ tess_stage_lower(struct mali_device *dev, const struct mali_shader_compile_info 
    *desc = tmp.desc;
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
-   lower_nir_io(nir);
+   lower_nir_io(nir, false);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    return VK_SUCCESS;

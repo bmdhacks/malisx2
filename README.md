@@ -47,6 +47,15 @@ Needs meson >= 1.7, ninja, a C/C++ compiler, rustc >= 1.85, bindgen >= 0.71.1
 (not 0.72.0, 0.73.0 or 0.73.1) and Python 3 with mako and PyYAML.
 `meson setup` downloads eight small Rust crates (`subprojects/`).
 
+Geometry and tessellation shaders (v10 and later) also need two of Mesa's
+host tools at build time, `mesa_clc` and `vtn_bindgen2`, built from the
+Mesa commit `meson.build` pins (Mesa's `-Dmesa-clc=enabled
+-Dinstall-mesa-clc=true`, which needs LLVM 15 or later with clang, its
+SPIRV-LLVM-Translator and SPIRV-Tools 2024.1 or later) and found on
+`PATH`. Without them the driver is built without those two stages;
+`-Dpoly=enabled` makes their absence an error. Release packs are built
+with `-Dpoly=enabled`.
+
 Android (arm64, API level 29) is a cross build with the NDK r28c at
 `~/Android/Sdk/ndk/28.2.13676358` (see `cross/android-aarch64.ini`):
 

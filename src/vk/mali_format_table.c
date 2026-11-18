@@ -42,12 +42,14 @@ compressed_format_bits(const struct mali_physical_device *pdev)
 }
 
 /*
- * The BCn formats. v7 and v9 sample the ones the GPU's TEXTURE_FEATURES_0
- * has (format_image_features); the G52 and the G57 have all of BC1-7. v11
- * answers no for them, as Arm's blob does: the G615 has none of their bits
- * (0xc7fe001e), and a GPU of that generation that did has not been tried.
- * The v9 plane descriptor needs a BCn clump format (mali_image_view.c);
- * without one the data is read as raw 64- or 128-bit texels.
+ * The BCn formats. v7, v9 and v10 sample the ones the GPU's
+ * TEXTURE_FEATURES_0 has (format_image_features); the G52, the G57 and
+ * the RK3588's G610 (0xc1ffff9e) have all of BC1-7. BC is a per-SoC
+ * option: the G615 has none of their bits (0xc7fe001e), and v11 answers no
+ * for them, as Arm's blob does, a GPU of that generation that had them
+ * not having been tried. The v9+ plane descriptor needs a BCn clump format
+ * (mali_image_view.c); without one the data is read as raw 64- or 128-bit
+ * texels.
  */
 static bool
 is_bc_format(VkFormat format)
@@ -102,11 +104,13 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
     * of BC1-7 that is textureCompressionBC (mali_physical_device.c
     * bc_formats_complete): hakuX asks per format (BC1-3), Dolphin for the
     * feature, and then they upload their BC textures as they are, a
-    * quarter to an eighth of the BGRA8 they decode them to otherwise. Not
-    * on v10 or v11: no BCn texture has been sampled on either through this
-    * driver yet.
+    * quarter to an eighth of the BGRA8 they decode them to otherwise.
+    * v10 the same way (the G610, 0xc1ffff9e): its Generic Plane takes the
+    * same BCn clump formats as v9's, plus the level's size, as the ETC2
+    * formats already sampled there. Not on v11: no BCn texture has been
+    * sampled on one through this driver yet.
     */
-   if (is_bc_format(format) && PAN_ARCH != 7 && PAN_ARCH != 9)
+   if (is_bc_format(format) && PAN_ARCH != 7 && PAN_ARCH != 9 && PAN_ARCH != 10)
       return 0;
 
    enum pipe_format planes[MALI_IMAGE_MAX_PLANES];

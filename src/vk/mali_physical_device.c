@@ -841,8 +841,8 @@ formats_complete(const struct mali_physical_device *pdev, VkFormat first, VkForm
    return true;
 }
 
-/* textureCompressionBC: v7 and v9 have every BCn format when the GPU has
- * all of BC1-7 (mali_format_table.c); v10 and v11 answer no for every BCn
+/* textureCompressionBC: v7, v9 and v10 have every BCn format when the GPU
+ * has all of BC1-7 (mali_format_table.c); v11 answers no for every BCn
  * format. */
 static bool
 bc_formats_complete(const struct mali_physical_device *pdev)

@@ -87,6 +87,12 @@ struct mali_desc_state {
    struct mali_descriptor_set *sets[MALI_MAX_SETS];
    uint32_t dyn_offsets[MALI_MAX_SETS][MALI_MAX_DYNAMIC_BUFFERS];
    struct mali_descriptor_set push[MALI_MAX_SETS];
+   /* A regular vkCmdBindDescriptorSets snapshots its set here (a copy of
+    * the slots in command memory plus the dynamic-buffer addresses), so a
+    * draw recorded against it keeps reading that memory even if the pool
+    * set is updated or reused while it is still executing — the same
+    * guarantee a push descriptor's fresh block gives. sets[] points here. */
+   struct mali_descriptor_set bound[MALI_MAX_SETS];
 };
 
 /*

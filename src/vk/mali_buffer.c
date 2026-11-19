@@ -113,3 +113,18 @@ mali_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
    }
    return VK_SUCCESS;
 }
+
+/* No capture and replay (bufferDeviceAddressCaptureReplay is off): there
+ * is no address to replay, so the opaque capture addresses are 0. */
+VKAPI_ATTR uint64_t VKAPI_CALL
+mali_GetBufferOpaqueCaptureAddress(VkDevice _device, const VkBufferDeviceAddressInfo *pInfo)
+{
+   return 0;
+}
+
+VKAPI_ATTR uint64_t VKAPI_CALL
+mali_GetDeviceMemoryOpaqueCaptureAddress(VkDevice _device,
+                                         const VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
+{
+   return 0;
+}

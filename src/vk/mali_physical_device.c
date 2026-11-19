@@ -888,7 +888,8 @@ device_extensions_for_arch(uint32_t arch)
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
    ext.EXT_custom_border_color = sampler_features_for_arch(arch);
    ext.EXT_non_seamless_cube_map = sampler_features_for_arch(arch);
-   ext.KHR_sampler_mirror_clamp_to_edge = sampler_features_for_arch(arch);
+   ext.KHR_sampler_mirror_clamp_to_edge =
+      sampler_features_for_arch(arch) || csf_ext_for_arch(arch);
    /* v7: DrawIndex is a system value the draw sets (draw_id); 8-bit indices
     * and list restart are the index scan's and the tiler's. */
    ext.KHR_shader_draw_parameters = arch == 7;
@@ -1043,6 +1044,9 @@ get_descriptor_indexing_features(struct vk_features *f, uint32_t arch)
    f->descriptorBindingPartiallyBound = true;
    f->descriptorBindingVariableDescriptorCount = true;
    f->runtimeDescriptorArray = true;
+   /* Vulkan 1.2's name for having every feature above that it requires of
+    * VK_EXT_descriptor_indexing. */
+   f->descriptorIndexing = true;
 }
 
 /*
@@ -1236,6 +1240,21 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* VK_EXT_texel_buffer_alignment (the extension table). */
       .texelBufferAlignment = true,
+
+      /*
+       * Vulkan 1.2 features that hold on every arch. Framebuffers and render
+       * pass objects are the runtime's, which take imageless framebuffers
+       * (the views come at vkCmdBeginRenderPass2). Image layouts are not
+       * tracked beyond UNDEFINED and PREINITIALIZED, so depth and stencil
+       * may each have their own. The subgroup operations reported are the
+       * basic ones (elect and barriers), which take no operand of an
+       * extended type and have no broadcast, so the last two hold for
+       * every subgroup operation a shader can use.
+       */
+      .imagelessFramebuffer = true,
+      .separateDepthStencilLayouts = true,
+      .shaderSubgroupExtendedTypes = true,
+      .subgroupBroadcastDynamicId = true,
    };
 
    get_descriptor_indexing_features(f, arch);
@@ -1260,6 +1279,16 @@ get_features(struct vk_features *f, uint32_t arch)
       f->customBorderColorWithoutFormat = true;
       f->nonSeamlessCubeMap = true;
       f->samplerMirrorClampToEdge = true;
+   }
+   if (csf_ext_for_arch(arch)) {
+      /* The Sampler's Mirrored Clamp to Edge wrap mode (mali_sampler.c
+       * wrap_mode), the same value on v10, v11 and v12 as on v7. */
+      f->samplerMirrorClampToEdge = true;
+      /* gl_ViewportIndex and gl_Layer from the vertex shader, which
+       * VK_EXT_shader_viewport_index_layer already offers there; Vulkan 1.2
+       * requires both features of a device that lists it. */
+      f->shaderOutputViewportIndex = true;
+      f->shaderOutputLayer = true;
    }
    if (arch == 7) {
       f->shaderDrawParameters = true;
@@ -1639,6 +1668,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .storageTexelBufferOffsetSingleTexelAlignment = false,
       .uniformTexelBufferOffsetAlignmentBytes = 64,
       .uniformTexelBufferOffsetSingleTexelAlignment = false,
+
+      /* Vulkan 1.2: integer colour attachments take the one sample count
+       * there is (MALI_SUPPORTED_SAMPLE_COUNTS). */
+      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
 
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,

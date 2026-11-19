@@ -798,6 +798,24 @@ sampler_features_for_arch(uint32_t arch)
    return arch == 7;
 }
 
+/*
+ * Inline uniform blocks (VK_EXT_inline_uniform_block), on v9 and later. A
+ * block takes a header slot, a Buffer descriptor that points at the bytes,
+ * and the bytes in the slots after it (mali_descriptor_set_layout.h
+ * mali_iub_desc_count); writes, copies and templates copy bytes at the
+ * byte offset dstArrayElement (mali_descriptor_set.c). The shader reads the
+ * block as a uniform buffer through the header, which the set's resource
+ * table entry gives it in place (mali_nir_lower_descriptors.c), so update
+ * after bind holds as for the other descriptors. v7 has the same set code,
+ * but there a block also takes an entry of the stage's uniform buffer
+ * table, whose 223 entries the uniform buffer limits already claim in full.
+ */
+static bool
+iub_for_arch(uint32_t arch)
+{
+   return arch == 9 || arch == 10 || arch == 11 || arch == 12;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -835,6 +853,7 @@ device_extensions_for_arch(uint32_t arch)
     * (mali_pipeline_state.c), gl_ViewportIndex a pass per viewport
     * (multiViewport). */
    ext.EXT_shader_viewport_index_layer = csf_ext_for_arch(arch);
+   ext.EXT_inline_uniform_block = iub_for_arch(arch);
    return ext;
 }
 
@@ -1155,6 +1174,10 @@ get_features(struct vk_features *f, uint32_t arch)
    };
 
    get_descriptor_indexing_features(f, arch);
+   if (iub_for_arch(arch)) {
+      f->inlineUniformBlock = true;
+      f->descriptorBindingInlineUniformBlockUpdateAfterBind = true;
+   }
    if (sampler_features_for_arch(arch)) {
       f->customBorderColors = true;
       f->customBorderColorWithoutFormat = true;
@@ -1572,6 +1595,18 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    /* VK_EXT_custom_border_color (sampler_features_for_arch). */
    if (sampler_features_for_arch(pdev->arch))
       props->maxCustomBorderColorSamplers = 4000;
+
+   /* VK_EXT_inline_uniform_block (iub_for_arch): modest limits, above
+    * Vulkan 1.3's minimums of 256 bytes and 4 blocks. A 4096-byte block
+    * takes 129 descriptor slots. */
+   if (iub_for_arch(pdev->arch)) {
+      props->maxInlineUniformBlockSize = 4096;
+      props->maxPerStageDescriptorInlineUniformBlocks = 16;
+      props->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 16;
+      props->maxDescriptorSetInlineUniformBlocks = 16;
+      props->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 16;
+      props->maxInlineUniformTotalSize = 16 * 4096;
+   }
 
    /*
     * VK_EXT_descriptor_indexing's properties on v9 and v11 (v7 has its own

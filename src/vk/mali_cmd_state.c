@@ -524,7 +524,7 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
 {
    struct mali_descriptor_set *set = &st->push[idx];
    struct mali_push_shadow *sh = &cmd->push_shadow.s[shadow_bp][idx];
-   const bool carry = st->sets[idx] == set && set->layout == layout;
+   bool carry = st->sets[idx] == set && set->layout == layout;
    const uint32_t size = layout->desc_count * MALI_DESCRIPTOR_SIZE;
 
    out->set = set;
@@ -532,8 +532,14 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
    out->size = size;
    if (size) {
       if (size > sh->size) {
-         /* Only a new layout grows it, and a new layout carries nothing. */
-         assert(!carry);
+         /* Only a new layout grows it, and a new layout carries nothing.
+          * The kept layout pointer can still match: the pipeline layout
+          * that held it may be destroyed while the command buffer records
+          * (VK_KHR_maintenance4), and a new layout can then be created at
+          * the same address. Whatever is carried then is what a new layout
+          * leaves undefined anyway, but a larger one must start from
+          * zeroed slots, not from a fresh allocation's contents. */
+         carry = false;
          vk_free(&cmd->vk.pool->alloc, sh->data);
          sh->size = 0;
          sh->data = vk_alloc(&cmd->vk.pool->alloc, size, 16,

@@ -1174,6 +1174,71 @@ set_target(struct mali_fb_target *t, const struct mali_image_view *view, unsigne
    t->store = att_store(att);
 }
 
+/*
+ * A render pass instance split by suspending and resuming is one instance to
+ * the application: its load ops apply where it begins and its store ops
+ * where it ends. Here each part is a pass of its own, so a part that is
+ * suspended stores every target and a part that resumes loads every target
+ * (and clears none). Every part has the same attachments and ops (a
+ * specification rule), so a suspended part knows the last part's store op:
+ * with STORE_OP_NONE the image must keep what it held where nothing was
+ * drawn, so a target that would start undefined is loaded first and its
+ * store writes back what it read.
+ */
+static void
+split_target(struct mali_fb_target *t, const VkRenderingAttachmentInfo *att,
+             VkRenderingFlags flags)
+{
+   if (!t->image)
+      return;
+   if (flags & VK_RENDERING_RESUMING_BIT)
+      t->load = MALI_ATT_LOAD_LOAD;
+   if (flags & VK_RENDERING_SUSPENDING_BIT) {
+      if (att->storeOp == VK_ATTACHMENT_STORE_OP_NONE && t->load == MALI_ATT_LOAD_DONT_CARE)
+         t->load = MALI_ATT_LOAD_LOAD;
+      t->store = true;
+   }
+}
+
+/*
+ * The targets of one part of a split instance, and before a resumed part a
+ * barrier: its loads read what the part before it stored, through the
+ * texture caches, with nothing the application records in between to order
+ * them.
+ */
+static void
+split_pass(VkCommandBuffer commandBuffer, struct mali_render_desc *d,
+           const VkRenderingInfo *info)
+{
+   for (uint32_t i = 0; i < info->colorAttachmentCount; i++)
+      split_target(&d->rt[i], &info->pColorAttachments[i], info->flags);
+   if (info->pDepthAttachment)
+      split_target(&d->z, info->pDepthAttachment, info->flags);
+   if (info->pStencilAttachment)
+      split_target(&d->s, info->pStencilAttachment, info->flags);
+
+   if (!(info->flags & VK_RENDERING_RESUMING_BIT))
+      return;
+   const VkPipelineStageFlags2 stages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+   const VkMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = stages,
+      .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+      .dstStageMask = stages,
+      .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+   };
+   const VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &barrier,
+   };
+   MALI_PER_ARCH(CmdPipelineBarrier2)(commandBuffer, &dep);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer, const VkRenderingInfo *info)
 {
@@ -1186,8 +1251,6 @@ MALI_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer, const VkRenderin
    uint32_t w = UINT32_MAX, h = UINT32_MAX;
    bool bound = false;
 
-   if (info->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT))
-      vk_logw(VK_LOG_OBJS(cmd), "malisx2: suspended/resumed rendering is not supported");
    if (info->viewMask)
       vk_logw(VK_LOG_OBJS(cmd), "malisx2: multiview rendering is not supported");
 
@@ -1247,6 +1310,8 @@ MALI_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer, const VkRenderin
    d.height = MAX2(d.height, 1);
    d.layer_count = MAX2(d.layer_count, 1);
 
+   if (info->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT))
+      split_pass(commandBuffer, &d, info);
    MALI_PER_ARCH(cmd_render_begin)(cmd, &d);
 }
 

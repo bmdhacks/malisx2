@@ -97,6 +97,12 @@ driver_info_for_arch(uint32_t arch)
 }
 
 static inline uint32_t
+api_version_for_arch(uint32_t arch)
+{
+   return mali_arch_is_csf(arch) ? MALI_API_VERSION_CSF : MALI_API_VERSION_JM;
+}
+
+static inline uint32_t
 driver_version_for_arch(uint32_t arch)
 {
    return arch == 7    ? MALI_V7_DRIVER_VERSION
@@ -545,9 +551,8 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_depth_stencil_resolve = true,
    .KHR_create_renderpass2 = true,
 
-   /* What Vulkan 1.3 made core, on every arch. The device stays 1.1: 1.2
-    * and 1.3 also require buffer device address, maintenance4, inline
-    * uniform blocks and subgroup size control, which no arch has.
+   /* What Vulkan 1.3 made core, on every arch (api_version_for_arch says
+    * which arches report 1.3):
     *
     *  - synchronization2: the driver's barrier, submit and timestamp
     *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
@@ -1516,7 +1521,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const char *const driver_info = driver_info_for_arch(p->arch_major);
 
    *props = (struct vk_properties) {
-      .apiVersion = MALI_API_VERSION,
+      .apiVersion = api_version_for_arch(p->arch_major),
       .driverVersion = driver_version,
       .vendorID = MALI_VENDOR_ID,
       .deviceID = (uint32_t)p->gpu_id,

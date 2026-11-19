@@ -572,6 +572,11 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * lower_sysvals); and a by-region barrier inside a pass is a draw with a
     * primitive barrier (cmd_fb_barrier). */
    .KHR_dynamic_rendering_local_read = true,
+
+   /* Instance divisors of any value up to maxVertexAttribDivisor: the
+    * power-of-two and non-power-of-two attribute encodings (v7:
+    * mali_jm_cmd_draw_v7.c; v9 and later: mali_cmd_state.h). */
+   .EXT_vertex_attribute_divisor = true,
 };
 
 /*
@@ -1096,6 +1101,11 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* VK_KHR_dynamic_rendering_local_read (the table above). */
       .dynamicRenderingLocalRead = true,
+
+      /* VK_EXT_vertex_attribute_divisor. Divisor 0 reads the first element
+       * for every instance. */
+      .vertexAttributeInstanceRateDivisor = true,
+      .vertexAttributeInstanceRateZeroDivisor = true,
    };
 
    get_descriptor_indexing_features(f, arch);
@@ -1420,6 +1430,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_push_descriptor. panvk's value; ARMSX2 needs 7 (its TFX
        * texture set). */
       .maxPushDescriptors = 32,
+
+      /* VK_EXT_vertex_attribute_divisor: the 32-bit Divisor D field and the
+       * 5-bit Divisor R field cover every 32-bit divisor. */
+      .maxVertexAttribDivisor = UINT32_MAX,
       .maxPerStageDescriptorSamplers = MALI_MAX_DESCS_PER_TYPE,
       .maxPerStageDescriptorUniformBuffers = MALI_MAX_DESCS_PER_TYPE,
       .maxPerStageDescriptorStorageBuffers = MALI_MAX_DESCS_PER_TYPE,

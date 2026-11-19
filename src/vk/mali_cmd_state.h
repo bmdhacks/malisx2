@@ -75,6 +75,23 @@
 #include "mali_queue.h"
 #endif
 
+/* Mesa's pan_compute_npot_divisor: the fixed-point reciprocal of a divisor
+ * that is not a power of two. */
+static inline unsigned
+compute_npot_divisor(unsigned hw_divisor, unsigned *divisor_r, unsigned *divisor_e)
+{
+   const unsigned r = util_logbase2(hw_divisor);
+   const uint64_t shift_hi = 32 + r;
+   const uint64_t t = (uint64_t)1 << shift_hi;
+   const uint64_t f0 = t + hw_divisor / 2;
+   const uint64_t fi = f0 / hw_divisor;
+   const uint64_t ff = f0 - fi * hw_divisor;
+   const uint64_t d = fi - (1ull << 31);
+   *divisor_r = r;
+   *divisor_e = ff > hw_divisor / 2 ? 1 : 0;
+   return d;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Compute                                                                 */
 
@@ -669,10 +686,13 @@ mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *str
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
          cfg.divisor_r = __builtin_ctz(bs->divisor);
       } else {
-         /* Not reachable for ARMSX2 (no divisors); the NPOT magic numbers
-          * are not implemented. */
-         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         unsigned divisor_r = 0, divisor_e = 0;
+         const unsigned divisor_d = compute_npot_divisor(bs->divisor, &divisor_r, &divisor_e);
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+         cfg.divisor_r = divisor_r;
+         cfg.divisor_e = divisor_e;
+         cfg.divisor_d = divisor_d;
       }
    }
 }

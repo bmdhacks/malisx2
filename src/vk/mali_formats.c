@@ -79,6 +79,37 @@ linear_features(const struct mali_physical_device *pdev, VkFormat format)
    return mali_format_image_features(pdev, format);
 }
 
+/*
+ * VK_KHR_format_feature_flags2: the 32-bit features widened, plus the bits
+ * only the 64-bit flags carry.
+ *
+ * - Storage images and storage texel buffers read and written without a
+ *   format in the shader. The descriptor carries the format: the image
+ *   descriptor's, and the texel buffer's Attribute (v7) or Buffer
+ *   conversion (v9 and later), which the shader's load and store go
+ *   through whatever format the shader names. Not the 64-bit integer
+ *   formats: their storage image access is lowered to two 32-bit channels
+ *   only when the shader names the format, as panvk leaves them out.
+ * - Sampling with a depth comparison for every depth format that can be
+ *   sampled (the sampler's compare function, mali_sampler.c).
+ */
+static VkFormatFeatureFlags2
+features2(VkFormat format, VkFormatFeatureFlags f)
+{
+   VkFormatFeatureFlags2 f2 = f;
+   const enum pipe_format p = vk_format_to_pipe_format(format);
+   const bool int64 =
+      p != PIPE_FORMAT_NONE && util_format_is_int64(util_format_description(p));
+
+   if ((f & (VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT)) &&
+       !int64)
+      f2 |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+   if ((f & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) && vk_format_has_depth(format))
+      f2 |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+   return f2;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 mali_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
                                         VkFormatProperties2 *pFormatProperties)
@@ -86,17 +117,26 @@ mali_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkForma
    VK_FROM_HANDLE(mali_physical_device, pdev, physicalDevice);
 
    const VkFormatFeatureFlags linear = linear_features(pdev, format);
+   const VkFormatFeatureFlags optimal = mali_format_image_features(pdev, format);
+   const VkFormatFeatureFlags buffer = mali_format_buffer_features(pdev, format);
    pFormatProperties->formatProperties = (VkFormatProperties) {
       .linearTilingFeatures = linear,
-      .optimalTilingFeatures = mali_format_image_features(pdev, format),
-      .bufferFeatures = mali_format_buffer_features(pdev, format),
+      .optimalTilingFeatures = optimal,
+      .bufferFeatures = buffer,
    };
 
    /* DRM format modifiers: DRM_FORMAT_MOD_LINEAR alone, with the linear
     * tiling features, for every format linear images can have. The list's
-    * second form only differs in the width of the feature flags. */
+    * second form has the 64-bit flags. */
    vk_foreach_struct(stype, ext, pFormatProperties->pNext) {
       switch (stype) {
+      case VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: {
+         VkFormatProperties3 *p3 = ext;
+         p3->linearTilingFeatures = features2(format, linear);
+         p3->optimalTilingFeatures = features2(format, optimal);
+         p3->bufferFeatures = features2(format, buffer);
+         break;
+      }
       case VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT: {
          VkDrmFormatModifierPropertiesListEXT *list = ext;
          VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
@@ -123,7 +163,7 @@ mali_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkForma
                *p = (VkDrmFormatModifierProperties2EXT){
                   .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
                   .drmFormatModifierPlaneCount = 1,
-                  .drmFormatModifierTilingFeatures = linear,
+                  .drmFormatModifierTilingFeatures = features2(format, linear),
                };
             }
          }

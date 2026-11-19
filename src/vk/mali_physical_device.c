@@ -427,6 +427,10 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_external_semaphore_fd = true,
    /* ARMSX2 logs the fault records after VK_ERROR_DEVICE_LOST. */
    .EXT_device_fault = true,
+   /* VkFormatProperties3 and the DRM format modifier list's second form,
+    * on every arch: the 32-bit features widened, with the storage
+    * without-format and depth comparison bits (mali_formats.c). */
+   .KHR_format_feature_flags2 = true,
    /* ARMSX2's "Spin GPU During Readbacks" turns GPU timestamps into CPU
     * time with these; Arm's WSI layer on Linux calibrates present timing
     * with them. Both names: ARMSX2 releases before the KHR name was

@@ -816,6 +816,24 @@ iub_for_arch(uint32_t arch)
    return arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
+/*
+ * Subgroup size control (VK_EXT_subgroup_size_control), on v9 and later:
+ * warps are 16 lanes, the one subgroup size there is, so a required size
+ * can only be 16 and asks nothing of the compiler. A compute shader that
+ * uses subgroups never has its workgroups merged into one warp
+ * (valhall_can_merge_workgroups, mali_shader.c), so each workgroup starts a
+ * warp and one whose width is a multiple of 16 fills every warp it runs
+ * on (computeFullSubgroups). Required sizes are offered for compute
+ * shaders, as panvk does. v7 is left out: Mesa's Bifrost compiler takes 4
+ * lanes as the subgroup size below arch 7.2 (the G31 and G51), where the
+ * driver reports 8.
+ */
+static bool
+subgroup_size_control_for_arch(uint32_t arch)
+{
+   return arch == 9 || arch == 10 || arch == 11 || arch == 12;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -854,6 +872,7 @@ device_extensions_for_arch(uint32_t arch)
     * (multiViewport). */
    ext.EXT_shader_viewport_index_layer = csf_ext_for_arch(arch);
    ext.EXT_inline_uniform_block = iub_for_arch(arch);
+   ext.EXT_subgroup_size_control = subgroup_size_control_for_arch(arch);
    return ext;
 }
 
@@ -1177,6 +1196,10 @@ get_features(struct vk_features *f, uint32_t arch)
    if (iub_for_arch(arch)) {
       f->inlineUniformBlock = true;
       f->descriptorBindingInlineUniformBlockUpdateAfterBind = true;
+   }
+   if (subgroup_size_control_for_arch(arch)) {
+      f->subgroupSizeControl = true;
+      f->computeFullSubgroups = true;
    }
    if (sampler_features_for_arch(arch)) {
       f->customBorderColors = true;
@@ -1606,6 +1629,14 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetInlineUniformBlocks = 16;
       props->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 16;
       props->maxInlineUniformTotalSize = 16 * 4096;
+   }
+
+   /* VK_EXT_subgroup_size_control (subgroup_size_control_for_arch). */
+   if (subgroup_size_control_for_arch(pdev->arch)) {
+      props->minSubgroupSize = props->subgroupSize;
+      props->maxSubgroupSize = props->subgroupSize;
+      props->maxComputeWorkgroupSubgroups = wg / props->subgroupSize;
+      props->requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
    }
 
    /*

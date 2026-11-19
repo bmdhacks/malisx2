@@ -575,7 +575,11 @@ static const struct vk_device_extension_table mali_device_extensions = {
 
    /* Instance divisors of any value up to maxVertexAttribDivisor: the
     * power-of-two and non-power-of-two attribute encodings (v7:
-    * mali_jm_cmd_draw_v7.c; v9 and later: mali_cmd_state.h). */
+    * mali_jm_cmd_draw_v7.c; v9 and later: mali_cmd_state.h). One gap on
+    * v7: an indirect draw with a divisor that is not a power of two is
+    * dropped with a warning: the patch job writes the instance spacing as a
+    * shift, which only combines with a power-of-two divisor
+    * (emit_attrib_buf_indirect). */
    .EXT_vertex_attribute_divisor = true,
 };
 

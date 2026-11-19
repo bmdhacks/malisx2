@@ -257,16 +257,24 @@ mali_image_wants_crc(const VkImageCreateInfo *info, uint64_t modifier)
    return vk_format_get_blocksize(info->format) <= 4;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
-                 const VkAllocationCallbacks *pAllocator, VkImage *pImage)
-{
-   VK_FROM_HANDLE(mali_device, dev, _device);
-   struct mali_physical_device *pdev = mali_device_physical(dev);
-   VkResult result;
+/*
+ * Lays out an image of pCreateInfo in image, which vk_image_init has set up:
+ * the modifier, the planes and the size. No kernel call and no allocation,
+ * so vkGetDeviceImageMemoryRequirements runs it on an image on the stack and
+ * gets the answer vkCreateImage's image gives. With report set, a refusal is
+ * logged with its reason (vkCreateImage); the query only answers.
+ */
+#define layout_error(report, dev, result, ...)                                \
+   ((report) ? vk_errorf(dev, result, __VA_ARGS__) : (result))
 
-   /* Swapchain images (VkNativeBufferANDROID) are laid out and bound
-    * below; AHB images are not supported. DRM format modifier tiling
+static VkResult
+image_layout(struct mali_device *dev, struct mali_image *image,
+             const VkImageCreateInfo *pCreateInfo, bool report)
+{
+   struct mali_physical_device *pdev = mali_device_physical(dev);
+
+   /* Swapchain images (VkNativeBufferANDROID) are laid out here and bound
+    * by vkCreateImage; AHB images are not supported. DRM format modifier tiling
     * takes DRM_FORMAT_MOD_LINEAR from a list, or explicitly with the
     * exporter's row stride and offset for one plane (the WSI layer's
     * imports). */
@@ -285,48 +293,36 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
             linear |= mod_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR;
       }
       if (!linear)
-         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                          "DRM format modifier tiling without DRM_FORMAT_MOD_LINEAR "
-                          "(the only modifier supported)");
+         return layout_error(report, dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "DRM format modifier tiling without DRM_FORMAT_MOD_LINEAR "
+                             "(the only modifier supported)");
    }
 
 #ifndef __ANDROID__
    const struct wsi_image_create_info *wsi_info =
       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
-   const bool wsi_scanout = wsi_info && wsi_info->scanout;
+   image->wsi_scanout = wsi_info && wsi_info->scanout;
 #else
-   const bool wsi_scanout = false;
+   image->wsi_scanout = false;
 #endif
-
-   struct mali_image *image =
-      vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
-   if (!image)
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   image->wsi_scanout = wsi_scanout;
 
    enum pipe_format formats[MALI_IMAGE_MAX_PLANES];
    image->plane_count = mali_format_planes(image->vk.format, formats);
-   if (!image->plane_count) {
-      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                         "images of format %d are not supported", image->vk.format);
-      goto fail;
-   }
-   const unsigned arch = mali_device_physical(dev)->arch;
-   image->vk.drm_format_mod =
-      choose_modifier(image, formats, arch, mali_device_physical(dev)->afbc, pCreateInfo);
+   if (!image->plane_count)
+      return layout_error(report, dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "images of format %d are not supported", image->vk.format);
+   const unsigned arch = pdev->arch;
+   image->vk.drm_format_mod = choose_modifier(image, formats, arch, pdev->afbc, pCreateInfo);
    /* CRC on the command-stream archs (v10, v11 and v12). Not on v7 and v9
     * yet: the job manager cannot update the CRC state from the GPU, and the
     * CPU-side state it needs is not written yet. */
    const bool crc = mali_arch_is_csf(arch) &&
                     mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
 
-   if (mod_explicit && image->plane_count != 1) {
-      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                         "explicit DRM format modifier layout of a %u-plane format",
-                         image->plane_count);
-      goto fail;
-   }
+   if (mod_explicit && image->plane_count != 1)
+      return layout_error(report, dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "explicit DRM format modifier layout of a %u-plane format",
+                          image->plane_count);
 
    /* Planes follow each other; each starts 4 KiB aligned (data_size is
     * rounded so). An explicit layout places the one plane where the
@@ -349,24 +345,41 @@ mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       if ((mod_explicit && (!info.explicit_row_stride ||
                             mod_explicit->pPlaneLayouts[0].rowPitch > UINT32_MAX)) ||
           !mali_image_plane_layout_init(&info, offset, &image->planes[p].layout)) {
-         result = vk_errorf(dev, mod_explicit ? VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
-                                              : VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "no layout for plane %u of a %ux%ux%u image of format %d%s", p,
-                            info.width, info.height, info.depth, image->vk.format,
-                            mod_explicit ? " with the explicit DRM format modifier layout" : "");
-         goto fail;
+         return layout_error(report, dev,
+                             mod_explicit ? VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+                                          : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "no layout for plane %u of a %ux%ux%u image of format %d%s", p,
+                             info.width, info.height, info.depth, image->vk.format,
+                             mod_explicit ? " with the explicit DRM format modifier layout" : "");
       }
       offset = image->planes[p].layout.slices[0].offset + image->planes[p].layout.data_size;
    }
    image->size = offset;
 
    /* maxResourceSize: an image has to fit one allocation. */
-   if (image->size > pdev->vk.properties.maxMemoryAllocationSize) {
-      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                         "image of %llu bytes is above maxMemoryAllocationSize",
-                         (unsigned long long)image->size);
+   if (image->size > pdev->vk.properties.maxMemoryAllocationSize)
+      return layout_error(report, dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "image of %llu bytes is above maxMemoryAllocationSize",
+                          (unsigned long long)image->size);
+   return VK_SUCCESS;
+}
+
+#undef layout_error
+
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
+                 const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+
+   struct mali_image *image =
+      vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
+   if (!image)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result = image_layout(dev, image, pCreateInfo, true);
+   if (result != VK_SUCCESS)
       goto fail;
-   }
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* A swapchain image from the Android loader: the gralloc buffer's
@@ -401,12 +414,9 @@ mali_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks 
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequirementsInfo2 *pInfo,
-                                 VkMemoryRequirements2 *pMemoryRequirements)
+static void
+image_requirements(const struct mali_image *image, VkMemoryRequirements2 *pMemoryRequirements)
 {
-   VK_FROM_HANDLE(mali_image, image, pInfo->image);
-
    /* Memory types as the blob: a transient attachment only in lazily
     * allocated memory, everything else in the host-visible types. No
     * disjoint planes, so VkImagePlaneMemoryRequirementsInfo does not
@@ -432,6 +442,57 @@ mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
          break;
       }
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequirementsInfo2 *pInfo,
+                                 VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(mali_image, image, pInfo->image);
+   image_requirements(image, pMemoryRequirements);
+}
+
+/*
+ * VK_KHR_maintenance4: the requirements of an image that does not exist
+ * yet, from the layout vkCreateImage would give it (image_layout) on an
+ * image on the stack, so they are the ones vkGetImageMemoryRequirements2
+ * gives for that image. A create info vkCreateImage would refuse gets zero
+ * requirements, in the chained structures too, and nothing is logged: the
+ * query only answers.
+ */
+VKAPI_ATTR void VKAPI_CALL
+mali_GetDeviceImageMemoryRequirements(VkDevice _device,
+                                      const VkDeviceImageMemoryRequirements *pInfo,
+                                      VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+
+   struct mali_image image;
+   memset(&image, 0, sizeof(image));
+   vk_image_init(&dev->vk, &image.vk, pInfo->pCreateInfo);
+   if (image_layout(dev, &image, pInfo->pCreateInfo, false) == VK_SUCCESS) {
+      image_requirements(&image, pMemoryRequirements);
+   } else {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){0};
+      vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {
+         if (stype == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *d = ext;
+            d->prefersDedicatedAllocation = VK_FALSE;
+            d->requiresDedicatedAllocation = VK_FALSE;
+         }
+      }
+   }
+   vk_image_finish(&image.vk);
+}
+
+/* No sparse images. */
+VKAPI_ATTR void VKAPI_CALL
+mali_GetDeviceImageSparseMemoryRequirements(VkDevice _device,
+                                            const VkDeviceImageMemoryRequirements *pInfo,
+                                            uint32_t *pSparseMemoryRequirementCount,
+                                            VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   *pSparseMemoryRequirementCount = 0;
 }
 
 /* The CRC knobs (mali_cmd_gfx.h): here, in code compiled once, so the

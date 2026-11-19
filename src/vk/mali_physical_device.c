@@ -592,6 +592,19 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * shift, which only combines with a power-of-two divisor
     * (emit_attrib_buf_indirect). */
    .EXT_vertex_attribute_divisor = true,
+
+   /* Maintenance 4, on every arch: memory requirements before the object
+    * exists (mali_buffer.c, mali_image.c: the image is laid out on the
+    * stack by the code vkCreateImage runs, with no kernel call), and
+    * maxBufferSize. Pipelines hold a reference to their layout and read it
+    * only while they are created, and binding descriptor sets reads the
+    * layout only while the command is recorded, so a layout may be destroyed
+    * right after it is used. The fragment shader reads its inputs at the
+    * offsets and component counts of the stage before it, so an output
+    * vector wider than the input that reads it gives the input its first
+    * components. LocalSizeId is resolved by the SPIR-V parser, and compute
+    * dispatches take the workgroup size from the shader after that. */
+   .KHR_maintenance4 = true,
 };
 
 /*
@@ -1118,6 +1131,9 @@ get_features(struct vk_features *f, uint32_t arch)
        * for every instance. */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
+
+      /* VK_KHR_maintenance4 (the extension table). */
+      .maintenance4 = true,
    };
 
    get_descriptor_indexing_features(f, arch);
@@ -1494,6 +1510,10 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_timeline_semaphore: Mesa's emulated timelines
        * (vk_sync_timeline) keep 64-bit values with no limit on the gap. */
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
+
+      /* VK_KHR_maintenance4: a buffer has to fit one allocation
+       * (mali_CreateBuffer). */
+      .maxBufferSize = max_alloc,
 
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,

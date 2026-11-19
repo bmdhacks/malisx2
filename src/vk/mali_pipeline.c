@@ -1082,6 +1082,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          vs->cache_hit = gs->cache_hit = true;
          goto gs_done;
       }
+      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto out;
+      }
       result = stage_to_nir(dev, flags, vs);
       if (result == VK_SUCCESS)
          result = stage_to_nir(dev, flags, gs);
@@ -1133,6 +1137,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
                           ts_index, ARRAY_SIZE(ts_slots))) {
          vs->cache_hit = tcs->cache_hit = tes->cache_hit = true;
          goto tess_done;
+      }
+      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto out;
       }
       result = stage_to_nir(dev, flags, vs);
       if (result == VK_SUCCESS)

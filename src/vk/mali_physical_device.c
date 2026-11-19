@@ -611,6 +611,15 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * components. LocalSizeId is resolved by the SPIR-V parser, and compute
     * dispatches take the workgroup size from the shader after that. */
    .KHR_maintenance4 = true,
+
+   /* Pipeline creation, on every arch (mali_pipeline.c): both creators fill
+    * VkPipelineCreationFeedbackCreateInfo (write_feedback), return
+    * VK_PIPELINE_COMPILE_REQUIRED for FAIL_ON_PIPELINE_COMPILE_REQUIRED
+    * when a shader is not in the cache, before compiling it, and stop at the
+    * first failure for EARLY_RETURN_ON_FAILURE. The runtime's cache takes
+    * EXTERNALLY_SYNCHRONIZED (no lock). */
+   .EXT_pipeline_creation_feedback = true,
+   .EXT_pipeline_creation_cache_control = true,
 };
 
 /*
@@ -1140,6 +1149,9 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* VK_KHR_maintenance4 (the extension table). */
       .maintenance4 = true,
+
+      /* VK_EXT_pipeline_creation_cache_control (the extension table). */
+      .pipelineCreationCacheControl = true,
    };
 
    get_descriptor_indexing_features(f, arch);

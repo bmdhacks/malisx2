@@ -834,6 +834,33 @@ subgroup_size_control_for_arch(uint32_t arch)
    return arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
+/*
+ * The shader features Vulkan 1.3 requires, on the command-stream arches
+ * (v10, v11, v12), where the device reports 1.3. Each was already handled
+ * by the shader path every arch shares; v7 and v9 report them once a
+ * device run there has checked them.
+ *
+ *  - Terminate invocation: Mesa's Bifrost preprocessing lowers terminate to
+ *    demote in fragment shaders, as for panvk.
+ *  - Zero-initialized workgroup memory: nir_zero_initialize_shared_memory
+ *    (mali_shader.c lower_nir) once shared memory is laid out.
+ *  - Image robustness: image loads and stores go through
+ *    pan_nir_lower_image's bounds-checked coordinates (LD_TEX and LEA_TEX
+ *    check each one), as panvk's do; panvk reports it on the same
+ *    hardware.
+ *  - Integer dot products: kraid has the 4x8 forms and their saturating
+ *    variants as instructions; nir_opt_algebraic lowers the others to
+ *    arithmetic. None is reported as accelerated.
+ *  - The Vulkan memory model at device scope: the SPIR-V parser gives every
+ *    barrier and atomic its scope and semantics, which kraid takes; no
+ *    availability and visibility chains.
+ */
+static bool
+vk13_shader_features_for_arch(uint32_t arch)
+{
+   return arch == 10 || arch == 11 || arch == 12;
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
@@ -873,6 +900,11 @@ device_extensions_for_arch(uint32_t arch)
    ext.EXT_shader_viewport_index_layer = csf_ext_for_arch(arch);
    ext.EXT_inline_uniform_block = iub_for_arch(arch);
    ext.EXT_subgroup_size_control = subgroup_size_control_for_arch(arch);
+   ext.KHR_shader_terminate_invocation = vk13_shader_features_for_arch(arch);
+   ext.KHR_zero_initialize_workgroup_memory = vk13_shader_features_for_arch(arch);
+   ext.EXT_image_robustness = vk13_shader_features_for_arch(arch);
+   ext.KHR_shader_integer_dot_product = vk13_shader_features_for_arch(arch);
+   ext.KHR_vulkan_memory_model = vk13_shader_features_for_arch(arch);
    return ext;
 }
 
@@ -1200,6 +1232,14 @@ get_features(struct vk_features *f, uint32_t arch)
    if (subgroup_size_control_for_arch(arch)) {
       f->subgroupSizeControl = true;
       f->computeFullSubgroups = true;
+   }
+   if (vk13_shader_features_for_arch(arch)) {
+      f->shaderTerminateInvocation = true;
+      f->shaderZeroInitializeWorkgroupMemory = true;
+      f->robustImageAccess = true;
+      f->shaderIntegerDotProduct = true;
+      f->vulkanMemoryModel = true;
+      f->vulkanMemoryModelDeviceScope = true;
    }
    if (sampler_features_for_arch(arch)) {
       f->customBorderColors = true;

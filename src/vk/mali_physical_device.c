@@ -536,9 +536,8 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_create_renderpass2 = true,
 
    /* What Vulkan 1.3 made core, on every arch. The device stays 1.1: 1.2
-    * and 1.3 also require host query reset, buffer device address,
-    * maintenance4, inline uniform blocks and subgroup size control, which
-    * no arch has.
+    * and 1.3 also require buffer device address, maintenance4, inline
+    * uniform blocks and subgroup size control, which no arch has.
     *
     *  - synchronization2: the driver's barrier, submit and timestamp
     *    commands are the 2 forms (the 1.0 forms are the runtime's wrappers
@@ -558,6 +557,14 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .EXT_vertex_input_dynamic_state = true,
    .EXT_shader_demote_to_helper_invocation = true,
    .EXT_private_data = true,
+
+   /* Host query reset (Vulkan 1.2 core), on every arch: vkResetQueryPool
+    * zeroes a query's counters and availability word through the pool's
+    * uncached host mapping, and the GPU caches are cleaned and invalidated
+    * at the start of every submit (command-stream frontend) or atom (job
+    * manager), so the next command that uses the queries sees the zeros
+    * (mali_query.c). hakuX uses it for its occlusion queries. */
+   .EXT_host_query_reset = true,
 
    /* Reads of the bound colour and depth/stencil attachments inside a
     * dynamic rendering pass, and the maps that decide which output location
@@ -676,7 +683,7 @@ float_controls_for_arch(uint32_t arch)
  * The features and extensions added on the command-stream back half for
  * Eden (geometry and tessellation shaders, polygon modes, cull distances,
  * multiple viewports, logic ops, wide lines, draw parameters, variable
- * pointers, float controls, host query reset): on v10, v11 and v12. The
+ * pointers, float controls): on v10, v11 and v12. The
  * descriptors they write (primitive, viewport, scissor, blend, RUN_IDVS
  * and RUN_COMPUTE) are the same on v10 as on v11 (genxml v10.xml,
  * v11.xml). Where v10's stream lacks an instruction the back half uses
@@ -789,13 +796,9 @@ device_extensions_for_arch(uint32_t arch)
 
    /* Float controls: v7 as float_controls_for_arch says; on the
     * command-stream frontend the SPD's flush-to-zero mode and kraid's
-    * rounding modes follow the shader's execution modes (panvk v9+). Host
-    * query reset: mali_ResetQueryPool zeroes the slots, which every CSF
-    * submit makes visible (mali_query.c), so only on the command-stream
-    * frontend for now. */
+    * rounding modes follow the shader's execution modes (panvk v9+). */
    ext.KHR_shader_float_controls =
       float_controls_for_arch(arch) || csf_ext_for_arch(arch);
-   ext.EXT_host_query_reset = csf_ext_for_arch(arch);
    /* gl_Layer from the vertex shader is the tiler's layer index
     * (mali_pipeline_state.c), gl_ViewportIndex a pass per viewport
     * (multiViewport). */
@@ -1039,9 +1042,6 @@ get_features(struct vk_features *f, uint32_t arch)
       .variablePointers = csf_ext_for_arch(arch),
       .variablePointersStorageBuffer = csf_ext_for_arch(arch),
 
-      /* VK_EXT_host_query_reset (device_extensions_for_arch). */
-      .hostQueryReset = csf_ext_for_arch(arch),
-
       /* VK_EXT_rasterization_order_attachment_access, every arch: the
        * draw descriptor's Flags 0 word (mali_pipeline_state.c) carries
        * this on v9 the same as v11, the Renderer State Descriptor's
@@ -1096,6 +1096,10 @@ get_features(struct vk_features *f, uint32_t arch)
        * parts. */
       .synchronization2 = true,
       .privateData = true,
+
+      /* VK_EXT_host_query_reset (mali_query.c vkResetQueryPool). */
+      .hostQueryReset = true,
+
       .shaderDemoteToHelperInvocation = true,
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,

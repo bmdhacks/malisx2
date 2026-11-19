@@ -4,9 +4,10 @@
  */
 
 /*
- * Query pools, the host side: vkCreateQueryPool, vkDestroyQueryPool and
- * vkGetQueryPoolResults, for timestamp and occlusion queries. Built once
- * per back half (v10, v11 and the job manager's v7 and v9), like mali_sync.c:
+ * Query pools, the host side: vkCreateQueryPool, vkDestroyQueryPool,
+ * vkResetQueryPool and vkGetQueryPoolResults, for timestamp and occlusion
+ * queries. Built once per back half (v10, v11 and the job manager's v7 and
+ * v9), like mali_sync.c:
  * what is recorded into command buffers differs (mali_cmd_query.c on the
  * command-stream frontend, mali_jm_query.c on the job manager), the pool
  * and its host reads do not. The layout is in mali_query.h.
@@ -210,9 +211,14 @@ put_result(void *out, unsigned index, bool wide, uint64_t v)
  * vkResetQueryPool (VK_EXT_host_query_reset): the host zeroes the queries'
  * counters and availability words, as vkCmdResetQueryPool's fills do. The
  * queries are not in use by any pending command (Vulkan), and the memory
- * is mapped uncached; on the command-stream frontend every submit starts
- * by cleaning and invalidating the GPU caches (mali_queue.c), so the next
- * command that uses the queries sees the zeros.
+ * is mapped uncached, so the zeros are in memory when this returns. The GPU
+ * caches hold no copy of the slots that could outlive them: on the
+ * command-stream frontend every submit starts by cleaning and invalidating
+ * the GPU caches (mali_queue.c); on the job manager the kernel cleans the
+ * caches at the end of every atom and cleans and invalidates them at the
+ * start of the next, since no atom sets KB_JM_REQ_SKIP_CACHE_START or
+ * KB_JM_REQ_SKIP_CACHE_END. Either way the next command that uses the
+ * queries sees the zeros.
  */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(ResetQueryPool)(VkDevice _device, VkQueryPool _pool, uint32_t firstQuery,

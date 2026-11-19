@@ -498,6 +498,12 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_line_rasterization = true,
    .EXT_line_rasterization = true,
 
+   /* Load and store op NONE, on every arch: the same as DONT_CARE, no
+    * preload, no clear and no writeback (mali_fb.c att_load, att_store).
+    * Both names, as with line rasterization. */
+   .KHR_load_store_op_none = true,
+   .EXT_load_store_op_none = true,
+
    /* VMA (ARMSX2's allocator) only asks for a memory budget when this is
     * listed. */
    .EXT_memory_budget = true,

@@ -1143,6 +1143,8 @@ MALI_PER_ARCH(fb_fill_tsd)(struct mali_cmd_buffer *cmd, struct mali_render_state
 /* ---------------------------------------------------------------------- */
 /* vkCmdBeginRendering / vkCmdEndRendering                                 */
 
+/* LOAD_OP_NONE takes the default branch, as DONT_CARE: no preload and no
+ * clear, so the image is not read, and the target starts undefined. */
 static enum mali_att_load
 att_load(VkAttachmentLoadOp op)
 {
@@ -1153,6 +1155,10 @@ att_load(VkAttachmentLoadOp op)
    }
 }
 
+/* STORE_OP_NONE as DONT_CARE: no writeback. Only a store writes a target
+ * to memory (there is no incremental rendering), so a target the pass did
+ * not write keeps what the image held, and one it wrote may be left
+ * undefined. */
 static bool
 att_store(const VkRenderingAttachmentInfo *att)
 {

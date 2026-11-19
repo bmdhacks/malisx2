@@ -620,6 +620,17 @@ static const struct vk_device_extension_table mali_device_extensions = {
     * EXTERNALLY_SYNCHRONIZED (no lock). */
    .EXT_pipeline_creation_feedback = true,
    .EXT_pipeline_creation_cache_control = true,
+
+   /* Vulkan 1.3 extensions that need nothing more, on every arch: every
+    * back half implements the second copy, blit and buffer/image copy
+    * commands (the runtime implements the first ones on them); the runtime
+    * lists no tools; the SPIR-V parser skips the non-semantic
+    * instructions; and the texel buffer offset alignments restate
+    * minTexelBufferOffsetAlignment, with no single-texel relaxation. */
+   .KHR_copy_commands2 = true,
+   .EXT_tooling_info = true,
+   .KHR_shader_non_semantic_info = true,
+   .EXT_texel_buffer_alignment = true,
 };
 
 /*
@@ -1222,6 +1233,9 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* VK_EXT_pipeline_creation_cache_control (the extension table). */
       .pipelineCreationCacheControl = true,
+
+      /* VK_EXT_texel_buffer_alignment (the extension table). */
+      .texelBufferAlignment = true,
    };
 
    get_descriptor_indexing_features(f, arch);
@@ -1618,6 +1632,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_maintenance4: a buffer has to fit one allocation
        * (mali_CreateBuffer). */
       .maxBufferSize = max_alloc,
+
+      /* VK_EXT_texel_buffer_alignment: minTexelBufferOffsetAlignment for
+       * every format, no single-texel relaxation. */
+      .storageTexelBufferOffsetAlignmentBytes = 64,
+      .storageTexelBufferOffsetSingleTexelAlignment = false,
+      .uniformTexelBufferOffsetAlignmentBytes = 64,
+      .uniformTexelBufferOffsetSingleTexelAlignment = false,
 
       /* VK_KHR_driver_properties */
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,

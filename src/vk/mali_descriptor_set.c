@@ -364,12 +364,17 @@ iub_data(const struct mali_descriptor_set *set, uint32_t binding)
 static void
 init_iub(const struct mali_descriptor_set *set, uint32_t binding)
 {
-   const struct mali_descriptor_set_binding_layout *bl = &set->layout->bindings[binding];
+   const struct mali_descriptor_set_layout *layout = set->layout;
+   const struct mali_descriptor_set_binding_layout *bl = &layout->bindings[binding];
    const uint32_t first = mali_desc_index(bl, 0, MALI_SUBDESC_NONE);
+   /* A variable-count block has the bytes the set was allocated with. */
+   const uint32_t slots = layout->has_variable_count && binding == layout->variable_binding ?
+                             mali_iub_desc_count(set->variable_count) :
+                             bl->desc_count;
    struct mali_hw_desc desc;
 
    pack_buffer(set->gpu + (uint64_t)(first + 1) * MALI_DESCRIPTOR_SIZE,
-               (uint64_t)(bl->desc_count - 1) * MALI_DESCRIPTOR_SIZE, false, &desc);
+               (uint64_t)(slots - 1) * MALI_DESCRIPTOR_SIZE, false, &desc);
    write_slot(set, binding, 0, MALI_SUBDESC_NONE, &desc);
 }
 
@@ -590,7 +595,7 @@ set_type_counts(const struct mali_descriptor_set_layout *layout, uint32_t variab
       return layout->type_counts;
    const struct mali_descriptor_set_binding_layout *b = &layout->bindings[layout->variable_binding];
    memcpy(scratch, layout->type_counts, sizeof(layout->type_counts));
-   scratch[mali_desc_type_index(b->type)] -= b->desc_count - variable_count;
+   scratch[mali_desc_type_index(b->type)] -= mali_desc_variable_max(b) - variable_count;
    return scratch;
 }
 
@@ -909,7 +914,7 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
          /* The specification keeps it within the binding's size; a larger
           * value would run past the set's memory, so it is cut. */
          variable_count = MIN2(var_counts->pDescriptorCounts[i],
-                               layout->bindings[layout->variable_binding].desc_count);
+                               mali_desc_variable_max(&layout->bindings[layout->variable_binding]));
       }
       result = pool_alloc_set(dev, pool, layout, variable_count, &set);
       if (result != VK_SUCCESS)

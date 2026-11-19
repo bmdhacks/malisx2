@@ -87,6 +87,8 @@ struct mali_descriptor_set_binding_layout {
     * or NULL. Written into every set at allocation; the shader side does
     * not use them (no YCbCr conversion). */
    const struct mali_hw_desc *immutable_samplers;
+   /* An inline uniform block's size in bytes (its descriptorCount). */
+   uint32_t iub_size;
 };
 
 struct mali_descriptor_set_layout {
@@ -103,9 +105,9 @@ struct mali_descriptor_set_layout {
    bool has_immutable_samplers;
    /* The binding with VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
     * if has_variable_count. It is the layout's last binding, not a dynamic
-    * buffer or an inline uniform block; its desc_count is the largest count
-    * a set may be given, and a set takes only the count it is allocated
-    * with (mali_descriptor_set::variable_count). */
+    * buffer; mali_desc_variable_max is the largest count a set may be given
+    * (bytes for an inline uniform block), and a set takes only the count it
+    * is allocated with (mali_descriptor_set::variable_count). */
    bool has_variable_count;
    uint32_t variable_binding;
 };
@@ -152,6 +154,30 @@ mali_desc_index(const struct mali_descriptor_set_binding_layout *b,
    return b->desc_idx + elem * mali_desc_stride(b) + mali_subdesc_offset(b, sub);
 }
 
+/* Slots an inline uniform block of size bytes takes. */
+static inline uint32_t
+mali_iub_desc_count(uint32_t size)
+{
+   return DIV_ROUND_UP(size, MALI_DESCRIPTOR_SIZE) + 1;
+}
+
+/* The largest count a set may give the variable-count binding b, in the
+ * units VkDescriptorSetVariableDescriptorCountAllocateInfo counts it in:
+ * bytes for an inline uniform block, elements otherwise. */
+static inline uint32_t
+mali_desc_variable_max(const struct mali_descriptor_set_binding_layout *b)
+{
+   return b->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? b->iub_size : b->desc_count;
+}
+
+/* Slots the variable-count binding b takes with count of those. */
+static inline uint32_t
+mali_desc_variable_slots(const struct mali_descriptor_set_binding_layout *b, uint32_t count)
+{
+   return b->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? mali_iub_desc_count(count) :
+                                                              count * mali_desc_stride(b);
+}
+
 /* Slots a set of this layout takes when its variable-count binding has
  * variable_count elements (variable_count is ignored by a layout without
  * one). */
@@ -161,8 +187,9 @@ mali_desc_set_slots(const struct mali_descriptor_set_layout *l, uint32_t variabl
    if (!l->has_variable_count)
       return l->desc_count;
    const struct mali_descriptor_set_binding_layout *b = &l->bindings[l->variable_binding];
-   assert(variable_count <= b->desc_count);
-   return l->desc_count - (b->desc_count - variable_count) * mali_desc_stride(b);
+   assert(variable_count <= mali_desc_variable_max(b));
+   return l->desc_count - b->desc_count * mali_desc_stride(b) +
+          mali_desc_variable_slots(b, variable_count);
 }
 
 /* Slot of the layout's first sampler (of its lowest sampler or combined
@@ -179,13 +206,6 @@ mali_desc_set_first_sampler_slot(const struct mali_descriptor_set_layout *l)
          return mali_desc_index(b, 0, MALI_SUBDESC_SAMPLER);
    }
    return -1;
-}
-
-/* Slots an inline uniform block of size bytes takes. */
-static inline uint32_t
-mali_iub_desc_count(uint32_t size)
-{
-   return DIV_ROUND_UP(size, MALI_DESCRIPTOR_SIZE) + 1;
 }
 
 #endif

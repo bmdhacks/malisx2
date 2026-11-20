@@ -801,8 +801,9 @@ arm_wsi_layer_loaded(void)
 /*
  * Sampler features the hardware's Sampler descriptor already has: custom
  * border colours (Mesa's runtime gives the colour, mali_sampler.c packs it as
- * it packs the standard ones), a seamless-cube bit to clear, and the
- * mirrored-clamp-to-edge wrap mode. Checked with the CTS on the G31 and G52.
+ * it packs the standard ones) and a seamless-cube bit to clear (the
+ * mirrored-clamp-to-edge wrap mode: mirror_clamp_for_arch). Checked with the
+ * CTS on the G31 and G52.
  * customBorderColorWithoutFormat holds because v7_afbc_format (mali_image.c)
  * makes only R8, RG8 and RGBA8 AFBC: a BGR-order AFBC image on v7 would need
  * the border colour's red and blue swapped per format, as panvk does
@@ -851,19 +852,22 @@ subgroup_size_control_for_arch(uint32_t arch)
 }
 
 /*
- * The shader features Vulkan 1.3 requires, on the command-stream arches
- * (v10, v11, v12), where the device reports 1.3. Each was already handled
- * by the shader path every arch shares; v7 and v9 report them once a
+ * The shader features Vulkan 1.3 requires, on v9 and later, where the
+ * device reports 1.3. kraid compiles every one of these arches, and the
+ * lowering below is the same for all of them (pan_nir_lower_image takes the
+ * same path from arch 9 on, and v9's ISA has the 4x8 dot products). v7,
+ * whose shaders go through Mesa's Bifrost compiler, reports them once a
  * device run there has checked them.
  *
  *  - Terminate invocation: Mesa's Bifrost preprocessing lowers terminate to
  *    demote in fragment shaders, as for panvk.
  *  - Zero-initialized workgroup memory: nir_zero_initialize_shared_memory
- *    (mali_shader.c lower_nir) once shared memory is laid out.
+ *    (mali_shader.c lower_nir) once shared memory is laid out; both back
+ *    halves size the workgroup memory from the shader (mali_compute_tsd).
  *  - Image robustness: image loads and stores go through
  *    pan_nir_lower_image's bounds-checked coordinates (LD_TEX and LEA_TEX
- *    check each one), as panvk's do; panvk reports it on the same
- *    hardware.
+ *    check each one) against the size in the view's texture descriptor, as
+ *    panvk's do; panvk reports it on the same hardware.
  *  - Integer dot products: kraid has the 4x8 forms and their saturating
  *    variants as instructions; nir_opt_algebraic lowers the others to
  *    arithmetic. None is reported as accelerated.
@@ -874,7 +878,18 @@ subgroup_size_control_for_arch(uint32_t arch)
 static bool
 vk13_shader_features_for_arch(uint32_t arch)
 {
-   return arch == 10 || arch == 11 || arch == 12;
+   return arch == 9 || arch == 10 || arch == 11 || arch == 12;
+}
+
+/*
+ * VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: the Sampler's Mirrored Clamp
+ * to Edge wrap mode (mali_sampler.c wrap_mode), the same value on every arch
+ * (genxml v7.xml to v12.xml). Checked with the CTS on the G31 and G52 (v7).
+ */
+static bool
+mirror_clamp_for_arch(uint32_t arch)
+{
+   return arch == 7 || arch == 9 || arch == 10 || arch == 11 || arch == 12;
 }
 
 static struct vk_device_extension_table
@@ -893,8 +908,7 @@ device_extensions_for_arch(uint32_t arch)
    ext.KHR_uniform_buffer_standard_layout = ubo_std_layout_for_arch(arch);
    ext.EXT_custom_border_color = sampler_features_for_arch(arch);
    ext.EXT_non_seamless_cube_map = sampler_features_for_arch(arch);
-   ext.KHR_sampler_mirror_clamp_to_edge =
-      sampler_features_for_arch(arch) || csf_ext_for_arch(arch);
+   ext.KHR_sampler_mirror_clamp_to_edge = mirror_clamp_for_arch(arch);
    /* v7: DrawIndex is a system value the draw sets (draw_id); 8-bit indices
     * and list restart are the index scan's and the tiler's. */
    ext.KHR_shader_draw_parameters = arch == 7;
@@ -1283,12 +1297,9 @@ get_features(struct vk_features *f, uint32_t arch)
       f->customBorderColors = true;
       f->customBorderColorWithoutFormat = true;
       f->nonSeamlessCubeMap = true;
-      f->samplerMirrorClampToEdge = true;
    }
+   f->samplerMirrorClampToEdge = mirror_clamp_for_arch(arch);
    if (csf_ext_for_arch(arch)) {
-      /* The Sampler's Mirrored Clamp to Edge wrap mode (mali_sampler.c
-       * wrap_mode), the same value on v10, v11 and v12 as on v7. */
-      f->samplerMirrorClampToEdge = true;
       /* gl_ViewportIndex and gl_Layer from the vertex shader, which
        * VK_EXT_shader_viewport_index_layer already offers there; Vulkan 1.2
        * requires both features of a device that lists it. */

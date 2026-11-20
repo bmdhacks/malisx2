@@ -882,6 +882,40 @@ vk13_shader_features_for_arch(uint32_t arch)
 }
 
 /*
+ * VK_EXT_robustness2 and VK_KHR_robustness2 with nullDescriptor only;
+ * robustBufferAccess2 and robustImageAccess2 are not offered. ARMSX2's
+ * frame generation needs nullDescriptor, and ARMSX2 enables it whenever it
+ * is offered, so it is on for all of its rendering. A null descriptor is
+ * therefore carried by what its slot holds (mali_descriptor_set.c), and a
+ * shader compiles to the same code with the feature on or off:
+ *
+ *  - a null image view (sampled, storage, input attachment, the image half
+ *    of a combined image/sampler) is a Null descriptor. Loads through it
+ *    read zero and stores are dropped by the hardware; the size, level and
+ *    sample count queries test word 0 for it (Mesa's
+ *    pan_nir_load_va_tex_size and the two after it), in every shader;
+ *  - a null uniform or storage buffer is a Buffer of size 0 at
+ *    MALI_NULL_BUFFER_ADDR, as a null dynamic buffer already is. Loads are
+ *    out of bounds and read zero, the size query reads 0, and stores and
+ *    atomics, which are global accesses at the address plus the offset,
+ *    land in the memory sink;
+ *  - a null texel buffer view is the same Buffer with a stride of 1 and a
+ *    zero conversion word: the size query divides the size by the stride,
+ *    and the shader reads a zero conversion word as constant zero;
+ *  - a null vertex buffer is a Null descriptor in the vertex stage's
+ *    driver table (mali_gfx_pack_vs_drv).
+ *
+ * Not on v7: Bifrost has no Null descriptor and its size queries read the
+ * descriptor's fields with nothing to test, and frame generation also
+ * needs the Vulkan memory model, which v7 does not offer.
+ */
+static bool
+null_descriptor_for_arch(uint32_t arch)
+{
+   return arch == 9 || arch == 10 || arch == 11 || arch == 12;
+}
+
+/*
  * VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: the Sampler's Mirrored Clamp
  * to Edge wrap mode (mali_sampler.c wrap_mode), the same value on every arch
  * (genxml v7.xml to v12.xml). Checked with the CTS on the G31 and G52 (v7).
@@ -936,6 +970,9 @@ device_extensions_for_arch(uint32_t arch)
    ext.EXT_image_robustness = vk13_shader_features_for_arch(arch);
    ext.KHR_shader_integer_dot_product = vk13_shader_features_for_arch(arch);
    ext.KHR_vulkan_memory_model = vk13_shader_features_for_arch(arch);
+   /* ARMSX2 asks for the EXT name; both share the feature structure. */
+   ext.EXT_robustness2 = null_descriptor_for_arch(arch);
+   ext.KHR_robustness2 = null_descriptor_for_arch(arch);
    return ext;
 }
 
@@ -1299,6 +1336,7 @@ get_features(struct vk_features *f, uint32_t arch)
       f->nonSeamlessCubeMap = true;
    }
    f->samplerMirrorClampToEdge = mirror_clamp_for_arch(arch);
+   f->nullDescriptor = null_descriptor_for_arch(arch);
    if (csf_ext_for_arch(arch)) {
       /* gl_ViewportIndex and gl_Layer from the vertex shader, which
        * VK_EXT_shader_viewport_index_layer already offers there; Vulkan 1.2
@@ -1739,6 +1777,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetInlineUniformBlocks = 16;
       props->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 16;
       props->maxInlineUniformTotalSize = 16 * 4096;
+   }
+
+   /* VK_EXT_robustness2 (null_descriptor_for_arch): what buffer descriptor
+    * sizes are rounded up to (mali_descriptor_set.c pack_buffer). */
+   if (null_descriptor_for_arch(pdev->arch)) {
+      props->robustStorageBufferAccessSizeAlignment = 4;
+      props->robustUniformBufferAccessSizeAlignment = 16;
    }
 
    /* VK_EXT_subgroup_size_control (subgroup_size_control_for_arch). */

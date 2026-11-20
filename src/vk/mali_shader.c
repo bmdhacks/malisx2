@@ -32,8 +32,10 @@
  *  - jobs point at Renderer State Descriptors (RSDs) instead of SPDs
  *    (shader_upload);
  *  - vertex and fragment shaders push uniform-buffer words into FAU too
- *    (lower_ubo_push), and clip distances are a discard in the fragment
- *    shader ("Clip distances").
+ *    (lower_ubo_push).
+ *
+ * On every arch clip and cull distances are a discard in the fragment
+ * shader ("Clip distances").
  */
 
 #ifndef PAN_ARCH
@@ -1948,7 +1950,6 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
 }
 #endif /* PAN_ARCH < 9 */
 
-#if PAN_ARCH != 9
 /* ---------------------------------------------------------------------- */
 /* Clip distances                                                          */
 
@@ -1956,7 +1957,9 @@ v7_stencil_tile_conv(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
  * No Mali arch has clip distance hardware. As Mesa's gallium driver does for
  * user clip planes (nir_lower_clip_fs), the distances are varyings, and the
  * fragment shader discards a fragment whose interpolated distance is
- * negative. Built for v7 and v11; v9 does not offer shaderClipDistance.
+ * negative. The same on every arch: the CLIP_DIST slots are generic
+ * varyings in the layout (pan_varying_collect_formats), and every draw
+ * path carries them like any other.
  *
  * The vertex shader keeps gl_ClipDistance as vk_spirv_to_nir leaves it: a
  * compact float array, whatever its name (a gl_PerVertex member is
@@ -2150,7 +2153,6 @@ lower_clip_distance_fs(nir_shader *nir, const struct pan_varying_layout *vs_layo
       nir->info.fs.early_fragment_tests = false;
    nir_progress(true, impl, nir_metadata_control_flow);
 }
-#endif /* PAN_ARCH != 9 */
 
 /* ---------------------------------------------------------------------- */
 /* Viewport index                                                          */
@@ -2855,10 +2857,8 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
          NIR_PASS(_, nir, v7_guard_vs_stores);
 #endif
       NIR_PASS(_, nir, nir_opt_constant_folding);
-#if PAN_ARCH != 9
       s->vs.clip_distances = nir->info.clip_distance_array_size;
       lower_cull_distance_vs(nir);
-#endif
 
       pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
       pan_build_varying_layout_compact(&varying_layout, nir, inputs.arch);
@@ -2877,9 +2877,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, v7_stencil_tile_conv,
                nir_metadata_control_flow, NULL);
 #endif
-#if PAN_ARCH != 9
       lower_clip_distance_fs(nir, info->vs_varying_layout, info->vs_clip_distances);
-#endif
 #if PAN_ARCH >= 10
       lower_viewport_index_fs(nir);
 #endif

@@ -731,13 +731,13 @@ float_controls_for_arch(uint32_t arch)
  * The features and extensions added on the command-stream back half for
  * Eden (geometry and tessellation shaders, polygon modes, cull distances,
  * multiple viewports, logic ops, wide lines, draw parameters, variable
- * pointers, float controls): on v10, v11 and v12. The
- * descriptors they write (primitive, viewport, scissor, blend, RUN_IDVS
- * and RUN_COMPUTE) are the same on v10 as on v11 (genxml v10.xml,
- * v11.xml). Where v10's stream lacks an instruction the back half uses
- * (NEXT_SB_ENTRY and the indirect waits, the shared scoreboard entries,
- * 32-bit logic ops, the TILER_FLAGS2 staging register), it has a v10 form
- * of its own. Checked on a Mali-G710 (v10, Pixel 7), G715 (v11, Pixel 8
+ * pointers, float controls): on v10, v11 and v12, and cull distances on v9
+ * too (get_features). The descriptors they write (primitive, viewport,
+ * scissor, blend, RUN_IDVS and RUN_COMPUTE) are the same on v10 as on v11
+ * (genxml v10.xml, v11.xml). Where v10's stream lacks an instruction the
+ * back half uses (NEXT_SB_ENTRY and the indirect waits, the shared
+ * scoreboard entries, 32-bit logic ops, the TILER_FLAGS2 staging
+ * register), it has a v10 form of its own. Checked on a Mali-G710 (v10, Pixel 7), G715 (v11, Pixel 8
  * and 9) and G720 (v12).
  */
 static bool
@@ -1099,18 +1099,18 @@ get_features(struct vk_features *f, uint32_t arch)
       .drawIndirectCount = draw_indirect_for_arch(arch),
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v7, v10, v11 and v12 (not v9): clip distances are varyings the fragment
-       * shader tests and discards on (mali_shader.c, "Clip distances").
-       * The test is per pixel, at the pixel centre, so under
-       * multisampling the clipped edge is not antialiased; and with a
-       * fragment shader that forces early fragment tests and also
-       * discards or writes memory, depth or stencil, clipped fragments
-       * still write depth and stencil. */
-      .shaderClipDistance = arch == 7 || mali_arch_is_csf(arch),
+      /* Every arch: clip distances are varyings the fragment shader tests
+       * and discards on (mali_shader.c, "Clip distances"). The test is per
+       * pixel, at the pixel centre, so under multisampling the clipped
+       * edge is not antialiased; and with a fragment shader that forces
+       * early fragment tests and also discards or writes memory, depth or
+       * stencil, clipped fragments still write depth and stencil. */
+      .shaderClipDistance = arch == 7 || arch == 9 || mali_arch_is_csf(arch),
       /* Cull distances: a discard of every fragment of a primitive whose
        * cull distance is negative at all its vertices (mali_shader.c,
-       * "Clip distances"). Command-stream frontend. */
-      .shaderCullDistance = csf_ext_for_arch(arch),
+       * "Clip distances"), the same shader code on every arch. Offered on
+       * v9 and the command-stream frontend, not on v7. */
+      .shaderCullDistance = arch == 9 || csf_ext_for_arch(arch),
       /* Polygon modes point and line: a point list of the vertices, a
        * line list of the triangles' edges (mali_cmd_draw.c). Faces are
        * not culled in either. Command-stream frontend, direct draws (an
@@ -1796,6 +1796,15 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetUpdateAfterBindStorageImages = props->maxDescriptorSetStorageImages;
       props->maxDescriptorSetUpdateAfterBindInputAttachments =
          props->maxDescriptorSetInputAttachments;
+   }
+
+   /* Clip and cull distances on v9, as on the command-stream arches
+    * below: eight in all, in the two CLIP_DIST varying slots (mali_shader.c,
+    * "Clip distances"). */
+   if (p->arch_major == 9) {
+      props->maxClipDistances = MALI_V11_MAX_CLIP_DISTANCES;
+      props->maxCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
+      props->maxCombinedClipAndCullDistances = MALI_V11_MAX_CLIP_DISTANCES;
    }
 
    /*

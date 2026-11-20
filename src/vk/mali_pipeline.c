@@ -20,10 +20,10 @@
  *   fragment = BLAKE3("fs", stage, layout, vertex stage, the state the
  *              fragment lowering reads)
  *   compute  = BLAKE3("cs", stage, layout)
- * and on v7 and v11, for the fragment shader that only clips
- * (clip_fs_compile),
- *   BLAKE3("mali-v7-clip-fs" or "mali-v11-clip-fs", the vertex shader's
- *          varying layout, the state the fragment lowering reads)
+ * and for the fragment shader that only clips (clip_fs_compile),
+ *   BLAKE3("mali-v7-clip-fs", "mali-v9-clip-fs" or "mali-v11-clip-fs", the
+ *          vertex shader's varying layout, the state the fragment lowering
+ *          reads)
  * "stage" is the runtime's hash of the stage create info (SPIR-V, entry
  * point, specialization, flags, robustness). The fragment shader is
  * compiled against the vertex shader's varying layout, so its key includes
@@ -839,23 +839,28 @@ fill_bind(struct mali_device *dev, struct mali_graphics_pipeline *p)
    return VK_SUCCESS;
 }
 
-#if PAN_ARCH != 9
 #if PAN_ARCH == 7
 #define CLIP_FS_TAG "mali-v7-clip-fs"
 #define CLIP_FS_NAME "mali_v7_clip_fs"
+#elif PAN_ARCH == 9
+#define CLIP_FS_TAG "mali-v9-clip-fs"
+#define CLIP_FS_NAME "mali_v9_clip_fs"
 #else
 #define CLIP_FS_TAG "mali-v11-clip-fs"
 #define CLIP_FS_NAME "mali_v11_clip_fs"
 #endif
 
 /*
- * v7 and v11 clip in the fragment shader (mali_shader.c, "Clip
+ * Clipping is done in the fragment shader (mali_shader.c, "Clip
  * distances"), so a pipeline whose vertex shader writes clip distances and
  * that has no fragment shader gets one that only clips: an empty fragment
  * shader, to which the fragment compile adds the clip discard. Like no
  * fragment shader, it writes no colour (every colour target stays off,
  * mali_pipeline_state.c pack_blend); its discard makes the depth/stencil
- * update late, so a clipped fragment writes no depth or stencil.
+ * update late, so a clipped fragment writes no depth or stencil. The draw
+ * takes it as the pipeline's fragment shader on every arch: on v9 and
+ * later its Draw descriptor flags and the vertex packet's varying part
+ * follow from it (pack_flags, fill_bind) as for one the application gave.
  */
 static bool
 vs_writes_clip_distances(const struct mali_shader *vs)
@@ -925,7 +930,6 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
    st->duration_ns = os_time_get_nano() - start;
    return VK_SUCCESS;
 }
-#endif /* PAN_ARCH != 9 */
 
 #if MALI_WITH_POLY && PAN_ARCH >= 10
 /* The tessellator's output primitives (mali_shader.h struct
@@ -952,10 +956,8 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    struct stage *vs = NULL, *fs = NULL, *gs = NULL, *tcs = NULL, *tes = NULL;
    struct mali_gs_shaders *gs_shaders = NULL;
    struct mali_tess_shaders *tess_shaders = NULL;
-#if PAN_ARCH != 9
    /* The fragment shader that only clips (clip_fs_compile), if needed. */
    struct stage clip = {0};
-#endif
    uint32_t stage_count = 0;
    VkResult result;
 
@@ -1193,7 +1195,6 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       if (result != VK_SUCCESS)
          goto out;
    }
-#if PAN_ARCH != 9
    if (!fs && vs_writes_clip_distances(vs->shader)) {
       clip_fs_key(dev, &state, vs->shader, clip.key);
       if (!stage_lookup(dev, cache, &clip)) {
@@ -1209,7 +1210,6 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          vs->duration_ns += clip.duration_ns;
       }
    }
-#endif
 
    struct mali_graphics_pipeline *p =
       vk_pipeline_zalloc(&dev->vk, &graphics_pipeline_ops,
@@ -1250,12 +1250,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       p->fs = fs->shader;
       fs->shader = NULL;
    }
-#if PAN_ARCH != 9
    if (clip.shader) {
       p->fs = clip.shader;
       clip.shader = NULL;
    }
-#endif
 
    /* The static state, and the words baked from it. */
    BITSET_COPY(p->dynamic, state.dynamic);
@@ -1308,9 +1306,7 @@ out:
                   os_time_get_nano() - start);
    for (uint32_t i = 0; i < stage_count; i++)
       stage_finish(dev, &stages[i]);
-#if PAN_ARCH != 9
    stage_finish(dev, &clip);
-#endif
    return result;
 }
 

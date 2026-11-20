@@ -37,15 +37,15 @@
 
 /*
  * The Vulkan version each arch reports (mali_physical_device.c
- * api_version_for_arch): 1.3 on the command-stream arches (v10, v11, v12),
- * which have every feature 1.2 and 1.3 require; 1.1 on the job manager
- * (v7, v9), which lacks some of the 1.3 shader features and subgroup size
- * control on v7. The instance reports the highest. ARMSX2 creates a 1.1
- * instance and uses nothing newer.
+ * api_version_for_arch): 1.3 on v9, v10, v11 and v12, which have every
+ * feature 1.2 and 1.3 require; 1.1 on v7, which lacks the 1.3 shader
+ * features, inline uniform blocks and subgroup size control. The instance
+ * reports the highest. ARMSX2 creates a 1.1 instance and uses nothing
+ * newer.
  */
-#define MALI_API_VERSION_CSF VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION)
-#define MALI_API_VERSION_JM VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION)
-#define MALI_API_VERSION MALI_API_VERSION_CSF
+#define MALI_API_VERSION_1_3 VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION)
+#define MALI_API_VERSION_1_1 VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION)
+#define MALI_API_VERSION MALI_API_VERSION_1_3
 
 /* One queue family, one queue. */
 #define MALI_QUEUE_COUNT 1

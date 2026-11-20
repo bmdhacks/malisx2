@@ -99,7 +99,7 @@ driver_info_for_arch(uint32_t arch)
 static inline uint32_t
 api_version_for_arch(uint32_t arch)
 {
-   return mali_arch_is_csf(arch) ? MALI_API_VERSION_CSF : MALI_API_VERSION_JM;
+   return arch == 7 ? MALI_API_VERSION_1_1 : MALI_API_VERSION_1_3;
 }
 
 static inline uint32_t

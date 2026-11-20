@@ -459,6 +459,11 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    /* The swapchain and present side of the shared WSI (VK_KHR_display). */
    vk_device_dispatch_table_from_entrypoints(&dispatch, &wsi_device_entrypoints, false);
 #endif
+   /* Secondary command buffers are not implemented. Mesa's common
+    * vkCmdExecuteCommands replays a vk_cmd_queue through
+    * command_dispatch_table, and this driver sets up neither, so the stub
+    * has to be in place before vk_device_init adds the common layer. */
+   dispatch.CmdExecuteCommands = mali_waist_CmdExecuteCommands;
 
    /* On v7 VK_MALISX2_descriptor_indexing is VK_EXT_descriptor_indexing to
     * Mesa's runtime, which supports only the latter where the former is

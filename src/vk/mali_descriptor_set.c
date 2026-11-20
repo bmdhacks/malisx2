@@ -206,6 +206,9 @@ write_slot(const struct mali_descriptor_set *set, uint32_t binding, uint32_t ele
    set_store(set, slot_ptr(set, binding, elem, sub), desc, MALI_DESCRIPTOR_SIZE);
 }
 
+/* A null image view or sampler. On v9+ a Null descriptor, which the
+ * hardware reads as zero and the shader's size queries test for
+ * (nullDescriptor, mali_physical_device.c null_descriptor_for_arch). */
 static void
 write_null(const struct mali_descriptor_set *set, uint32_t binding, uint32_t elem,
            enum mali_subdesc sub)
@@ -216,8 +219,8 @@ write_null(const struct mali_descriptor_set *set, uint32_t binding, uint32_t ele
    write_slot(set, binding, elem, sub, &null_desc);
 #else
    /* No Null descriptor on Bifrost (panvk_v7 writes none either): the slot
-    * is zeroed. Reading through it is not robust, and nullDescriptor is
-    * not exposed. */
+    * is zeroed. Reading through it is not robust, and v7 does not offer
+    * nullDescriptor. */
    const uint8_t null_desc[MALI_DESCRIPTOR_SIZE] = {0};
    write_slot(set, binding, elem, sub, null_desc);
 #endif
@@ -311,15 +314,25 @@ write_buffer(const struct mali_descriptor_set *set, const VkDescriptorBufferInfo
              uint32_t binding, uint32_t elem, VkDescriptorType type)
 {
    VK_FROM_HANDLE(mali_buffer, buffer, info->buffer);
-   if (!buffer) {
+   const bool ssbo = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   struct mali_hw_desc desc;
+
+   if (buffer) {
+      pack_buffer(mali_buffer_gpu_va(buffer, info->offset),
+                  vk_buffer_range(&buffer->vk, info->offset, info->range), ssbo, &desc);
+   } else {
+#if PAN_ARCH >= 9
+      /* A null buffer is what a null dynamic buffer becomes at draw time
+       * (write_dynamic_buffer): no bytes at the memory sink. Loads are out
+       * of bounds and read zero, the size query reads 0, and stores and
+       * atomics (global accesses at the address plus the offset) land in
+       * the sink. */
+      pack_buffer(MALI_NULL_BUFFER_ADDR, 0, ssbo, &desc);
+#else
       write_null(set, binding, elem, MALI_SUBDESC_NONE);
       return;
+#endif
    }
-
-   struct mali_hw_desc desc;
-   pack_buffer(mali_buffer_gpu_va(buffer, info->offset),
-               vk_buffer_range(&buffer->vk, info->offset, info->range),
-               type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &desc);
    write_slot(set, binding, elem, MALI_SUBDESC_NONE, &desc);
 }
 
@@ -347,10 +360,27 @@ write_buffer_view(const struct mali_descriptor_set *set, VkBufferView _view,
                   uint32_t binding, uint32_t elem)
 {
    VK_FROM_HANDLE(mali_buffer_view, view, _view);
-   if (view)
+   if (view) {
       write_slot(set, binding, elem, MALI_SUBDESC_NONE, &view->desc);
-   else
-      write_null(set, binding, elem, MALI_SUBDESC_NONE);
+      return;
+   }
+#if PAN_ARCH >= 9
+   /* A null view: a Structure Buffer of no bytes at the memory sink, as
+    * write_buffer's null buffer. The stride is 1 because the size query
+    * divides the size by it (pan_nir_load_va_buf_size_el); the conversion
+    * word stays zero, which the shader reads as constant zero
+    * (pan_nir_load_va_buf_cvt). */
+   struct mali_buffer_packed desc;
+   pan_pack(&desc, BUFFER, cfg) {
+      cfg.buffer_type = MALI_BUFFER_TYPE_STRUCTURE;
+      cfg.address = MALI_NULL_BUFFER_ADDR;
+      cfg.size = 0;
+      cfg.stride = 1;
+   }
+   write_slot(set, binding, elem, MALI_SUBDESC_NONE, &desc);
+#else
+   write_null(set, binding, elem, MALI_SUBDESC_NONE);
+#endif
 }
 
 /* Inline uniform block bytes start in the binding's second slot; the first

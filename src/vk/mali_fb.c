@@ -341,10 +341,9 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
     * tile (fix_frame_mode). Only several or wide targets make the v7 tile
     * that small. */
    if (tw < AFBC_BLOCK || th < AFBC_BLOCK) {
-      for (unsigned i = 0; i < desc->rt_count; i++) {
-         struct mali_fb_target *t = &r->desc.rt[i];
-         if (target_is_afbc(t) && t->store)
-            t->always_write = true;
+      for (unsigned i = 0; i < n; i++) {
+         if (target_is_afbc(targets[i]) && targets[i]->store)
+            targets[i]->always_write = true;
       }
    }
 #endif
@@ -791,10 +790,11 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
    }
 
 #if PAN_ARCH < 9
-   /* v7 depth/stencil images are never AFBC (mali_image.c v7_can_use_afbc). */
-   assert(!target_is_afbc(zt) && !target_is_afbc(st));
-   if (zt->image && zt->store) {
-#else
+   /* On v7 only a D32_SFLOAT depth image is AFBC, and it has no stencil
+    * plane: the AFBC depth target's body pointer is the stencil target's
+    * base (mali_image.c v7_can_use_afbc). */
+   assert(!target_is_afbc(st) && !(target_is_afbc(zt) && st->image && st->store));
+#endif
    if (zt->image && zt->store && target_is_afbc(zt)) {
       uint64_t header;
       uint32_t body, row;
@@ -804,12 +804,20 @@ pack_zs_ext(const struct mali_render_state *r, unsigned layer, uint64_t crc_clea
          cfg.afbc_zs.block_format = MALI_BLOCK_FORMAT_AFBC_TILED;
          cfg.afbc_zs.reverse_issue_order = afbc_reverse_issue_order(r);
          cfg.afbc_zs.header = header;
+#if PAN_ARCH < 9
+         /* pan_emit_afbc_zs_attachment at PAN_ARCH 7: an absolute body
+          * pointer and the header row stride in superblocks. */
+         const enum pipe_format pf = zt->image->planes[zt->plane].format;
+         cfg.afbc_zs.body = header + body;
+         cfg.afbc_zs.header_row_stride =
+            row / (MALI_AFBC_HEADER_BYTES * mali_afbc_header_tile_sbs(pf));
+#else
          cfg.afbc_zs.body_offset = body;
          cfg.afbc_zs.header_row_stride = row;
+#endif
       }
       pan_merge(&desc, &part, ZS_CRC_EXTENSION);
    } else if (zt->image && zt->store) {
-#endif
       uint64_t base, surf;
       uint32_t row;
       target_mem(zt, layer, &base, &row, &surf);

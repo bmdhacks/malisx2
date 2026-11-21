@@ -45,9 +45,10 @@
  * between identical uncompressed, non-AFBC formats of 1, 2, 4, 8 or
  * 16-byte texels is the compute copy instead. v7 compresses and
  * decompresses AFBC by the render target's and the texture's format, so
- * the two AFBC paths read and write an AFBC plane (colour only) in its own
- * format and convert to and from the block's bits in the shader
- * (mali_meta_copy_fmt). Blits and clears work in the image's own format.
+ * the two AFBC paths read and write an AFBC plane in its own format and
+ * convert to and from the block's bits in the shader (mali_meta_copy_fmt);
+ * an AFBC depth plane is written as the copy pass's depth target. Blits
+ * and clears work in the image's own format.
  * The copy pass writes its target through a copy format (v7_copy_fmt),
  * which only the AFBC formats have, so image copies into other planes
  * never take the fragment-side copy pass.
@@ -262,6 +263,7 @@ v7_copy_fmt(const struct mali_image *img, unsigned plane)
    case PIPE_FORMAT_R8_UNORM: return MALI_META_COPY_FMT_R8;
    case PIPE_FORMAT_R8G8_UNORM: return MALI_META_COPY_FMT_R8G8;
    case PIPE_FORMAT_R8G8B8A8_UNORM: return MALI_META_COPY_FMT_R8G8B8A8;
+   case PIPE_FORMAT_Z32_FLOAT: return MALI_META_COPY_FMT_R32F;
    default:
       /* v7_afbc_format (mali_image.c) admits no other format. */
       UNREACHABLE("no v7 AFBC copy format");
@@ -357,12 +359,19 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
    key.rt_type[0] = MALI_META_FS_UINT;
 #if PAN_ARCH < 9
    /* v7: an AFBC target and source in their own formats, the bits
-    * converted in the shader (mali_meta_copy_fmt). */
+    * converted in the shader (mali_meta_copy_fmt). A depth plane is
+    * compressed by the depth writeback, so it is written as the pass's
+    * depth target, not as a colour target. */
    const enum pipe_format target_format = util_format_linear(img->planes[plane].format);
+   const bool depth = util_format_is_depth_or_stencil(target_format);
    key.rt_type[0] = MALI_META_FS_FLOAT;
    key.copy_dst_fmt = v7_copy_fmt(img, plane);
    if (src->img)
       key.copy_src_fmt = v7_copy_fmt(src->img, src->plane);
+   if (depth) {
+      key.rt_op[0] = MALI_META_FS_NONE;
+      key.z_op = MALI_META_FS_COPY;
+   }
 #endif
 
    struct mali_meta_fs_push push = {
@@ -399,7 +408,7 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
       .rt_count = 1,
       .blit = &blit,
    };
-   d.rt[0] = (struct mali_fb_target){
+   const struct mali_fb_target t = {
       .image = img,
       .plane = plane,
       .level = level,
@@ -413,6 +422,13 @@ copy_to_afbc(struct mali_cmd_buffer *cmd, const struct mali_image *img, unsigned
       .store = true,
       .always_write = true,
    };
+#if PAN_ARCH < 9
+   if (depth) {
+      d.rt_count = 0;
+      d.z = t;
+   } else
+#endif
+      d.rt[0] = t;
    transfer_pass(cmd, &d);
    return;
 

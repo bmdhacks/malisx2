@@ -70,8 +70,8 @@ external_memory(const VkImageCreateInfo *info)
  * v9, v10 and v11. On a G57 at 2x upscaling, uncompressed render targets made
  * fragment-bound dumps 20-25 % slower than with AFBC.
  *
- * v7 has narrower rules of its own, colour attachments only
- * (v7_can_use_afbc).
+ * v7 has narrower rules of its own: colour attachments and single-plane
+ * 32-bit float depth (v7_can_use_afbc).
  */
 static bool
 afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
@@ -119,10 +119,12 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, un
 /*
  * The plane formats v7 AFBC takes here: 8-bit UNORM R, RG and RGBA (sRGB
  * as a flag on RGBA8), whose component order the v7 texture unit accepts
- * with AFBC as it is. pan_afbc_format at PAN_ARCH 7 accepts more (RGB565,
- * RGB5A1, RGBA4, RGB10A2, the BGR orders); those are left uncompressed
- * here. The BGR orders also need pan_texture_afbc_reswizzle, with the
- * sampler border colours swizzled to match (panvk_vX_sampler.c).
+ * with AFBC as it is, and Z32_FLOAT, which the depth writeback compresses
+ * as RGBA8 (pan_afbc_format). pan_afbc_format at PAN_ARCH 7 accepts more
+ * (RGB565, RGB5A1, RGBA4, RGB10A2, the BGR orders, Z16, Z24); those are
+ * left uncompressed here. The BGR orders also need
+ * pan_texture_afbc_reswizzle, with the sampler border colours swizzled to
+ * match (panvk_vX_sampler.c).
  */
 static bool
 v7_afbc_format(enum pipe_format f)
@@ -132,6 +134,7 @@ v7_afbc_format(enum pipe_format f)
    case PIPE_FORMAT_R8G8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_Z32_FLOAT:
       return true;
    default:
       return false;
@@ -141,23 +144,30 @@ v7_afbc_format(enum pipe_format f)
 /*
  * AFBC on v7 (panvk_image_can_use_mod and pan_mod_afbc_test_props at
  * PAN_ARCH 7, narrowed): a single-plane 2D colour attachment in a format
- * of v7_afbc_format, optimal tiling, single-sampled, one level and one
- * layer, at least half a header tile each way. Not for images whose bytes
- * are read or written uncompressed (storage, host transfer, external
- * memory, swapchain and Android native buffers), nor for mutable,
- * block-compatible or aliased ones (v7 cannot read an AFBC plane in
- * another format), nor for disjoint or sparse ones.
+ * of v7_afbc_format, or a D32_SFLOAT depth attachment, optimal tiling,
+ * single-sampled, one level and one layer, at least half a header tile
+ * each way. Not for images whose bytes are read or written uncompressed
+ * (storage, host transfer, external memory, swapchain and Android native
+ * buffers), nor for mutable, block-compatible or aliased ones (v7 cannot
+ * read an AFBC plane in another format), nor for disjoint or sparse ones.
+ *
+ * No depth/stencil format with a stencil plane: in v7's ZS CRC Extension
+ * the AFBC depth target's body pointer is the stencil target's base, so a
+ * pass cannot have both (gallium's panfrost_should_afbc refuses AFBC Z32
+ * on v7 for the same reason), and v7 has no AFBC stencil target.
  */
 static bool
 v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
                 const VkImageCreateInfo *info)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
-   if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
-       (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+   const bool depth = image->vk.format == VK_FORMAT_D32_SFLOAT;
+   const VkImageUsageFlags attachment =
+      depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   if (!(usage & attachment) ||
+       (usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
       return false;
-   if (image->plane_count != 1 || vk_format_is_depth_or_stencil(image->vk.format) ||
+   if (image->plane_count != 1 || (!depth && vk_format_is_depth_or_stencil(image->vk.format)) ||
        !v7_afbc_format(formats[0]))
       return false;
    if (image->vk.create_flags &

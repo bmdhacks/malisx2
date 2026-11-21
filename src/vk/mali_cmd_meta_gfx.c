@@ -300,6 +300,24 @@ query_copy_fs(nir_builder *b, const struct mali_meta_fs_key *key, nir_def *xy)
 }
 #endif
 
+#if PAN_ARCH < 9
+/* What v7's COPY, COPY_OUT and STORE read at sxy, as the uvec4 of a uint
+ * target: an AFBC source in its copy format, packed into the block's bits
+ * (mali_meta_copy_fmt), else texture `tex` as uint or the raw surface. */
+static nir_def *
+copy_src_bits(nir_builder *b, const struct mali_meta_fs_key *key, unsigned tex, nir_def *sxy,
+              nir_def *layer)
+{
+   if (key->copy_src_fmt) {
+      nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
+      return raw_to_uvec4(b,
+                          nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
+   }
+   return key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
+                            : copy_raw_load(b, key, sxy, layer);
+}
+#endif
+
 static nir_shader *
 build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
 {
@@ -332,7 +350,8 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
    need_area |= key->z_op == MALI_META_FS_CLEAR_IN_AREA ||
                 key->s_op == MALI_META_FS_CLEAR_IN_AREA;
 #if PAN_ARCH < 9
-   need_area |= key->z_op == MALI_META_FS_BLIT || key->s_op == MALI_META_FS_BLIT;
+   need_area |= key->z_op == MALI_META_FS_BLIT || key->s_op == MALI_META_FS_BLIT ||
+                key->z_op == MALI_META_FS_COPY;
 #endif
    if (need_area) {
       nir_def *area = push_load(b, 4, 32, offsetof(struct mali_meta_fs_push, area));
@@ -363,15 +382,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
          nir_def *sxy = nir_iadd(b, xy, delta);
          nir_push_if(b, inside);
-         nir_def *in;
-         if (key->copy_src_fmt) {
-            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
-            in = raw_to_uvec4(
-               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
-         } else {
-            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
-                                   : copy_raw_load(b, key, sxy, layer);
-         }
+         nir_def *in = copy_src_bits(b, key, tex, sxy, layer);
          nir_def *dxy =
             nir_iadd(b, xy, push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, store_delta)));
          nir_def *addr = surface_addr(
@@ -422,15 +433,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
           * the block's bits; an AFBC target takes them unpacked into its
           * own format (mali_meta_copy_fmt). Exact for these UNORM formats:
           * n / (2^k - 1) converts back to n. */
-         nir_def *in;
-         if (key->copy_src_fmt) {
-            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
-            in = raw_to_uvec4(
-               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
-         } else {
-            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
-                                   : copy_raw_load(b, key, sxy, layer);
-         }
+         nir_def *in = copy_src_bits(b, key, tex, sxy, layer);
          if (key->copy_dst_fmt)
             in = nir_format_unpack_rgba(b, nir_channel(b, in, 0),
                                         mali_meta_copy_fmt_pipe(key->copy_dst_fmt));
@@ -457,15 +460,7 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
          nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
          nir_def *sxy = nir_iadd(b, xy, delta);
          nir_push_if(b, inside);
-         nir_def *in;
-         if (key->copy_src_fmt) {
-            nir_def *t = fetch(b, tex, sxy, layer, nir_type_float32);
-            in = raw_to_uvec4(
-               b, nir_format_pack_rgba(b, mali_meta_copy_fmt_pipe(key->copy_src_fmt), t));
-         } else {
-            in = key->copy_src_tex ? fetch(b, tex, sxy, layer, nir_type_uint32)
-                                   : copy_raw_load(b, key, sxy, layer);
-         }
+         nir_def *in = copy_src_bits(b, key, tex, sxy, layer);
          nir_push_else(b, NULL);
          nir_def *zero = nir_imm_zero(b, 4, 32);
          nir_pop_if(b, NULL);
@@ -487,6 +482,21 @@ build_fs(struct mali_device *dev, const struct mali_meta_fs_key *key)
       store_out(b, FRAG_RESULT_DEPTH, glsl_float_type(),
                 blit_zs(b, tex, pos, xy, layer, inside, nir_type_float32));
       tex += 2;
+   } else if (key->z_op == MALI_META_FS_COPY) {
+      /* Into an AFBC depth target (copy format R32F): inside the area the
+       * source block's bits are the depth, outside the target keeps its
+       * own. An if, not a select: a raw load outside the area could read
+       * anything. */
+      nir_def *delta = push_load(b, 2, 32, offsetof(struct mali_meta_fs_push, copy_delta));
+      nir_def *sxy = nir_iadd(b, xy, delta);
+      nir_push_if(b, inside);
+      nir_def *in = nir_channel(b, copy_src_bits(b, key, tex, sxy, layer), 0);
+      nir_push_else(b, NULL);
+      nir_def *out =
+         nir_channel(b, fetch(b, tex + (key->copy_src_tex ? 1 : 0), xy, layer, nir_type_float32), 0);
+      nir_pop_if(b, NULL);
+      store_out(b, FRAG_RESULT_DEPTH, glsl_float_type(), nir_if_phi(b, in, out));
+      tex += key->copy_src_tex ? 2 : 1;
    } else if (key->z_op != MALI_META_FS_NONE) {
 #else
    if (key->z_op != MALI_META_FS_NONE) {

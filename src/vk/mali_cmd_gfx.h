@@ -602,7 +602,8 @@ enum mali_meta_fs_op {
                                 * after the colour ones */
    MALI_META_FS_COPY,          /* raw copy into an AFBC target read as a
                                 * uint format of its block size (on v7 in
-                                * its copy format, copy_dst_fmt): inside the
+                                * its copy format, copy_dst_fmt; on v7 also
+                                * a z_op, into an AFBC depth target): inside the
                                 * area, the source block at the fragment's
                                 * position + copy_delta (texture 0 when
                                 * copy_src_tex, else a raw surface in memory);
@@ -659,13 +660,15 @@ struct mali_meta_fs_key {
  * plane's own as on v9 and v11: a copy into or out of an AFBC plane reads
  * or writes it in its own format (sRGB as UNORM) and the shader converts
  * to and from the block's bits. RAW: no conversion. One per format v7
- * makes AFBC (mali_image.c v7_afbc_format).
+ * makes AFBC (mali_image.c v7_afbc_format); the Z32_FLOAT depth plane is
+ * R32F, read as a depth texture and written as the fragment's depth.
  */
 enum mali_meta_copy_fmt {
    MALI_META_COPY_FMT_RAW = 0,
    MALI_META_COPY_FMT_R8,
    MALI_META_COPY_FMT_R8G8,
    MALI_META_COPY_FMT_R8G8B8A8,
+   MALI_META_COPY_FMT_R32F,
    MALI_META_COPY_FMT_COUNT,
 };
 
@@ -677,6 +680,7 @@ mali_meta_copy_fmt_pipe(enum mali_meta_copy_fmt f)
    case MALI_META_COPY_FMT_R8: return PIPE_FORMAT_R8_UNORM;
    case MALI_META_COPY_FMT_R8G8: return PIPE_FORMAT_R8G8_UNORM;
    case MALI_META_COPY_FMT_R8G8B8A8: return PIPE_FORMAT_R8G8B8A8_UNORM;
+   case MALI_META_COPY_FMT_R32F: return PIPE_FORMAT_R32_FLOAT;
    default: return PIPE_FORMAT_NONE;
    }
 }

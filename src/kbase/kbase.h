@@ -277,6 +277,9 @@ struct mali_kbase {
    uint32_t jm_atom_stride;
    int jm_probe_errno;
    uint32_t jm_probe_event;
+   /* Job manager only: the errno of the last JOB_SUBMIT the kernel
+    * refused, for the device-lost message. */
+   int jm_submit_errno;
    /* Job manager only: MEM_JIT_INIT failed with ENOMEM (no room for the
     * zone in the GPU's VA) and the context runs without a JIT zone. */
    bool jm_no_jit;
@@ -589,7 +592,8 @@ const char *mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf
  * kb_jm_atom; unless the context takes that struct as it is (jm_atom_size
  * and jm_atom_stride 64), each is copied on the way in: its first
  * jm_atom_size bytes from seq_nr (base_jd_atom) or from jc
- * (base_jd_atom_v2), then zeros up to jm_atom_stride.
+ * (base_jd_atom_v2), then zeros up to jm_atom_stride. On failure
+ * jm_submit_errno holds the kernel's errno.
  */
 enum mali_kbase_result
 mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsigned n);

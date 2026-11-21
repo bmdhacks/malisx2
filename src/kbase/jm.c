@@ -138,6 +138,7 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
          batch = MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT;
       long ret = jm_job_submit(kb, atoms + off, batch, kb->jm_atom_size, kb->jm_atom_stride);
       if (ret < 0) {
+         kb->jm_submit_errno = (int)-ret;
          KB_LOG(kb, "JOB_SUBMIT of %u atoms (offset %u of %u, stride %u, kernel UK %u.%u) "
                     "failed: %s",
                 batch, off, n, kb->jm_atom_stride, kb->uk_major, kb->uk_minor,

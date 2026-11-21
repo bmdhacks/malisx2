@@ -523,8 +523,14 @@ flush(struct mali_device *dev)
    memset(b->slot_last, 0, sizeof(b->slot_last));
    if (r != MALI_KBASE_SUCCESS) {
       /* Some atoms of the call may be in the kernel and some not; there
-       * is no way back from that. */
-      jm_set_fault(jd, "JOB_SUBMIT failed: %s", mali_kbase_result_str(r));
+       * is no way back from that. The device-lost line is logged at
+       * error level, so it carries the errno and the stride itself. */
+      const struct mali_kbase *kb = jd->kb;
+      jm_set_fault(jd, "JOB_SUBMIT failed: %s (%s; stride %u, kernel UK %u.%u)",
+                   mali_kbase_result_str(r),
+                   r == MALI_KBASE_ERROR_INVALID_ARGUMENT ? "no kernel call"
+                                                          : strerror(kb->jm_submit_errno),
+                   kb->jm_atom_stride, kb->uk_major, kb->uk_minor);
       return VK_ERROR_DEVICE_LOST;
    }
    return VK_SUCCESS;

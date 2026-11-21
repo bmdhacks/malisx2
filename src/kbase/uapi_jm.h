@@ -51,9 +51,11 @@
  *     kb_jm_atom without its leading seq_nr: 56 bytes from 11.19
  *     (renderpass_id added), 48 bytes before that (no renderpass_id;
  *     jit_id[2] is compat_core_req there, which the kernel no longer
- *     reads; jobslot is padding before 11.17). The stride check is exact,
- *     so each kernel accepts its own size and nothing else; base_jd_atom
- *     (64 bytes) arrives in 11.22.
+ *     reads; jobslot is padding before 11.17). A stock kernel's stride
+ *     check is exact, so each accepts its own size and nothing else;
+ *     base_jd_atom (64 bytes) arrives in 11.22. Some vendor kernels add a
+ *     field to the end of the atom and take 8 bytes more (see
+ *     KB_JM_IOCTL_JOB_SUBMIT).
  *   - MEM_JIT_INIT has no phys_pages before 11.20: 16 bytes, so a
  *     different ioctl number (KB_JM_IOCTL_MEM_JIT_INIT_11_5). Before 11.14
  *     group_id is padding, which we leave 0.
@@ -72,9 +74,8 @@
  *
  * Every other ioctl we use has the same number and size from 11.7 to
  * 11.36 (checked against the r12p0 and r20p0 kernels' mali_kbase_ioctl.h).
- * The MediaTek 72-byte atom layout is not a function of the minor and is
- * found by the probe in mali_kbase_create, not by this check; the probe
- * only runs from 11.22. */
+ * A vendor field on the end of the atom is not a function of the minor
+ * and is found by the probe in mali_kbase_create, not by this check. */
 #define KB_JM_UK_VERSION_MAJOR 11
 #define KB_JM_UK_VERSION_MINOR 36
 #define KB_JM_UK_MIN_MINOR     7
@@ -120,9 +121,8 @@
 struct kb_jm_job_submit {
    uint64_t addr;     /* user pointer to an array of struct kb_jm_atom */
    uint32_t nr_atoms;
-   uint32_t stride;   /* sizeof(struct kb_jm_atom), or on a kernel with the
-                         frame-number field sizeof(struct
-                         kb_jm_atom_frame_nr); see below */
+   uint32_t stride;   /* the kernel's atom size: sizeof(struct kb_jm_atom)
+                         on a stock kernel from 11.22; see below */
 };
 
 #define KB_JM_IOCTL_JOB_SUBMIT _IOW(KB_IOCTL_TYPE, 2, struct kb_jm_job_submit)
@@ -200,8 +200,7 @@ struct kb_jm_dep {
  * struct base_jd_atom ("v3": base_jd_atom_v2 plus a leading seq_nr), the
  * 64-byte layout this driver builds and submits on stock kernels, with
  * every offset below checked against both the r40p0 and r44p1 kernel
- * headers' structs. kb_jm_atom_frame_nr below is the same atom as
- * MediaTek kernels with the frame-number field want it.
+ * headers' structs.
  */
 struct kb_jm_atom {
    uint64_t seq_nr;
@@ -233,14 +232,14 @@ struct kb_jm_atom {
  *
  * The kernel copies frame_nr into its atom and hands it, with the context
  * id and an atom serial, to the SoC's bandwidth-monitor shared memory when
- * the atom starts on job slot 0. Nothing in the job path reads it.
+ * the atom starts on job slot 0. Nothing in the job path reads it, so the
+ * driver submits it as 0.
+ *
+ * Kernels before 11.22 with a field like it take base_jd_atom_v2 plus 8
+ * bytes and refuse the stock size with EINVAL: MediaTek's (frame_nr) and,
+ * it is thought, Huawei Kirin's (a throttle hint field). mali_kbase_create tries the stock size, then that
+ * plus 8, and refuses a kernel that takes neither.
  */
-struct kb_jm_atom_frame_nr {
-   struct kb_jm_atom atom;
-   uint32_t frame_nr;
-   uint32_t tail;          /* the struct's trailing alignment padding; the
-                              kernel copies it but does not check it */
-};
 
 #define KB_JM_PRIO_MEDIUM   0
 #define KB_JM_PRIO_HIGH     1
@@ -395,9 +394,6 @@ _Static_assert(offsetof(struct kb_jm_atom, core_req) + 4 - 8 == 48,
 
 KB_CHECK_SIZE(struct kb_ioctl_mem_jit_init_11_5, 16);
 KB_CHECK_OFF(struct kb_ioctl_mem_jit_init_11_5, group_id, 10);
-
-KB_CHECK_SIZE(struct kb_jm_atom_frame_nr, 72);
-KB_CHECK_OFF(struct kb_jm_atom_frame_nr, frame_nr, 64);
 
 KB_CHECK_SIZE(struct kb_jm_event, 24);
 KB_CHECK_OFF(struct kb_jm_event, atom_number, 4);

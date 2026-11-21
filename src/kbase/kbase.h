@@ -232,18 +232,6 @@ enum mali_kbase_frontend {
    MALI_KBASE_FRONTEND_JM = 1,
 };
 
-/*
- * The atom layout JOB_SUBMIT takes on a job-manager context (uapi_jm.h,
- * struct kb_jm_atom_frame_nr and KB_JM_UK_MIN_MINOR, say how they differ).
- */
-enum mali_kbase_jm_atom_layout {
-   MALI_KBASE_JM_ATOM_STOCK = 0,  /* base_jd_atom, stride 64 (UK 11.22 on) */
-   MALI_KBASE_JM_ATOM_FRAME_NR,   /* base_jd_atom + u32 frame_nr, stride 72 */
-   MALI_KBASE_JM_ATOM_V2,         /* base_jd_atom_v2, stride 56 (UK 11.19 to 11.21) */
-   MALI_KBASE_JM_ATOM_V2_48,      /* base_jd_atom_v2 without renderpass_id,
-                                     stride 48 (UK 11.7 to 11.18) */
-};
-
 typedef void (*mali_kbase_log_fn)(void *user, const char *msg);
 
 struct mali_kbase_create_info {
@@ -276,11 +264,17 @@ struct mali_kbase {
     * kept only so mali_kbase_destroy can munmap it. Job manager only; NULL
     * on CSF. */
    void *jm_tracking_page;
-   /* Job manager only: the atom layout mali_kbase_create's probe found,
-    * and what the probe saw. jm_probe_errno is the errno of the stride-72
-    * JOB_SUBMIT (0: accepted); jm_probe_event the event code its atom
-    * completed with when it was accepted. */
-   enum mali_kbase_jm_atom_layout jm_atom_layout;
+   /* Job manager only: how JOB_SUBMIT takes an atom, as mali_kbase_create
+    * found it. Each atom goes in as the first jm_atom_size bytes of the
+    * kernel's struct, which the minor picks (base_jd_atom_v2, struct
+    * kb_jm_atom from jc on: 48 bytes before UK 11.19, 56 to 11.21;
+    * base_jd_atom, all 64 bytes, from 11.22), then zeros up to
+    * jm_atom_stride: the field some vendor kernels add to the end of the
+    * atom (MediaTek's frame_nr). jm_probe_errno is the errno of the last
+    * stride the kernel refused (0: none was); jm_probe_event the event code
+    * the probe atom completed with, when one was submitted. */
+   uint32_t jm_atom_size;
+   uint32_t jm_atom_stride;
    int jm_probe_errno;
    uint32_t jm_probe_event;
    /* Job manager only: MEM_JIT_INIT failed with ENOMEM (no room for the
@@ -323,14 +317,16 @@ struct mali_kbase {
  *      page (BASE_MEM_MAP_TRACKING_HANDLE, required before any
  *      allocation on this kernel), GET_GPUPROPS, MEM_EXEC_INIT,
  *      MEM_JIT_INIT (trim level 0; we do not use JIT memory, see
- *      mali_kbase_alloc; the 16-byte variant below 11.20). Below 11.22
- *      the minor alone picks the atom layout (base_jd_atom_v2, 56 bytes
- *      from 11.19, 48 before). From 11.22 one JOB_SUBMIT of a
- *      dependency-only atom at stride 72 picks it: EINVAL means a stock
- *      kernel (64-byte base_jd_atom); acceptance means the MediaTek
- *      frame_nr layout, and the atom's completion event is read back
+ *      mali_kbase_alloc; the 16-byte variant below 11.20). Then
+ *      JOB_SUBMIT of a dependency-only atom finds the atom stride (jm.c,
+ *      kb_jm_probe_atom_layout): below 11.22 the minor's base_jd_atom_v2
+ *      size (48 bytes before 11.19, 56 from it), then that plus 8 (a
+ *      vendor field on the end of the atom); from 11.22, 72 (MediaTek's
+ *      frame_nr) and, on EINVAL, the stock 64 without a probe. An
+ *      accepted probe atom's completion event is read back and checked
  *      before returning, so no event or atom number is left over for the
- *      caller. An ENOMEM answer to MEM_JIT_INIT, from a GPU VA too narrow
+ *      caller. If no stride is accepted, INCOMPATIBLE_KERNEL. An ENOMEM
+ *      answer to MEM_JIT_INIT, from a GPU VA too narrow
  *      for the zone, leaves the context without one (jm_no_jit).
  *   3. If neither answer matches, INCOMPATIBLE_KERNEL, logging both
  *      refusals.
@@ -590,10 +586,10 @@ const char *mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf
  * else is done between them (no per-edge round trip — the whole
  * dependency graph is submitted with pre_dep already resolved by the
  * caller). n may be 0 (no-op). The atoms are always built as struct
- * kb_jm_atom; on a MALI_KBASE_JM_ATOM_FRAME_NR context each is copied into
- * the 72-byte layout (frame_nr 0) on the way in, and on the two
- * base_jd_atom_v2 layouts the atom without seq_nr (and, at 48 bytes,
- * without renderpass_id) is what goes in.
+ * kb_jm_atom; unless the context takes that struct as it is (jm_atom_size
+ * and jm_atom_stride 64), each is copied on the way in: its first
+ * jm_atom_size bytes from seq_nr (base_jd_atom) or from jc
+ * (base_jd_atom_v2), then zeros up to jm_atom_stride.
  */
 enum mali_kbase_result
 mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsigned n);

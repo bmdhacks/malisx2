@@ -99,50 +99,48 @@ mali_kbase_jm_atom_ids_free_count(const struct mali_kbase_jm_atom_ids *ids)
  * kernel memory. Do not raise this. */
 #define MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT 256
 
+/* One JOB_SUBMIT call of n <= 256 atoms, each as the first `size` bytes of
+ * the kernel's atom struct followed by zeros up to `stride`. size 64 is
+ * base_jd_atom, which is struct kb_jm_atom; a smaller size is
+ * base_jd_atom_v2, which starts at jc. Returns the ioctl's result. */
+static long
+jm_job_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsigned n,
+              unsigned size, unsigned stride)
+{
+   struct kb_jm_job_submit s = {
+      .addr = (uint64_t)(uintptr_t)atoms,
+      .nr_atoms = n,
+      .stride = stride,
+   };
+   const bool as_is = size == sizeof(struct kb_jm_atom) && stride == size;
+   const unsigned from = size == sizeof(struct kb_jm_atom) ? 0 : offsetof(struct kb_jm_atom, jc);
+   /* At most 18 KiB (256 atoms of 72 bytes), only when the kernel's atom
+    * is not struct kb_jm_atom as it is. */
+   uint8_t packed[as_is ? 1 : n * stride];
+   if (!as_is) {
+      memset(packed, 0, n * stride);
+      for (unsigned i = 0; i < n; i++)
+         memcpy(packed + i * stride, (const uint8_t *)&atoms[i] + from, size);
+      s.addr = (uint64_t)(uintptr_t)packed;
+   }
+   return kb_ioctl(kb, KB_JM_IOCTL_JOB_SUBMIT, &s);
+}
+
 enum mali_kbase_result
 mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsigned n)
 {
    if (!kb || (n && !atoms))
       return MALI_KBASE_ERROR_INVALID_ARGUMENT;
 
-   const bool frame_nr = kb->jm_atom_layout == MALI_KBASE_JM_ATOM_FRAME_NR;
-   /* base_jd_atom_v2 is struct kb_jm_atom from jc on, cut at v2_size. */
-   const unsigned v2_size = kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2      ? 56
-                            : kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2_48 ? 48
-                                                                            : 0;
    for (unsigned off = 0; off < n; off += MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT) {
       unsigned batch = n - off;
       if (batch > MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT)
          batch = MALI_KBASE_JM_MAX_ATOMS_PER_SUBMIT;
-
-      struct kb_jm_job_submit s = {
-         .addr = (uint64_t)(uintptr_t)(atoms + off),
-         .nr_atoms = batch,
-         .stride = sizeof(struct kb_jm_atom),
-      };
-      /* 18 KiB on the stack for a full batch, only on kernels with the
-       * frame-number field. */
-      struct kb_jm_atom_frame_nr wide[frame_nr ? batch : 1];
-      if (frame_nr) {
-         memset(wide, 0, sizeof(wide));
-         for (unsigned i = 0; i < batch; i++)
-            wide[i].atom = atoms[off + i];
-         s.addr = (uint64_t)(uintptr_t)wide;
-         s.stride = sizeof(struct kb_jm_atom_frame_nr);
-      }
-      /* At most 14 KiB, only on kernels before 11.22. */
-      uint8_t narrow[v2_size ? batch * v2_size : 1];
-      if (v2_size) {
-         for (unsigned i = 0; i < batch; i++)
-            memcpy(narrow + i * v2_size, (const uint8_t *)&atoms[off + i].jc, v2_size);
-         s.addr = (uint64_t)(uintptr_t)narrow;
-         s.stride = v2_size;
-      }
-      long ret = kb_ioctl(kb, KB_JM_IOCTL_JOB_SUBMIT, &s);
+      long ret = jm_job_submit(kb, atoms + off, batch, kb->jm_atom_size, kb->jm_atom_stride);
       if (ret < 0) {
          KB_LOG(kb, "JOB_SUBMIT of %u atoms (offset %u of %u, stride %u, kernel UK %u.%u) "
                     "failed: %s",
-                batch, off, n, (unsigned)s.stride, kb->uk_major, kb->uk_minor,
+                batch, off, n, kb->jm_atom_stride, kb->uk_major, kb->uk_minor,
                 strerror((int)-ret));
          return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
       }
@@ -164,48 +162,16 @@ mali_kbase_jm_submit(struct mali_kbase *kb, const struct kb_jm_atom *atoms, unsi
  * pending by the time the ioctl returns; this only bounds the wait. */
 #define PROBE_EVENT_TIMEOUT_MS 1000
 
-enum mali_kbase_result
-kb_jm_probe_atom_layout(struct mali_kbase *kb)
+/* The bytes a vendor field on the end of the atom adds: MediaTek's u32
+ * frame_nr, rounded up to the struct's 8-byte alignment. */
+#define VENDOR_TAIL 8
+
+/* Reads back the event of the probe atom the kernel accepted at the
+ * context's stride, and checks that the kernel read the atom's fields
+ * where we put them. */
+static enum mali_kbase_result
+probe_event(struct mali_kbase *kb)
 {
-   /* Before 11.22 the kernel takes base_jd_atom_v2 only and its size
-    * follows from the minor (uapi_jm.h). The frame_nr variant is only
-    * known on 11.22 and later, so nothing is probed. */
-   if (kb->uk_minor < KB_JM_UK_ATOM_V3_MINOR) {
-      kb->jm_atom_layout = kb->uk_minor >= KB_JM_UK_ATOM_RP_MINOR ? MALI_KBASE_JM_ATOM_V2
-                                                                  : MALI_KBASE_JM_ATOM_V2_48;
-      kb->jm_probe_errno = 0;
-      return MALI_KBASE_SUCCESS;
-   }
-
-   struct kb_jm_atom_frame_nr probe;
-   memset(&probe, 0, sizeof(probe));
-   probe.atom.atom_number = PROBE_ATOM_NUMBER;
-   probe.atom.prio = KB_JM_PRIO_MEDIUM;
-   probe.atom.core_req = KB_JM_REQ_DEP;
-   probe.atom.udata[0] = PROBE_UDATA0;
-   probe.atom.udata[1] = PROBE_UDATA1;
-
-   struct kb_jm_job_submit s = {
-      .addr = (uint64_t)(uintptr_t)&probe,
-      .nr_atoms = 1,
-      .stride = sizeof(probe),
-   };
-   long ret = kb_ioctl(kb, KB_JM_IOCTL_JOB_SUBMIT, &s);
-   if (ret == -EINVAL) {
-      /* The stride check comes before any atom is read: nothing was
-       * submitted, nothing will complete. */
-      kb->jm_atom_layout = MALI_KBASE_JM_ATOM_STOCK;
-      kb->jm_probe_errno = EINVAL;
-      return MALI_KBASE_SUCCESS;
-   }
-   if (ret < 0) {
-      KB_LOG(kb, "JOB_SUBMIT of the atom-layout probe failed: %s", strerror((int)-ret));
-      return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
-   }
-
-   kb->jm_atom_layout = MALI_KBASE_JM_ATOM_FRAME_NR;
-   kb->jm_probe_errno = 0;
-
    struct kb_jm_event ev;
    unsigned n = 0;
    const int slice = 50;
@@ -221,9 +187,9 @@ kb_jm_probe_atom_layout(struct mali_kbase *kb)
    if (!n) {
       /* Atom 1 would still be in flight in the kernel and its event
        * would turn up later as one nobody submitted. */
-      KB_LOG(kb, "the kernel accepted a 72-byte atom but posted no event for it "
+      KB_LOG(kb, "the kernel accepted a %u-byte atom but posted no event for it "
                  "within %d ms; refusing the device",
-             PROBE_EVENT_TIMEOUT_MS);
+             kb->jm_atom_stride, PROBE_EVENT_TIMEOUT_MS);
       return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
    }
    kb->jm_probe_event = ev.event_code;
@@ -231,9 +197,9 @@ kb_jm_probe_atom_layout(struct mali_kbase *kb)
        ev.udata[1] != PROBE_UDATA1) {
       /* Accepted, but not read where we put the fields: a layout we do
        * not know. Submitting real work would run garbage. */
-      KB_LOG(kb, "the kernel accepted a 72-byte atom but returned atom %u udata "
+      KB_LOG(kb, "the kernel accepted a %u-byte atom but returned atom %u udata "
                  "0x%llx 0x%llx (event 0x%x); unknown atom layout, refusing the device",
-             ev.atom_number, (unsigned long long)ev.udata[0],
+             kb->jm_atom_stride, ev.atom_number, (unsigned long long)ev.udata[0],
              (unsigned long long)ev.udata[1], ev.event_code);
       return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
    }
@@ -244,25 +210,85 @@ kb_jm_probe_atom_layout(struct mali_kbase *kb)
    return MALI_KBASE_SUCCESS;
 }
 
+enum mali_kbase_result
+kb_jm_probe_atom_layout(struct mali_kbase *kb)
+{
+   /* The minor picks the struct (uapi_jm.h, KB_JM_UK_MIN_MINOR); the
+    * stride is that struct's size or, on a kernel with a vendor field on
+    * the end of the atom, that plus VENDOR_TAIL. Below 11.22 the stock
+    * kernels check the size exactly and a vendor kernel refuses it, so
+    * the stock size goes first.
+    *
+    * From 11.22 the vendor stride (72) goes first: MediaTek's frame_nr
+    * kernels also accept 64 but read it as base_jd_atom_v2 + frame_nr, a
+    * stock atom 8 bytes off. A stock kernel refuses 72, which settles it
+    * at 64 without submitting anything. */
+   const unsigned v2_from = offsetof(struct kb_jm_atom, jc);
+   const unsigned size = kb->uk_minor >= KB_JM_UK_ATOM_V3_MINOR ? sizeof(struct kb_jm_atom)
+                         : kb->uk_minor >= KB_JM_UK_ATOM_RP_MINOR
+                            ? sizeof(struct kb_jm_atom) - v2_from
+                            : offsetof(struct kb_jm_atom, renderpass_id) - v2_from;
+   const bool v3 = size == sizeof(struct kb_jm_atom);
+   const unsigned strides[2] = {v3 ? size + VENDOR_TAIL : size, v3 ? size : size + VENDOR_TAIL};
+
+   struct kb_jm_atom probe;
+   memset(&probe, 0, sizeof(probe));
+   probe.atom_number = PROBE_ATOM_NUMBER;
+   probe.prio = KB_JM_PRIO_MEDIUM;
+   probe.core_req = KB_JM_REQ_DEP;
+   probe.udata[0] = PROBE_UDATA0;
+   probe.udata[1] = PROBE_UDATA1;
+
+   kb->jm_atom_size = size;
+   kb->jm_probe_errno = 0;
+   for (unsigned i = 0; i < 2; i++) {
+      kb->jm_atom_stride = strides[i];
+      long ret = jm_job_submit(kb, &probe, 1, size, strides[i]);
+      if (ret == -EINVAL) {
+         /* The stride check comes before any atom is read: nothing was
+          * submitted, nothing will complete. */
+         kb->jm_probe_errno = EINVAL;
+         if (v3) {
+            kb->jm_atom_stride = size;
+            return MALI_KBASE_SUCCESS;
+         }
+         continue;
+      }
+      if (ret < 0) {
+         KB_LOG(kb, "JOB_SUBMIT of the atom-layout probe at stride %u failed: %s", strides[i],
+                strerror((int)-ret));
+         return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
+      }
+      return probe_event(kb);
+   }
+   KB_LOG(kb, "the kernel (UK %u.%u) refused a %u-byte atom at stride %u and at stride %u (%s); "
+              "unknown atom layout, refusing the device",
+          kb->uk_major, kb->uk_minor, size, strides[0], strides[1], strerror(EINVAL));
+   return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
+}
+
 const char *
 mali_kbase_jm_atom_layout_str(const struct mali_kbase *kb, char *buf, size_t size)
 {
-   if (kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2 ||
-       kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2_48) {
-      snprintf(buf, size, "%u-byte base_jd_atom_v2 (UK %u.%u, before base_jd_atom): not probed",
-               kb->jm_atom_layout == MALI_KBASE_JM_ATOM_V2 ? 56u : 48u, kb->uk_major,
-               kb->uk_minor);
-   } else if (kb->jm_atom_layout == MALI_KBASE_JM_ATOM_FRAME_NR) {
+   const char *code = kb->jm_probe_event == KB_JM_EVENT_DONE         ? " (done)"
+                      : kb->jm_probe_event == KB_JM_EVENT_TERMINATED ? " (terminated)"
+                                                                     : "";
+   if (kb->jm_atom_size == sizeof(struct kb_jm_atom) && kb->jm_atom_stride == kb->jm_atom_size) {
+      /* The one layout taken without a probe atom. */
+      snprintf(buf, size, "64-byte atoms (stock kbase): the kernel refused stride 72 (%s)",
+               strerror(kb->jm_probe_errno));
+   } else if (kb->jm_atom_size == sizeof(struct kb_jm_atom)) {
       snprintf(buf, size,
                "72-byte atoms with frame_nr (MediaTek kbase): the kernel accepted "
                "stride 72, probe atom completed with 0x%x%s",
-               kb->jm_probe_event,
-               kb->jm_probe_event == KB_JM_EVENT_DONE ? " (done)"
-               : kb->jm_probe_event == KB_JM_EVENT_TERMINATED ? " (terminated)"
-                                                              : "");
+               kb->jm_probe_event, code);
    } else {
-      snprintf(buf, size, "64-byte atoms (stock kbase): the kernel refused stride 72 (%s)",
-               strerror(kb->jm_probe_errno));
+      snprintf(buf, size,
+               "%u-byte atoms: %u-byte base_jd_atom_v2%s (UK %u.%u), "
+               "probe atom completed with 0x%x%s",
+               kb->jm_atom_stride, kb->jm_atom_size,
+               kb->jm_atom_stride > kb->jm_atom_size ? " and a vendor field" : "", kb->uk_major,
+               kb->uk_minor, kb->jm_probe_event, code);
    }
    return buf;
 }

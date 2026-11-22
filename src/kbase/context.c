@@ -11,7 +11,7 @@
  *   blob step                          here
  *   2  open + VERSION_CHECK            open, version handshake
  *   3  SET_FLAGS                       SET_FLAGS
- *   4  tracking page (UK < 1.18)       not needed at UK 1.20
+ *   4  tracking page (UK < 1.18)       not needed from UK 1.18 (our floor)
  *   5  GET_GPUPROPS                    GET_GPUPROPS + decode
  *   7  CS_GET_GLB_IFACE (twice)        same
  *   8  GPU ID vs supported list        left to the caller
@@ -57,14 +57,16 @@ open_device(struct mali_kbase *kb, const char *path)
 }
 
 /*
- * We propose UK 1.20, the r44p1 CSF interface, and accept only 1.20 back.
- * The kernel answers min(its minor, ours) when the major matches and its
- * own version otherwise, so "1.20" means "a CSF kernel at 1.20 or newer"
- * (the RG 477V is 1.21). The blob accepts older minors and switches ioctl
- * variants for them; we implement only the 1.20 variants (MEM_ALLOC_EX,
- * the 112-byte group create, tiler heap init with buf_desc_va, no
- * tracking page), so an older kernel is refused here, loudly, instead of
- * failing later in some ioctl.
+ * We propose UK 1.20, the r44p1 CSF interface, and accept 1.18 to 1.20
+ * back. The kernel answers min(its minor, ours) when the major matches and
+ * its own version otherwise, so "1.20" means "a CSF kernel at 1.20 or
+ * newer" (the RG 477V is 1.21). Like the blob, we switch ioctl variants on
+ * the negotiated minor; from 1.18 the only one that differs is queue group
+ * creation (the 112-byte form from 1.19, the 40-byte one below; see
+ * uapi.h). MEM_ALLOC_EX (1.9) and tiler heap init with buf_desc_va (1.14)
+ * are older than the floor. Below 1.18 a context must map the tracking
+ * page before it allocates, which we do not do, so an older kernel is
+ * refused here, loudly, instead of failing later in some ioctl.
  *
  * If that check fails with EPERM, the kernel is a job-manager one: it
  * reserves this ioctl number and answers it with EPERM without touching
@@ -93,7 +95,8 @@ version_handshake(struct mali_kbase *kb)
       .minor = KB_UK_VERSION_MINOR,
    };
    long ret = kb_ioctl(kb, KB_IOCTL_VERSION_CHECK, &vc);
-   if (ret >= 0 && vc.major == KB_UK_VERSION_MAJOR && vc.minor == KB_UK_VERSION_MINOR) {
+   if (ret >= 0 && vc.major == KB_UK_VERSION_MAJOR && vc.minor >= KB_UK_MIN_MINOR &&
+       vc.minor <= KB_UK_VERSION_MINOR) {
       kb->frontend = MALI_KBASE_FRONTEND_CSF;
       kb->uk_major = vc.major;
       kb->uk_minor = vc.minor;
@@ -110,8 +113,9 @@ version_handshake(struct mali_kbase *kb)
    }
    if (ret >= 0) {
       KB_LOG(kb, "refusing device: kernel answered UK %u.%u, this driver "
-                 "speaks only UK %u.%u (kbase r44p1)",
-             vc.major, vc.minor, KB_UK_VERSION_MAJOR, KB_UK_VERSION_MINOR);
+                 "speaks UK %u.%u to %u.%u (kbase r44p1 and older)",
+             vc.major, vc.minor, KB_UK_VERSION_MAJOR, KB_UK_MIN_MINOR, KB_UK_VERSION_MAJOR,
+             KB_UK_VERSION_MINOR);
       return MALI_KBASE_ERROR_INCOMPATIBLE_KERNEL;
    }
 

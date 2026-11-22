@@ -5,7 +5,8 @@
 
 /*
  * The kbase kernel interface (Arm's Mali kernel driver, /dev/mali<N>), CSF
- * flavour, UK version 1.20 (DDK r44p1): the ioctl argument structures,
+ * flavour, UK version 1.20 (DDK r44p1), plus the one 1.18 variant we use
+ * on older kernels: the ioctl argument structures,
  * ioctl numbers and flag values this driver uses.
  *
  * Licensing choice: these are our own definitions, written from the r44p1
@@ -29,9 +30,19 @@
 #include <linux/ioctl.h>
 
 /* The UK (user-kernel) interface version we speak. The kernel answers a
- * VERSION_CHECK with min(its minor, our minor) for major 1. */
+ * VERSION_CHECK with min(its minor, our minor) for major 1. We propose 1.20
+ * and accept 1.18 and up back (KB_UK_MIN_MINOR). Between 1.18 and 1.20 the
+ * structures and ioctl numbers we use are the same except for queue group
+ * creation, whose 112-byte form is new in 1.19 (KB_UK_GROUP_CREATE_NE_MINOR);
+ * below that we issue the older 40-byte form. 1.20's only other change, the
+ * refusal of file operations on an inherited fd, does not affect us: we
+ * open with O_CLOEXEC and never use the fd from a child. Below 1.18 a
+ * context needs the tracking page mapped before any allocation, which we
+ * do not do, so 1.18 is the floor. */
 #define KB_UK_VERSION_MAJOR 1
 #define KB_UK_VERSION_MINOR 20
+#define KB_UK_MIN_MINOR 18
+#define KB_UK_GROUP_CREATE_NE_MINOR 19
 
 #define KB_IOCTL_TYPE 0x80
 
@@ -239,6 +250,29 @@ union kb_ioctl_cs_queue_group_create {
    } out;
 };
 
+/* UK 1.6 to 1.18 form (also nr 58; the ioctl number differs by its size).
+ * Kernels at 1.19 and newer still accept it. */
+union kb_ioctl_cs_queue_group_create_1_18 {
+   struct {
+      uint64_t tiler_mask;
+      uint64_t fragment_mask;
+      uint64_t compute_mask;
+      uint8_t cs_min;
+      uint8_t priority;
+      uint8_t tiler_max;
+      uint8_t fragment_max;
+      uint8_t compute_max;
+      uint8_t csi_handlers;
+      uint8_t padding[2];
+      uint64_t dvs_buf;
+   } in;
+   struct {
+      uint8_t group_handle;
+      uint8_t padding[3];
+      uint32_t group_uid;
+   } out;
+};
+
 struct kb_ioctl_cs_queue_group_term {
    uint8_t group_handle;
    uint8_t padding[7];
@@ -379,6 +413,8 @@ union kb_ioctl_get_cpu_gpu_timeinfo {
 #define KB_IOCTL_CS_CPU_QUEUE_DUMP  _IOW(KB_IOCTL_TYPE, 53, struct kb_ioctl_cs_cpu_queue_info)
 #define KB_IOCTL_CS_QUEUE_GROUP_CREATE \
    _IOWR(KB_IOCTL_TYPE, 58, union kb_ioctl_cs_queue_group_create)
+#define KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18 \
+   _IOWR(KB_IOCTL_TYPE, 58, union kb_ioctl_cs_queue_group_create_1_18)
 #define KB_IOCTL_MEM_EXEC_INIT    _IOW(KB_IOCTL_TYPE, 38, struct kb_ioctl_mem_exec_init)
 #define KB_IOCTL_CS_GET_GLB_IFACE _IOWR(KB_IOCTL_TYPE, 51, union kb_ioctl_cs_get_glb_iface)
 #define KB_IOCTL_VERSION_CHECK    _IOWR(KB_IOCTL_TYPE, 52, struct kb_ioctl_version_check)
@@ -591,6 +627,11 @@ KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, in.cs_min, 24);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, in.csi_handlers, 29);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, in.dvs_buf, 32);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, out.group_uid, 4);
+KB_CHECK_SIZE(union kb_ioctl_cs_queue_group_create_1_18, 40);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.cs_min, 24);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.csi_handlers, 29);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.dvs_buf, 32);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, out.group_uid, 4);
 KB_CHECK_SIZE(struct kb_ioctl_cs_queue_group_term, 8);
 KB_CHECK_SIZE(union kb_ioctl_cs_tiler_heap_init, 24);
 KB_CHECK_OFF(union kb_ioctl_cs_tiler_heap_init, in.target_in_flight, 12);
@@ -626,6 +667,7 @@ _Static_assert(KB_IOCTL_MEM_ALLOC_EX == 0xc040803b, "MEM_ALLOC_EX");
 KB_CHECK_SIZE(union kb_ioctl_get_cpu_gpu_timeinfo, 32);
 _Static_assert(KB_IOCTL_GET_CPU_GPU_TIMEINFO == 0xc0208032, "GET_CPU_GPU_TIMEINFO");
 _Static_assert(KB_IOCTL_CS_QUEUE_GROUP_CREATE == 0xc070803a, "GROUP_CREATE");
+_Static_assert(KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18 == 0xc028803a, "GROUP_CREATE_1_18");
 _Static_assert(KB_IOCTL_CS_QUEUE_GROUP_TERMINATE == 0x4008802b, "GROUP_TERMINATE");
 _Static_assert(KB_IOCTL_CS_TILER_HEAP_INIT == 0xc0188030, "TILER_HEAP_INIT");
 _Static_assert(KB_IOCTL_CS_EVENT_SIGNAL == 0x802c, "CS_EVENT_SIGNAL");

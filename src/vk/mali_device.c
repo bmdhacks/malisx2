@@ -552,6 +552,14 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
          mesa_logi("malisx2 GPU timestamps are not the CPU's CNTVCT_EL0: calibrated "
                    "timestamps read them through the kernel");
    }
+   if (dev->kbase->frontend == MALI_KBASE_FRONTEND_CSF &&
+       dev->kbase->uk_minor < KB_UK_VERSION_MINOR) {
+      /* No "malisx2:" prefix: this is information, not a warning. Kernels
+       * at 1.20 and newer answer 1.20 and log nothing here. */
+      mesa_logi("malisx2 CSF kernel UK %u.%u (proposed %u.%u): older ioctl variants in use",
+                dev->kbase->uk_major, dev->kbase->uk_minor, KB_UK_VERSION_MAJOR,
+                KB_UK_VERSION_MINOR);
+   }
    if (dev->kbase->frontend == MALI_KBASE_FRONTEND_JM) {
       /* No "malisx2:" prefix: this is information, not a warning. */
       char layout[192];

@@ -39,8 +39,30 @@ mali_kbase_group_create(struct mali_kbase *kb,
 {
    /* Tiler endpoint 0 only, every fragment and compute endpoint, at most
     * 1 tiler and 64 fragment/compute endpoints, no CSI exception handlers
-    * (no incremental rendering). UK >= 1.19 form of the ioctl; we only
-    * speak 1.20. */
+    * (no incremental rendering). UK >= 1.19 form of the ioctl; below 1.19
+    * the 40-byte form with the same leading fields (uapi.h). */
+   if (kb->uk_minor < KB_UK_GROUP_CREATE_NE_MINOR) {
+      union kb_ioctl_cs_queue_group_create_1_18 gc;
+      memset(&gc, 0, sizeof(gc));
+      gc.in.tiler_mask = 1;
+      gc.in.fragment_mask = ~0ull;
+      gc.in.compute_mask = ~0ull;
+      gc.in.cs_min = info->cs_count;
+      gc.in.priority = info->priority;
+      gc.in.tiler_max = 1;
+      gc.in.fragment_max = 64;
+      gc.in.compute_max = 64;
+
+      long ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18, &gc);
+      if (ret < 0) {
+         KB_LOG(kb, "CS_QUEUE_GROUP_CREATE_1_18 (%u CSs, priority %u) failed: %s",
+                info->cs_count, info->priority, strerror((int)-ret));
+         return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
+      }
+      *handle = gc.out.group_handle;
+      return MALI_KBASE_SUCCESS;
+   }
+
    union kb_ioctl_cs_queue_group_create gc;
    memset(&gc, 0, sizeof(gc));
    gc.in.tiler_mask = 1;

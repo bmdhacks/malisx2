@@ -803,6 +803,25 @@ polygon_prim(enum mesa_prim prim, VkPolygonMode mode)
    return prim;
 }
 
+/* The colour attachments a draw writes through its blend: a target whose
+ * blend is off (no write mask, a disabled colour write, an output the
+ * shader does not write) keeps what is under the fragment. A fragment may
+ * kill the fragments under it only if it overwrites every target (Mesa's
+ * pan_allow_forward_pixel_to_kill takes the blend's enabled mask the same
+ * way): a depth-only draw, with every colour write masked, would otherwise
+ * remove the colour of the fragments it hides, depending on which of them
+ * were still in flight. */
+static uint8_t
+blend_written_mask(const struct mali_gfx_baked *out)
+{
+   uint8_t mask = 0;
+   for (uint32_t i = 0; i < out->rt_count && i < MALI_MAX_RTS; i++) {
+      if (out->blend[i].mode != MALI_BLEND_RT_OFF)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
+}
+
 static void
 pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
@@ -882,7 +901,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) && out->rt_read;
 
             cfg.allow_forward_pixel_to_kill =
-               fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
+               fs->info.fs.can_fpk &&
+               !(rt_mask & ~(out->rt_written & blend_written_mask(out))) &&
                !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read &&
                !roa_color;
             cfg.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
@@ -1136,7 +1156,7 @@ pack_rsd(const struct mali_gfx_pack_input *in, const struct mali_gfx_baked *out,
                                 out->rt_read;
 
          cfg.properties.allow_forward_pixel_to_kill =
-            fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
+            fs->info.fs.can_fpk && !(rt_mask & ~(out->rt_written & blend_written_mask(out))) &&
             !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read && !roa_color;
          /* The hardware does the early ZS check for FPK on v7 (panvk). */
          cfg.properties.allow_forward_pixel_to_be_killed = !fs->info.writes_global;

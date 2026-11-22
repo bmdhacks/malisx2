@@ -255,7 +255,7 @@ struct mali_kbase {
    const struct mali_kbase_backend *backend;
    int fd;
    enum mali_kbase_frontend frontend;
-   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.7 to 11.36 on JM */
+   uint16_t uk_major, uk_minor;  /* negotiated: 1.18 to 1.20 on CSF, 11.7 to 11.36 on JM */
    struct mali_kbase_gpu_props props;
    struct mali_kbase_glb_iface glb;          /* CSF only; zero on JM */
    /* The GPU's user register page, mapped read-only. CSF only; NULL on JM. */
@@ -307,10 +307,11 @@ struct mali_kbase {
  * Open the device and set up a context. mali_kbase_create works out which
  * frontend the kernel speaks:
  *
- *   1. VERSION_CHECK (ioctl 52) proposing 1.20. On a matching answer the
- *      frontend is CSF and the rest of the sequence is the blob's CSF
- *      order: SET_FLAGS, GET_GPUPROPS, CS_GET_GLB_IFACE, map the user
- *      register page, MEM_EXEC_INIT, MEM_JIT_INIT (trim level 5).
+ *   1. VERSION_CHECK (ioctl 52) proposing 1.20 and accepting 1.18 to 1.20
+ *      back. On a matching answer the frontend is CSF and the rest of the
+ *      sequence is the blob's CSF order: SET_FLAGS, GET_GPUPROPS,
+ *      CS_GET_GLB_IFACE, map the user register page, MEM_EXEC_INIT,
+ *      MEM_JIT_INIT (trim level 5).
  *   2. Otherwise, VERSION_CHECK (ioctl 0) proposing 11.36 on the same fd
  *      and accepting 11.7 to 11.36 back:
  *      each frontend's kernel answers the other's version-check ioctl

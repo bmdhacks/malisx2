@@ -39,8 +39,8 @@ mali_kbase_group_create(struct mali_kbase *kb,
 {
    /* Tiler endpoint 0 only, every fragment and compute endpoint, at most
     * 1 tiler and 64 fragment/compute endpoints, no CSI exception handlers
-    * (no incremental rendering). UK >= 1.19 form of the ioctl; we only
-    * speak 1.20. */
+    * (no incremental rendering). A 1.18 kernel knows only the 40-byte
+    * form of the ioctl; the 112-byte form adds fields we leave zero. */
    union kb_ioctl_cs_queue_group_create gc;
    memset(&gc, 0, sizeof(gc));
    gc.in.tiler_mask = 1;
@@ -52,10 +52,19 @@ mali_kbase_group_create(struct mali_kbase *kb,
    gc.in.fragment_max = 64;
    gc.in.compute_max = 64;
 
-   long ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE, &gc);
+   long ret;
+   if (kb->uk_minor < KB_UK_GROUP_CREATE_112_MINOR) {
+      /* The 1.18 form is the first 40 bytes of the current one. */
+      union kb_ioctl_cs_queue_group_create_1_18 old;
+      memcpy(&old, &gc, sizeof(old));
+      ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18, &old);
+      memcpy(&gc.out, &old.out, sizeof(old.out));
+   } else {
+      ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE, &gc);
+   }
    if (ret < 0) {
-      KB_LOG(kb, "CS_QUEUE_GROUP_CREATE (%u CSs, priority %u) failed: %s",
-             info->cs_count, info->priority, strerror((int)-ret));
+      KB_LOG(kb, "CS_QUEUE_GROUP_CREATE (UK 1.%u form, %u CSs, priority %u) failed: %s",
+             kb->uk_minor, info->cs_count, info->priority, strerror((int)-ret));
       return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
    }
    *handle = gc.out.group_handle;

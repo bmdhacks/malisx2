@@ -562,6 +562,10 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
       if (dev->kbase->jm_no_jit)
          mesa_logi("malisx2 job-manager context without a JIT zone: the kernel refused "
                    "MEM_JIT_INIT (GPU MMU VA %u bits)", dev->kbase->props.va_bits);
+   } else {
+      mesa_logi("malisx2 command-stream kernel UK %u.%u (proposed %u.%u)",
+                dev->kbase->uk_major, dev->kbase->uk_minor, KB_UK_VERSION_MAJOR,
+                KB_UK_VERSION_MINOR);
    }
 
    /* Shaders: kraid must be the compiler on v9 and v11 (v7 compiles
